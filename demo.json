@@ -1,0 +1,39 @@
+{
+  "nodes": {
+    "1": {
+      "id": 1,
+      "template_name": "Script",
+      "label": "controls",
+      "pos": [50.0, 50.0],
+      "input_values": {},
+      "output_values": {},
+      "script_code": "(output gain f64)\n(output freq f64)\n\n(define gain (store-get \"gain\"))\n(define freq (store-get \"freq\"))\n\n# Controls\n\n@(slider \"gain\" 0.0 100.0)\n@(slider \"freq\" 1.0 20.0)\n@(checkbox \"Enabled\" \"enabled\")\n@(text-input \"label\" \"Enter label...\")\n\n---\n\nGain = @(store-get \"gain\"), Freq = @(store-get \"freq\")"
+    },
+    "2": {
+      "id": 2,
+      "template_name": "Script",
+      "label": "wave",
+      "pos": [400.0, 50.0],
+      "input_values": {},
+      "output_values": {},
+      "script_code": "(input gain f64)\n(input freq f64)\n\n(define pi 3.14159265)\n(define (make-wave n)\n  (if (= n 0) '()\n    (cons (* gain (sin (* freq (/ n 10.0) pi)))\n          (make-wave (- n 1)))))\n(define data (make-wave 40))\n\n# Waveform\n\n@(plot-line data \"signal\")\n\nPeak = @gain, Frequency = @freq"
+    },
+    "3": {
+      "id": 3,
+      "template_name": "Script",
+      "label": "tasks",
+      "pos": [50.0, 350.0],
+      "input_values": {},
+      "output_values": {},
+      "script_code": "# Task Manager\n\n@(text-input \"new-task\" \"New task...\")\n@(button \"Add Task\" (store-append! \"tasks\" (store-get \"new-task\")))\n\n---\n\nStored tasks: @(store-get \"tasks\")"
+    }
+  },
+  "connections": [
+    { "id": 1, "from_node": 1, "from_port": "gain", "to_node": 2, "to_port": "gain" },
+    { "id": 2, "from_node": 1, "from_port": "freq", "to_node": 2, "to_port": "freq" }
+  ],
+  "next_node_id": 4,
+  "next_conn_id": 3,
+  "viewport_offset": [0.0, 0.0],
+  "viewport_zoom": 1.0
+}

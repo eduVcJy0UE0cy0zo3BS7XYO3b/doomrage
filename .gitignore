@@ -1,0 +1,6 @@
+/target
+/node-crates/target
+store.json
+*.swp
+*.swo
+*~

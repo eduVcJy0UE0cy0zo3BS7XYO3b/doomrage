@@ -1,0 +1,5 @@
+package pipeline:nodes;
+
+world node {
+  export run: func(a: f64, b: f64) -> f64;
+}

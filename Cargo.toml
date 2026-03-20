@@ -1,0 +1,25 @@
+[package]
+name = "wasm-canvas"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wasm-canvas"
+path = "src/main.rs"
+
+[dependencies]
+egui = "0.33.3"
+eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "x11", "wayland", "default_fonts"] }
+wgpu = { version = "27.0.1", features = ["vulkan", "gles"] }
+wasmtime = { version = "43.0.0", features = ["component-model"] }
+wit-parser = "0.245.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+notify = "8.2.0"
+notify-debouncer-mini = "0.7.0"
+rfd = "0.17.2"
+egui_plot = "0.34.1"
+scheme-rs = { version = "0.1.0", default-features = false }
+anyhow = "1.0.102"
+log = "0.4.29"
+env_logger = "0.11.9"
