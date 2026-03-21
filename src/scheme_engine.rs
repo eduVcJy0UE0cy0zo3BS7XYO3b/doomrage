@@ -374,6 +374,8 @@ impl SchemeEngine {
             .map_err(|e| anyhow::anyhow!("Failed to import canvas ports: {}", e))?;
         env.eval(true, "(import (canvas scribble))")
             .map_err(|e| anyhow::anyhow!("Failed to import canvas scribble: {}", e))?;
+        env.eval(true, "(import (canvas net))")
+            .map_err(|e| anyhow::anyhow!("Failed to import canvas net: {}", e))?;
 
         // Port declaration wrappers: call bridge functions from (canvas ports)
         env.eval(false, r#"
@@ -385,6 +387,8 @@ impl SchemeEngine {
                 (if (or (null? params) (null? (cdr params))) 0 (cadr params))))
             (define (slider name lo hi) (register-widget name 'slider lo hi))
             (define (checkbox name) (register-widget name 'checkbox 0 0))
+            (define (net-publish channel) (net-publish-channel channel))
+            (define (net-value channel key default) (net-value-get channel key default))
         "#)
             .map_err(|e| anyhow::anyhow!("Failed to define port wrappers: {}", e))?;
 
@@ -611,12 +615,15 @@ impl SchemeEngine {
             }
         }
 
+        let net_publishes = crate::bridge::take_net_publishes();
+
         Ok(ScriptResult {
             output_values,
             render_blocks,
             declared_inputs,
             declared_outputs,
             widget_decls,
+            net_publishes,
         })
     }
 
@@ -669,6 +676,7 @@ impl SchemeEngine {
             declared_inputs: Vec::new(),
             declared_outputs: Vec::new(),
             widget_decls: Vec::new(),
+            net_publishes: Vec::new(),
         })
     }
 
@@ -681,6 +689,7 @@ pub struct ScriptResult {
     pub declared_inputs: Vec<(String, String)>,
     pub declared_outputs: Vec<(String, String)>,
     pub widget_decls: Vec<crate::bridge::WidgetDecl>,
+    pub net_publishes: Vec<String>,
 }
 
 #[cfg(test)]

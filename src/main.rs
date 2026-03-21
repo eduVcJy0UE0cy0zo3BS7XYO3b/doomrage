@@ -13,6 +13,7 @@ mod scheme_convert;
 mod scheme_engine;
 mod theme;
 mod types;
+mod network;
 mod worker;
 
 fn main() -> eframe::Result<()> {

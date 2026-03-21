@@ -7,6 +7,10 @@ use scheme_rs::value::Value;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// Shared network values store: (peer, channel) -> (key -> Value)
+pub type NetValues = Arc<Mutex<HashMap<(String, String), HashMap<String, crate::types::Value>>>>;
 
 thread_local! {
     static THREAD_DB: RefCell<Option<Db>> = RefCell::new(None);
@@ -44,6 +48,20 @@ impl PortRegistry {
 thread_local! {
     static THREAD_INPUTS: RefCell<Option<HashMap<String, crate::types::Value>>> = RefCell::new(None);
     static THREAD_PORTS: RefCell<PortRegistry> = RefCell::new(PortRegistry::new());
+    static THREAD_NET_VALUES: RefCell<Option<NetValues>> = RefCell::new(None);
+    static THREAD_NET_PUBLISH: RefCell<Vec<String>> = RefCell::new(Vec::new());
+}
+
+/// Set thread-local net values store for bridge functions.
+pub fn set_thread_net_values(nv: Option<&NetValues>) {
+    THREAD_NET_VALUES.with(|cell| {
+        *cell.borrow_mut() = nv.cloned();
+    });
+}
+
+/// Take collected net-publish channel names from thread-local.
+pub fn take_net_publishes() -> Vec<String> {
+    THREAD_NET_PUBLISH.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
 /// Scope-guard: sets thread-local input values and clears port registry before `f`,
@@ -471,6 +489,44 @@ fn bridge_register_widget(
                 None => Value::from(p1_f64),
             },
             None => Value::from(p1_f64),
+        }
+    });
+
+    Ok(vec![result])
+}
+
+// --- (canvas net) bridge functions ---
+
+#[bridge(name = "net-publish-channel", lib = "(canvas net)")]
+fn bridge_net_publish(channel: &Value) -> Result<Vec<Value>, Exception> {
+    let ch = value_to_string(channel);
+    THREAD_NET_PUBLISH.with(|cell| {
+        cell.borrow_mut().push(ch);
+    });
+    Ok(vec![Value::null()])
+}
+
+#[bridge(name = "net-value-get", lib = "(canvas net)")]
+fn bridge_net_value(channel: &Value, key: &Value, default: &Value) -> Result<Vec<Value>, Exception> {
+    let ch = value_to_string(channel);
+    let k = value_to_string(key);
+
+    let result = THREAD_NET_VALUES.with(|cell| {
+        let borrow = cell.borrow();
+        match borrow.as_ref() {
+            Some(nv) => {
+                let store = nv.lock().unwrap();
+                // Search all peers for this channel
+                for ((_, channel), values) in store.iter() {
+                    if *channel == ch {
+                        if let Some(val) = values.get(&k) {
+                            return types_value_to_scheme(val);
+                        }
+                    }
+                }
+                default.clone()
+            }
+            None => default.clone(),
         }
     });
 

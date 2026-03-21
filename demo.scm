@@ -15,7 +15,30 @@
   Gain = @(->str gain), Freq = @(->str freq)
 )
 
-(node 2 "Script" "wave" (pos 400.0 50.0)
+(node 2 "Script" "gateway out" (pos 300.0 50.0)
+
+  (define gain (input 'gain 'f64))
+  (define freq (input 'freq 'f64))
+  (net-publish "controls")
+
+  # Gateway Out
+
+  Publishing gain=@(->str gain), freq=@(->str freq)
+)
+
+(node 3 "Script" "gateway in" (pos 550.0 50.0)
+
+  (define gain (output 'gain 'f64))
+  (define freq (output 'freq 'f64))
+  (set! gain (net-value "controls" "gain" 50.0))
+  (set! freq (net-value "controls" "freq" 5.0))
+
+  # Gateway In
+
+  Receiving gain=@(->str gain), freq=@(->str freq)
+)
+
+(node 4 "Script" "wave" (pos 800.0 50.0)
 
   (define gain-raw (input 'gain 'f64))
   (define freq-raw (input 'freq 'f64))
@@ -48,21 +71,7 @@
   Peak = @(->str gain), Freq = @(->str freq)
 )
 
-(node 3 "Script" "tasks" (pos 50.0 350.0)
-
-  # Task Manager
-
-  @(text-input "new-task" "New task...")
-  @(button "Add Task" 'append "tasks" "new-task")
-
-  ---
-
-  ## Tasks
-
-  @(editable-list "tasks")
-)
-
-(node 4 "Script" "colors" (pos 400.0 350.0)
+(node 5 "Script" "colors" (pos 50.0 350.0)
 
   (define swatch
     (canvas 200 80
@@ -84,3 +93,5 @@
 
 (connection 1 (from 1 "gain") (to 2 "gain"))
 (connection 2 (from 1 "freq") (to 2 "freq"))
+(connection 3 (from 3 "gain") (to 4 "gain"))
+(connection 4 (from 3 "freq") (to 4 "freq"))

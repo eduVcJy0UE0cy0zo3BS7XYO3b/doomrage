@@ -678,12 +678,18 @@ mod tests {
     fn test_parse_demo_scm() {
         let src = std::fs::read_to_string("demo.scm").unwrap();
         let graph = parse_scm(&src).unwrap();
-        assert_eq!(graph.nodes.len(), 4);
-        assert_eq!(graph.connections.len(), 2);
+        assert_eq!(graph.nodes.len(), 5);
+        assert_eq!(graph.connections.len(), 4);
 
-        let wave = &graph.nodes[&2];
+        let wave = &graph.nodes[&4];
         assert_eq!(wave.label, "wave");
         assert!(wave.script_code.contains("canvas"));
         assert!(wave.script_code.contains("draw-polyline"));
+
+        let gw_out = &graph.nodes[&2];
+        assert!(gw_out.script_code.contains("net-publish"));
+
+        let gw_in = &graph.nodes[&3];
+        assert!(gw_in.script_code.contains("net-value"));
     }
 }

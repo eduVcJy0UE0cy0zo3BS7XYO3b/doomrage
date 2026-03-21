@@ -1,14 +1,17 @@
+use crate::bridge::NetValues;
 use crate::canvas::{self, CanvasState};
 use crate::debug_log::DebugLog;
 use crate::executor::Executor;
+use crate::network::{self, NetCommand, NetEvent, NetHandle};
 use crate::panels::{self, PanelAction, PanelState};
 use crate::persistence::{self, UndoHistory};
 use crate::registry::NodeRegistry;
 use crate::theme;
 use crate::types::*;
 use crate::worker::{DeferredQueue, WorkRequest, WorkResult};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 pub struct WasmCanvasApp {
     graph: Graph,
@@ -25,10 +28,14 @@ pub struct WasmCanvasApp {
     theme_applied: bool,
     pending_nodes: HashSet<NodeId>,
     debug_log: DebugLog,
+    net_handle: NetHandle,
+    net_values: NetValues,
+    /// Nodes that have net-subscribe dependencies (need recompute on net events)
+    net_subscribed_nodes: HashSet<NodeId>,
 }
 
 impl WasmCanvasApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let nodes_dir = PathBuf::from("./nodes");
         let mut registry = NodeRegistry::new(nodes_dir);
         if let Err(e) = registry.scan() {
@@ -77,6 +84,9 @@ impl WasmCanvasApp {
         let mut undo_history = UndoHistory::new(10);
         undo_history.push(&graph);
 
+        let net_handle = network::spawn_network(cc.egui_ctx.clone());
+        let net_values: NetValues = Arc::new(Mutex::new(HashMap::new()));
+
         Self {
             graph,
             registry,
@@ -92,6 +102,9 @@ impl WasmCanvasApp {
             theme_applied: false,
             pending_nodes: HashSet::new(),
             debug_log: DebugLog::new(),
+            net_handle,
+            net_values,
+            net_subscribed_nodes: HashSet::new(),
         }
     }
 
@@ -144,6 +157,8 @@ impl WasmCanvasApp {
     }
 
     fn poll_worker_results(&mut self) {
+        // Set net values in thread-local before Scheme execution
+        crate::bridge::set_thread_net_values(Some(&self.net_values));
         if let Some(result) = self.worker.poll(&self.executor.scheme) {
             match result {
                 WorkResult::Preview { node_id, blocks } => {
@@ -194,6 +209,44 @@ impl WasmCanvasApp {
                     if let Some(node) = self.graph.nodes.get(&node_id) {
                         self.executor.scheme.register_node_library(node_id, &node.output_values);
                     }
+                    // Handle net-publish: send all node values to network
+                    for channel in &result.net_publishes {
+                        if let Some(node) = self.graph.nodes.get(&node_id) {
+                            // Merge input values (from connections) + output values + widget values
+                            let mut values = self.graph.resolve_all_input_values(node_id);
+                            for (k, v) in &node.widget_values {
+                                values.insert(k.clone(), v.clone());
+                            }
+                            for (k, v) in &node.output_values {
+                                values.insert(k.clone(), v.clone());
+                            }
+                            // Local loopback: update net_values so same-instance nodes can read
+                            {
+                                let mut store = self.net_values.lock().unwrap();
+                                store.insert(("local".to_string(), channel.clone()), values.clone());
+                            }
+                            // Send to network peers
+                            self.net_handle.send(NetCommand::Publish {
+                                channel: channel.clone(),
+                                values,
+                            });
+                            self.debug_log.log("net", format!(
+                                "publish \"{}\" → {:?}",
+                                channel,
+                                node.output_values.keys().collect::<Vec<_>>()
+                            ));
+                            // Trigger recompute on local nodes that subscribe via net-value
+                            let subscribers: Vec<NodeId> = self.graph.nodes.iter()
+                                .filter(|(id, n)| **id != node_id && n.template_name == "Script" && n.script_code.contains("net-value"))
+                                .map(|(id, _)| *id)
+                                .collect();
+                            for sid in subscribers {
+                                if !self.pending_nodes.contains(&sid) {
+                                    self.compute_node(sid);
+                                }
+                            }
+                        }
+                    }
                     // Auto-recompute downstream nodes
                     let descendants = self.graph.descendants_sorted(node_id);
                     for did in descendants {
@@ -208,6 +261,47 @@ impl WasmCanvasApp {
                     if let Some(n) = self.graph.nodes.get_mut(&node_id) {
                         n.error = Some(message);
                     }
+                }
+            }
+        }
+        crate::bridge::set_thread_net_values(None);
+    }
+
+    fn poll_network(&mut self) {
+        let events = self.net_handle.poll();
+        let mut need_recompute = false;
+        for event in events {
+            match event {
+                NetEvent::PeerDiscovered(peer) => {
+                    self.debug_log.log("net", format!("peer discovered: {}...", &peer[..12.min(peer.len())]));
+                }
+                NetEvent::PeerLost(peer) => {
+                    self.debug_log.log("net", format!("peer lost: {}...", &peer[..12.min(peer.len())]));
+                    // Remove values from this peer
+                    let mut store = self.net_values.lock().unwrap();
+                    store.retain(|(p, _), _| *p != peer);
+                }
+                NetEvent::ValuesReceived { peer, channel, values } => {
+                    self.debug_log.log("net", format!(
+                        "recv \"{}\": {:?}",
+                        channel,
+                        values.keys().collect::<Vec<_>>()
+                    ));
+                    let mut store = self.net_values.lock().unwrap();
+                    store.insert((peer, channel), values);
+                    need_recompute = true;
+                }
+            }
+        }
+        // Recompute all nodes that use net-value (simple approach: recompute all script nodes)
+        if need_recompute {
+            let script_nodes: Vec<NodeId> = self.graph.nodes.iter()
+                .filter(|(_, n)| n.template_name == "Script" && n.script_code.contains("net-value"))
+                .map(|(id, _)| *id)
+                .collect();
+            for nid in script_nodes {
+                if !self.pending_nodes.contains(&nid) {
+                    self.compute_node(nid);
                 }
             }
         }
@@ -334,8 +428,9 @@ impl eframe::App for WasmCanvasApp {
             self.theme_applied = true;
         }
 
-        // Poll background worker results
+        // Poll background worker results and network events
         self.poll_worker_results();
+        self.poll_network();
 
         // Keep repainting while work is pending
         if !self.pending_nodes.is_empty() || self.worker.has_pending() {
