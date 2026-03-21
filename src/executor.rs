@@ -1,8 +1,6 @@
 use crate::db::Db;
 use crate::registry::NodeRegistry;
 use crate::scheme_engine::SchemeEngine;
-#[allow(unused_imports)]
-use crate::bridge;
 use crate::types::*;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -128,17 +126,18 @@ impl Executor {
 
             let start = Instant::now();
 
-            let eff_inputs = node.effective_inputs(Some(template));
-            let input_vals = graph.resolve_input_values(node_id, eff_inputs);
-
-            let result = if let Some(BuiltinKind::Const) = template.builtin {
-                self.execute_const(&node, &input_vals)
-            } else if let Some(BuiltinKind::Output) = template.builtin {
-                self.execute_output(&input_vals)
-            } else if let Some(BuiltinKind::Script) = template.builtin {
-                self.execute_script(&node, template, &input_vals, graph, node_id)
+            let result = if let Some(BuiltinKind::Script) = template.builtin {
+                self.execute_script(&node, graph, node_id)
             } else {
-                self.execute_wasm_node(template, &input_vals)
+                let eff_inputs = node.effective_inputs(Some(template));
+                let input_vals = graph.resolve_input_values(node_id, eff_inputs);
+                if let Some(BuiltinKind::Const) = template.builtin {
+                    self.execute_const(&node, &input_vals)
+                } else if let Some(BuiltinKind::Output) = template.builtin {
+                    self.execute_output(&input_vals)
+                } else {
+                    self.execute_wasm_node(template, &input_vals)
+                }
             };
 
             let duration_us = start.elapsed().as_micros() as u64;
@@ -274,45 +273,47 @@ impl Executor {
     fn execute_script(
         &self,
         node: &Node,
-        _template: &NodeTemplate,
-        input_vals: &HashMap<String, Value>,
         graph: &mut Graph,
         node_id: NodeId,
     ) -> Result<HashMap<String, Value>> {
-        use crate::scheme_engine::parse_port_declarations;
-
         let code = &node.script_code;
         if code.trim().is_empty() {
             return Ok(HashMap::new());
         }
 
-        let (input_decls, output_decls) = parse_port_declarations(code);
+        let mut available = graph.resolve_all_input_values(node_id);
+        for (k, v) in &node.widget_values {
+            available.entry(k.clone()).or_insert_with(|| v.clone());
+        }
 
-        // Build bindings from declared inputs
-        let bindings: Vec<(String, Value)> = input_decls
-            .iter()
-            .filter_map(|decl| {
-                let val = input_vals.get(&decl.name)?;
-                Some((decl.name.clone(), val.clone()))
-            })
-            .collect();
+        let script_result = self.scheme.execute_script(&available, Some(&self.db), code)?;
 
-        let output_names: Vec<String> = output_decls.iter().map(|d| d.name.clone()).collect();
-
-        let script_result = self.scheme.execute_script(&bindings, &output_names, Some(&self.db), code)?;
-
-        // Store render blocks
+        // Store render blocks and update dynamic ports
         if let Some(n) = graph.nodes.get_mut(&node_id) {
             n.render_blocks = script_result.render_blocks;
+            if !script_result.declared_inputs.is_empty() || !script_result.declared_outputs.is_empty() {
+                n.script_inputs = script_result.declared_inputs.iter()
+                    .map(|(name, type_str)| PortDef {
+                        name: name.clone(),
+                        port_type: PortType::from_str(type_str).unwrap_or(PortType::F64),
+                    })
+                    .collect();
+                n.script_outputs = script_result.declared_outputs.iter()
+                    .map(|(name, type_str)| PortDef {
+                        name: name.clone(),
+                        port_type: PortType::from_str(type_str).unwrap_or(PortType::F64),
+                    })
+                    .collect();
+            }
+            n.widget_decls = script_result.widget_decls;
+            // Initialize input_values defaults for new ports
+            for port in &n.script_inputs {
+                n.input_values.entry(port.name.clone())
+                    .or_insert_with(|| port.port_type.default_value());
+            }
         }
 
-        // Convert outputs
-        let mut output_values = HashMap::new();
-        for (name, val) in &script_result.output_values {
-            output_values.insert(name.clone(), val.clone());
-        }
-
-        Ok(output_values)
+        Ok(script_result.output_values)
     }
 
 }
@@ -346,7 +347,6 @@ fn wasm_val_to_value(val: &Val) -> Value {
 mod tests {
     use super::*;
     use crate::registry::NodeRegistry;
-    use crate::scheme_engine::parse_port_declarations;
 
     fn fresh_executor() -> Executor {
         let mut cfg = Config::new();
@@ -384,6 +384,8 @@ mod tests {
             script_code: String::new(),
             script_inputs: Vec::new(),
             script_outputs: Vec::new(),
+            widget_decls: Vec::new(),
+            widget_values: HashMap::new(),
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -401,6 +403,8 @@ mod tests {
             script_code: String::new(),
             script_inputs: Vec::new(),
             script_outputs: Vec::new(),
+            widget_decls: Vec::new(),
+            widget_values: HashMap::new(),
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -408,25 +412,6 @@ mod tests {
     }
 
     fn script_node(id: NodeId, code: &str) -> Node {
-        let (input_decls, output_decls) = parse_port_declarations(code);
-        let script_inputs: Vec<PortDef> = input_decls
-            .iter()
-            .filter_map(|d| {
-                PortType::from_str(&d.port_type).map(|pt| PortDef {
-                    name: d.name.clone(),
-                    port_type: pt,
-                })
-            })
-            .collect();
-        let script_outputs: Vec<PortDef> = output_decls
-            .iter()
-            .filter_map(|d| {
-                PortType::from_str(&d.port_type).map(|pt| PortDef {
-                    name: d.name.clone(),
-                    port_type: pt,
-                })
-            })
-            .collect();
         Node {
             id,
             template_name: "Script".to_string(),
@@ -435,8 +420,10 @@ mod tests {
             input_values: HashMap::new(),
             output_values: HashMap::new(),
             script_code: code.to_string(),
-            script_inputs,
-            script_outputs,
+            script_inputs: Vec::new(),
+            script_outputs: Vec::new(),
+            widget_decls: Vec::new(),
+            widget_values: HashMap::new(),
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -508,6 +495,8 @@ mod tests {
             script_code: String::new(),
             script_inputs: Vec::new(),
             script_outputs: Vec::new(),
+            widget_decls: Vec::new(),
+            widget_values: HashMap::new(),
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -561,7 +550,7 @@ mod tests {
     fn test_script_arithmetic() {
         let mut exec = fresh_executor();
         let reg = builtin_registry();
-        let code = "(input x f64)\n(output result f64)\n(define result (* x 2))";
+        let code = "(define x (input 'x 'f64))\n(define result (output 'result 'f64))\n(set! result (* x 2))";
         let mut node = script_node(1, code);
         node.input_values.insert("x".to_string(), Value::F64(5.0));
         let mut graph = make_graph(vec![node], vec![]);
@@ -638,7 +627,7 @@ mod tests {
     fn test_const_to_script_chain() {
         let mut exec = fresh_executor();
         let reg = builtin_registry();
-        let code = "(input x f64)\n(output result f64)\n(define result (* x 10))";
+        let code = "(define x (input 'x 'f64))\n(define result (output 'result 'f64))\n(set! result (* x 10))";
         let mut graph = make_graph(
             vec![const_node(1, Value::F64(3.0)), script_node(2, code)],
             vec![(1, "out", 2, "x")],
@@ -652,8 +641,8 @@ mod tests {
     fn test_cycle_detection() {
         let mut exec = fresh_executor();
         let reg = builtin_registry();
-        let code_a = "(input x f64)\n(output result f64)\n(define result x)";
-        let code_b = "(input x f64)\n(output result f64)\n(define result x)";
+        let code_a = "(define x (input 'x 'f64))\n(define result (output 'result 'f64))\n(set! result x)";
+        let code_b = "(define x (input 'x 'f64))\n(define result (output 'result 'f64))\n(set! result x)";
         let mut graph = make_graph(
             vec![script_node(1, code_a), script_node(2, code_b)],
             vec![(1, "result", 2, "x"), (2, "result", 1, "x")],
@@ -666,7 +655,7 @@ mod tests {
     fn test_execute_up_to() {
         let mut exec = fresh_executor();
         let reg = builtin_registry();
-        let code = "(input x f64)\n(output result f64)\n(define result (* x 2))";
+        let code = "(define x (input 'x 'f64))\n(define result (output 'result 'f64))\n(set! result (* x 2))";
         // node 3 is independent, should not execute
         let mut graph = make_graph(
             vec![
@@ -754,7 +743,7 @@ mod tests {
 
         // Const(42) → Script that imports (node n1) via R6RS module.
         // We need a connection to ensure topo order (1 before 2).
-        let code = "(import (node n1))\n(output result f64)\n(define result (* out 2))";
+        let code = "(import (node n1))\n(define result (output 'result 'f64))\n(set! result (* out 2))";
         let mut graph = make_graph(
             vec![const_node(1, Value::F64(42.0)), script_node(2, code)],
             // Dummy connection to enforce ordering
@@ -767,11 +756,10 @@ mod tests {
     }
 
     #[test]
-    fn test_backward_compat_input_injection() {
-        // Old style (input x f64) still works with connections
+    fn test_new_syntax_with_connections() {
         let mut exec = fresh_executor();
         let reg = builtin_registry();
-        let code = "(input x f64)\n(output result f64)\n(define result (* x 3))";
+        let code = "(define x (input 'x 'f64))\n(define result (output 'result 'f64))\n(set! result (* x 3))";
         let mut graph = make_graph(
             vec![const_node(1, Value::F64(10.0)), script_node(2, code)],
             vec![(1, "out", 2, "x")],

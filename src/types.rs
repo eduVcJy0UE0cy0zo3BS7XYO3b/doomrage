@@ -157,6 +157,10 @@ pub struct Node {
     pub script_inputs: Vec<PortDef>,
     #[serde(default)]
     pub script_outputs: Vec<PortDef>,
+    #[serde(default)]
+    pub widget_decls: Vec<crate::bridge::WidgetDecl>,
+    #[serde(default)]
+    pub widget_values: HashMap<String, Value>,
     #[serde(skip)]
     pub error: Option<String>,
     #[serde(skip)]
@@ -225,7 +229,7 @@ impl Graph {
         }
 
         let script_code = if template.builtin == Some(BuiltinKind::Script) {
-            "(input x f64)\n(input y f64)\n(output result f64)\n\n(define result (+ x y))\n\n# Result\n\nThe sum is @result.\n\n| input | value |\n|-------|-------|\n| x     | @x    |\n| y     | @y    |".to_string()
+            "(define x (input 'x 'f64))\n(define y (input 'y 'f64))\n(define result (output 'result 'f64))\n(set! result (+ x y))\n\n# Result\n\nThe sum is @result.\n\n| input | value |\n|-------|-------|\n| x     | @x    |\n| y     | @y    |".to_string()
         } else {
             String::new()
         };
@@ -240,6 +244,8 @@ impl Graph {
             script_code,
             script_inputs: Vec::new(),
             script_outputs: Vec::new(),
+            widget_decls: Vec::new(),
+            widget_values: HashMap::new(),
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -284,6 +290,26 @@ impl Graph {
         self.connections
             .iter()
             .find(|c| c.to_node == node_id && c.to_port == port)
+    }
+
+    /// Resolve ALL connections to a node without requiring eff_inputs.
+    /// Starts from node's input_values, overrides with connected upstream outputs.
+    pub fn resolve_all_input_values(&self, node_id: NodeId) -> HashMap<String, Value> {
+        let node = match self.nodes.get(&node_id) {
+            Some(n) => n,
+            None => return HashMap::new(),
+        };
+        let mut vals = node.input_values.clone();
+        for conn in &self.connections {
+            if conn.to_node == node_id {
+                if let Some(src) = self.nodes.get(&conn.from_node) {
+                    if let Some(val) = src.output_values.get(&conn.from_port) {
+                        vals.insert(conn.to_port.clone(), val.clone());
+                    }
+                }
+            }
+        }
+        vals
     }
 
     /// Resolve input values for a node: start from node's input_values,
@@ -374,6 +400,26 @@ impl Graph {
         }
 
         // Topological sort of just the needed subset
+        match self.topological_sort() {
+            Ok(order) => order.into_iter().filter(|id| needed.contains(id)).collect(),
+            Err(_) => needed.into_iter().collect(),
+        }
+    }
+
+    /// Find all descendant nodes (transitive downstream) of the given node, excluding itself.
+    /// Returns them in topological order.
+    pub fn descendants_sorted(&self, source: NodeId) -> Vec<NodeId> {
+        let mut needed: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        let mut stack = vec![source];
+        while let Some(id) = stack.pop() {
+            for conn in &self.connections {
+                if conn.from_node == id && needed.insert(conn.to_node) {
+                    stack.push(conn.to_node);
+                }
+            }
+        }
+        needed.remove(&source);
+
         match self.topological_sort() {
             Ok(order) => order.into_iter().filter(|id| needed.contains(id)).collect(),
             Err(_) => needed.into_iter().collect(),

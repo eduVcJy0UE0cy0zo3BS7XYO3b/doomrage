@@ -4,10 +4,71 @@ use crate::types::{Graph, NodeId};
 use scheme_rs::exceptions::Exception;
 use scheme_rs::registry::bridge;
 use scheme_rs::value::Value;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 thread_local! {
     static THREAD_DB: RefCell<Option<Db>> = RefCell::new(None);
+}
+
+// --- Port registry (dynamic port discovery) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetDecl {
+    pub name: String,
+    pub widget_type: String,
+    pub params: Vec<f64>,
+}
+
+pub struct PortRegistry {
+    pub inputs: Vec<(String, String)>,
+    pub outputs: Vec<(String, String)>,
+    pub widgets: Vec<WidgetDecl>,
+}
+
+impl PortRegistry {
+    pub fn new() -> Self {
+        Self {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            widgets: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inputs.is_empty() && self.outputs.is_empty() && self.widgets.is_empty()
+    }
+}
+
+thread_local! {
+    static THREAD_INPUTS: RefCell<Option<HashMap<String, crate::types::Value>>> = RefCell::new(None);
+    static THREAD_PORTS: RefCell<PortRegistry> = RefCell::new(PortRegistry::new());
+}
+
+/// Scope-guard: sets thread-local input values and clears port registry before `f`,
+/// returns collected PortRegistry after.
+pub fn with_port_context<R>(
+    available_inputs: Option<&HashMap<String, crate::types::Value>>,
+    f: impl FnOnce() -> R,
+) -> (R, PortRegistry) {
+    THREAD_INPUTS.with(|cell| {
+        *cell.borrow_mut() = available_inputs.cloned();
+    });
+    THREAD_PORTS.with(|cell| {
+        *cell.borrow_mut() = PortRegistry::new();
+    });
+
+    let result = f();
+
+    THREAD_INPUTS.with(|cell| {
+        cell.borrow_mut().take();
+    });
+    let registry = THREAD_PORTS.with(|cell| {
+        std::mem::replace(&mut *cell.borrow_mut(), PortRegistry::new())
+    });
+
+    (result, registry)
 }
 
 // --- Graph context (Phase 6) ---
@@ -291,7 +352,7 @@ fn bridge_list_nodes() -> Result<Vec<Value>, Exception> {
     .map(|v| vec![v])
 }
 
-fn types_value_to_scheme(v: &crate::types::Value) -> Value {
+pub(crate) fn types_value_to_scheme(v: &crate::types::Value) -> Value {
     match v {
         crate::types::Value::F64(f) => Value::from(*f),
         crate::types::Value::F32(f) => Value::from(*f as f64),
@@ -344,4 +405,74 @@ fn bridge_node_set(id: &Value, key: &Value, value: &Value) -> Result<Vec<Value>,
         }
     })?;
     Ok(vec![Value::null()])
+}
+
+// --- (canvas ports) bridge functions ---
+
+#[bridge(name = "register-input", lib = "(canvas ports)")]
+fn bridge_register_input(name: &Value, port_type: &Value) -> Result<Vec<Value>, Exception> {
+    let name_str = value_to_string(name);
+    let type_str = value_to_string(port_type);
+
+    THREAD_PORTS.with(|cell| {
+        cell.borrow_mut().inputs.push((name_str.clone(), type_str));
+    });
+
+    let result = THREAD_INPUTS.with(|cell| {
+        let borrow = cell.borrow();
+        match borrow.as_ref() {
+            Some(map) => match map.get(&name_str) {
+                Some(val) => types_value_to_scheme(val),
+                None => Value::from(String::from("<compute>")),
+            },
+            None => Value::from(String::from("<compute>")),
+        }
+    });
+
+    Ok(vec![result])
+}
+
+#[bridge(name = "register-output", lib = "(canvas ports)")]
+fn bridge_register_output(name: &Value, port_type: &Value) -> Result<Vec<Value>, Exception> {
+    let name_str = value_to_string(name);
+    let type_str = value_to_string(port_type);
+
+    THREAD_PORTS.with(|cell| {
+        cell.borrow_mut().outputs.push((name_str, type_str));
+    });
+
+    Ok(vec![Value::null()])
+}
+
+#[bridge(name = "register-widget", lib = "(canvas ports)")]
+fn bridge_register_widget(
+    name: &Value, wtype: &Value, p1: &Value, p2: &Value,
+) -> Result<Vec<Value>, Exception> {
+    let name_str = value_to_string(name);
+    let type_str = value_to_string(wtype);
+    let p1_f64 = p1.cast_to_scheme_type::<f64>().unwrap_or(0.0);
+    let p2_f64 = p2.cast_to_scheme_type::<f64>().unwrap_or(0.0);
+
+    THREAD_PORTS.with(|cell| {
+        let mut ports = cell.borrow_mut();
+        ports.widgets.push(WidgetDecl {
+            name: name_str.clone(),
+            widget_type: type_str,
+            params: vec![p1_f64, p2_f64],
+        });
+        ports.outputs.push((name_str.clone(), "f64".to_string()));
+    });
+
+    let result = THREAD_INPUTS.with(|cell| {
+        let borrow = cell.borrow();
+        match borrow.as_ref() {
+            Some(map) => match map.get(&name_str) {
+                Some(val) => types_value_to_scheme(val),
+                None => Value::from(p1_f64),
+            },
+            None => Value::from(p1_f64),
+        }
+    });
+
+    Ok(vec![result])
 }

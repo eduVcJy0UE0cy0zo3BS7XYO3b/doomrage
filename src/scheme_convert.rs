@@ -1,4 +1,4 @@
-use crate::render::{PlotData, RenderBlock};
+use crate::render::{DrawCmd, PlotData, RenderBlock};
 use scheme_rs::value::{UnpackedValue, Value};
 
 /// Collect a Scheme list (pair chain ending in null) into a Vec<Value>
@@ -99,49 +99,6 @@ pub fn scheme_value_to_json(val: &Value) -> serde_json::Value {
             // Fallback: display as string
             JV::String(format!("{}", val))
         }
-    }
-}
-
-/// Port declaration parsed from Scheme code
-#[derive(Debug, Clone)]
-pub struct PortDecl {
-    pub name: String,
-    pub port_type: String, // "f64", "string", etc.
-}
-
-/// Parse (input name type) and (output name type) declarations from code
-pub fn parse_port_declarations(code: &str) -> (Vec<PortDecl>, Vec<PortDecl>) {
-    let mut inputs = Vec::new();
-    let mut outputs = Vec::new();
-
-    for line in code.lines() {
-        let line = line.trim();
-        if line.starts_with("(input ") {
-            if let Some(decl) = parse_single_decl(line) {
-                inputs.push(decl);
-            }
-        } else if line.starts_with("(output ") {
-            if let Some(decl) = parse_single_decl(line) {
-                outputs.push(decl);
-            }
-        }
-    }
-
-    (inputs, outputs)
-}
-
-fn parse_single_decl(s: &str) -> Option<PortDecl> {
-    // "(input x f64)" or "(output sum f64)"
-    let s = s.trim();
-    let inner = s.strip_prefix('(')?.strip_suffix(')')?;
-    let parts: Vec<&str> = inner.split_whitespace().collect();
-    if parts.len() >= 3 {
-        Some(PortDecl {
-            name: parts[1].to_string(),
-            port_type: parts[2].to_string(),
-        })
-    } else {
-        None
     }
 }
 
@@ -266,6 +223,38 @@ pub(crate) fn try_parse_render_from_value(val: &Value) -> Option<Vec<RenderBlock
                 key: value_display(&args[0]),
             }])
         }
+        "render-canvas" => {
+            let width = args.get(0).and_then(|v| v.cast_to_scheme_type::<f64>()).unwrap_or(200.0);
+            let height = args.get(1).and_then(|v| v.cast_to_scheme_type::<f64>()).unwrap_or(150.0);
+            let cmd_list = args.get(2).map(|v| collect_list(v)).unwrap_or_default();
+            let commands = cmd_list.iter().filter_map(|cmd| parse_draw_cmd(cmd)).collect();
+            Some(vec![RenderBlock::Canvas { width, height, commands }])
+        }
+        _ => None,
+    }
+}
+
+fn parse_draw_cmd(val: &Value) -> Option<DrawCmd> {
+    let items = collect_list(val);
+    let tag = format!("{}", items.first()?);
+    let f = |i: usize| items.get(i).and_then(|v| v.cast_to_scheme_type::<f64>()).unwrap_or(0.0);
+    let s = |i: usize| items.get(i).map(|v| value_display(v)).unwrap_or_default();
+
+    match tag.as_str() {
+        "line" => Some(DrawCmd::Line { x1: f(1), y1: f(2), x2: f(3), y2: f(4), color: s(5), width: f(6) }),
+        "rect" => Some(DrawCmd::Rect { x: f(1), y: f(2), w: f(3), h: f(4), fill: s(5) }),
+        "circle" => Some(DrawCmd::Circle { x: f(1), y: f(2), r: f(3), fill: s(4) }),
+        "polyline" => {
+            let pts_list = items.get(1).map(|v| collect_list(v)).unwrap_or_default();
+            let points: Vec<[f64; 2]> = pts_list.iter().map(|pt| {
+                let coords = collect_list(pt);
+                let x = coords.first().and_then(|v| v.cast_to_scheme_type::<f64>()).unwrap_or(0.0);
+                let y = coords.get(1).and_then(|v| v.cast_to_scheme_type::<f64>()).unwrap_or(0.0);
+                [x, y]
+            }).collect();
+            Some(DrawCmd::Polyline { points, color: s(2), width: f(3) })
+        }
+        "text" => Some(DrawCmd::Text { x: f(1), y: f(2), text: s(3), color: s(4), size: f(5) }),
         _ => None,
     }
 }

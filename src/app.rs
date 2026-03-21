@@ -1,10 +1,9 @@
 use crate::canvas::{self, CanvasState};
 use crate::debug_log::DebugLog;
 use crate::executor::Executor;
-use crate::panels::{self, PanelAction, PanelState, ScriptViewMode};
+use crate::panels::{self, PanelAction, PanelState};
 use crate::persistence::{self, UndoHistory};
 use crate::registry::NodeRegistry;
-use crate::scheme_engine::parse_port_declarations;
 use crate::theme;
 use crate::types::*;
 use crate::worker::{DeferredQueue, WorkRequest, WorkResult};
@@ -45,30 +44,36 @@ impl WasmCanvasApp {
             log::warn!("Failed to restore DB: {}", e);
         }
 
-        // Try loading demo graph on first launch
-        let demo_path = PathBuf::from("./demo.json");
-        let graph = if demo_path.exists() {
-            match persistence::load_graph(&demo_path, &executor.db) {
-                Ok(g) => {
-                    log::info!("Loaded demo graph");
-                    g
+        // Try loading demo graph on first launch (prefer .scm over .json)
+        let (graph, current_file) = {
+            let scm_path = PathBuf::from("./demo.scm");
+            let json_path = PathBuf::from("./demo.json");
+            if scm_path.exists() {
+                match persistence::load_graph_scm(&scm_path, &executor.db) {
+                    Ok(g) => {
+                        log::info!("Loaded demo graph from .scm");
+                        (g, Some(scm_path))
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to load demo.scm: {}", e);
+                        (Graph::new(), None)
+                    }
                 }
-                Err(e) => {
-                    log::warn!("Failed to load demo graph: {}", e);
-                    Graph::new()
+            } else if json_path.exists() {
+                match persistence::load_graph(&json_path, &executor.db) {
+                    Ok(g) => {
+                        log::info!("Loaded demo graph from .json");
+                        (g, Some(json_path))
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to load demo.json: {}", e);
+                        (Graph::new(), None)
+                    }
                 }
+            } else {
+                (Graph::new(), None)
             }
-        } else {
-            Graph::new()
         };
-        // Sync ports for Script nodes loaded from file
-        let mut graph = graph;
-        for node in graph.nodes.values_mut() {
-            if node.template_name == "Script" {
-                Self::sync_script_ports(node);
-            }
-        }
-
         let mut undo_history = UndoHistory::new(10);
         undo_history.push(&graph);
 
@@ -83,7 +88,7 @@ impl WasmCanvasApp {
             run_events: Vec::new(),
             auto_run: false,
             graph_dirty: false,
-            current_file: None,
+            current_file,
             theme_applied: false,
             pending_nodes: HashSet::new(),
             debug_log: DebugLog::new(),
@@ -94,36 +99,6 @@ impl WasmCanvasApp {
         let events = self.executor.execute_graph(&mut self.graph, &self.registry);
         self.run_events.extend(events);
         self.graph_dirty = false;
-    }
-
-    /// Parse (input)/(output) declarations from script code and sync node ports
-    fn sync_script_ports(node: &mut Node) {
-        use crate::scheme_engine::parse_port_declarations;
-
-        let (input_decls, output_decls) = parse_port_declarations(&node.script_code);
-
-        node.script_inputs = input_decls
-            .iter()
-            .map(|d| PortDef {
-                name: d.name.clone(),
-                port_type: PortType::from_str(&d.port_type).unwrap_or(PortType::F64),
-            })
-            .collect();
-
-        node.script_outputs = output_decls
-            .iter()
-            .map(|d| PortDef {
-                name: d.name.clone(),
-                port_type: PortType::from_str(&d.port_type).unwrap_or(PortType::F64),
-            })
-            .collect();
-
-        // Ensure input_values has defaults for new ports
-        for port in &node.script_inputs {
-            node.input_values
-                .entry(port.name.clone())
-                .or_insert_with(|| port.port_type.default_value());
-        }
     }
 
     fn compute_node(&mut self, node_id: NodeId) {
@@ -146,28 +121,17 @@ impl WasmCanvasApp {
         if let Some(node) = self.graph.nodes.get(&node_id) {
             if node.template_name == "Script" {
                 let code = node.script_code.clone();
-                let (input_decls, output_decls) = parse_port_declarations(&code);
 
-                let eff_inputs = node.effective_inputs(
-                    self.registry.templates.get(&node.template_name).map(|t| t as &NodeTemplate),
-                );
-                let resolved = self.graph.resolve_input_values(node_id, eff_inputs);
-                let bindings: Vec<(String, Value)> = input_decls
-                    .iter()
-                    .filter_map(|decl| {
-                        let val = resolved.get(&decl.name)?;
-                        Some((decl.name.clone(), val.clone()))
-                    })
-                    .collect();
-
-                let output_names: Vec<String> = output_decls.iter().map(|d| d.name.clone()).collect();
+                let mut available_inputs = self.graph.resolve_all_input_values(node_id);
+                for (k, v) in &node.widget_values {
+                    available_inputs.entry(k.clone()).or_insert_with(|| v.clone());
+                }
 
                 self.pending_nodes.insert(node_id);
                 self.worker.send(WorkRequest::Compute {
                     node_id,
                     code,
-                    input_bindings: bindings,
-                    output_names,
+                    available_inputs,
                     db: self.executor.db.clone(),
                 });
                 return;
@@ -204,6 +168,38 @@ impl WasmCanvasApp {
                         for (name, val) in &result.output_values {
                             n.output_values.insert(name.clone(), val.clone());
                         }
+                        // Update dynamic ports from script result
+                        if !result.declared_inputs.is_empty() || !result.declared_outputs.is_empty() {
+                            n.script_inputs = result.declared_inputs.iter()
+                                .map(|(name, type_str)| PortDef {
+                                    name: name.clone(),
+                                    port_type: PortType::from_str(type_str).unwrap_or(PortType::F64),
+                                })
+                                .collect();
+                            n.script_outputs = result.declared_outputs.iter()
+                                .map(|(name, type_str)| PortDef {
+                                    name: name.clone(),
+                                    port_type: PortType::from_str(type_str).unwrap_or(PortType::F64),
+                                })
+                                .collect();
+                        }
+                        n.widget_decls = result.widget_decls;
+                        // Initialize input_values defaults for new ports
+                        for port in &n.script_inputs {
+                            n.input_values.entry(port.name.clone())
+                                .or_insert_with(|| port.port_type.default_value());
+                        }
+                    }
+                    // Re-register outputs so downstream nodes can read them
+                    if let Some(node) = self.graph.nodes.get(&node_id) {
+                        self.executor.scheme.register_node_library(node_id, &node.output_values);
+                    }
+                    // Auto-recompute downstream nodes
+                    let descendants = self.graph.descendants_sorted(node_id);
+                    for did in descendants {
+                        if !self.pending_nodes.contains(&did) {
+                            self.compute_node(did);
+                        }
                     }
                 }
                 WorkResult::Error { node_id, message } => {
@@ -238,11 +234,6 @@ impl WasmCanvasApp {
                         self.compute_node(node_id);
                     }
                 }
-                PanelAction::SyncScriptPorts(id) => {
-                    if let Some(node) = self.graph.nodes.get_mut(&id) {
-                        Self::sync_script_ports(node);
-                    }
-                }
                 PanelAction::StepGraph => {
                     // TODO: step mode
                     self.run_graph();
@@ -259,13 +250,7 @@ impl WasmCanvasApp {
                 PanelAction::AddNode(name, pos) => {
                     if let Some(template) = self.registry.templates.get(&name) {
                         let template = template.clone();
-                        let id = self.graph.add_node(&template, pos);
-                        // Sync ports for Script nodes
-                        if template.builtin == Some(BuiltinKind::Script) {
-                            if let Some(node) = self.graph.nodes.get_mut(&id) {
-                                Self::sync_script_ports(node);
-                            }
-                        }
+                        let _id = self.graph.add_node(&template, pos);
                         self.undo_history.push(&self.graph);
                         self.graph_dirty = true;
                     }
@@ -278,6 +263,16 @@ impl WasmCanvasApp {
                         self.panel_state.selected_node = None;
                     }
                 }
+                PanelAction::UpdateWidget(node_id, key, val) => {
+                    if let Some(node) = self.graph.nodes.get_mut(&node_id) {
+                        node.widget_values.insert(key, val);
+                    }
+                    // Re-register node library with updated outputs and recompute
+                    if let Some(node) = self.graph.nodes.get(&node_id) {
+                        self.executor.scheme.register_node_library(node_id, &node.output_values);
+                    }
+                    self.compute_node(node_id);
+                }
             }
         }
     }
@@ -286,12 +281,18 @@ impl WasmCanvasApp {
         let path = self.current_file.clone().or_else(|| {
             rfd::FileDialog::new()
                 .set_title("Save Graph")
+                .add_filter("Scheme", &["scm"])
                 .add_filter("JSON", &["json"])
                 .save_file()
         });
 
         if let Some(path) = path {
-            if let Err(e) = persistence::save_graph(&self.graph, &path, &self.executor.db) {
+            let result = if path.extension().map_or(false, |e| e == "scm") {
+                persistence::save_graph_scm(&self.graph, &path, &self.executor.db)
+            } else {
+                persistence::save_graph(&self.graph, &path, &self.executor.db)
+            };
+            if let Err(e) = result {
                 log::error!("Failed to save graph: {}", e);
             } else {
                 self.current_file = Some(path);
@@ -302,11 +303,16 @@ impl WasmCanvasApp {
     fn load_graph(&mut self) {
         let path = rfd::FileDialog::new()
             .set_title("Load Graph")
-            .add_filter("JSON", &["json"])
+            .add_filter("Graph files", &["scm", "json"])
             .pick_file();
 
         if let Some(path) = path {
-            match persistence::load_graph(&path, &self.executor.db) {
+            let result = if path.extension().map_or(false, |e| e == "scm") {
+                persistence::load_graph_scm(&path, &self.executor.db)
+            } else {
+                persistence::load_graph(&path, &self.executor.db)
+            };
+            match result {
                 Ok(graph) => {
                     self.graph = graph;
                     self.undo_history.push(&self.graph);
@@ -446,6 +452,16 @@ impl eframe::App for WasmCanvasApp {
             for node_id in canvas_response.delete_nodes {
                 self.graph.remove_node(node_id);
                 self.graph_dirty = true;
+            }
+
+            for (node_id, key, val) in canvas_response.widget_updates {
+                if let Some(node) = self.graph.nodes.get_mut(&node_id) {
+                    node.widget_values.insert(key, val);
+                }
+                if let Some(node) = self.graph.nodes.get(&node_id) {
+                    self.executor.scheme.register_node_library(node_id, &node.output_values);
+                }
+                self.compute_node(node_id);
             }
             if self.graph_dirty {
                 self.undo_history.push(&self.graph);

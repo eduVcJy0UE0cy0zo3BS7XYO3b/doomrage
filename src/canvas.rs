@@ -1,9 +1,11 @@
+use crate::panels::PanelAction;
 use crate::registry::NodeRegistry;
+use crate::render::DrawCmd;
 use crate::theme::*;
 use crate::types::*;
 use egui::{
-    pos2, vec2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Sense, Stroke, StrokeKind,
-    Vec2,
+    pos2, vec2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, RichText, Sense, Stroke,
+    StrokeKind, Vec2,
 };
 
 const NODE_WIDTH: f32 = 180.0;
@@ -202,6 +204,78 @@ pub fn draw_canvas(
             &mut port_positions,
             node_id,
         );
+    }
+
+    // Draw interactive widget sliders on nodes
+    for &node_id in &node_ids {
+        let node = match graph.nodes.get(&node_id) {
+            Some(n) => n,
+            None => continue,
+        };
+        if node.widget_decls.is_empty() { continue; }
+        let template = registry.templates.get(&node.template_name);
+        let node_rect = node_screen_rect(node, template, canvas_rect, offset, zoom);
+        let preview_h = node_preview_height(node);
+        if preview_h <= 0.0 { continue; }
+
+        let preview_y = node_rect.bottom() - preview_h * zoom;
+        let mut wy = preview_y + 4.0 * zoom;
+
+        for wdecl in &node.widget_decls {
+            if wdecl.widget_type != "slider" { continue; }
+            let min = wdecl.params.first().copied().unwrap_or(0.0);
+            let max = wdecl.params.get(1).copied().unwrap_or(100.0);
+            let current = node.widget_values.get(&wdecl.name)
+                .map(|v| v.as_f64())
+                .unwrap_or(min);
+
+            let slider_rect = Rect::from_min_size(
+                pos2(node_rect.left() + 8.0 * zoom, wy + 2.0 * zoom),
+                vec2(node_rect.width() - 16.0 * zoom, (WIDGET_ROW_HEIGHT - 4.0) * zoom),
+            );
+
+            // Draw slider track + fill
+            let track_h = 4.0 * zoom;
+            let track_rect = Rect::from_min_size(
+                pos2(slider_rect.left(), slider_rect.center().y - track_h * 0.5),
+                vec2(slider_rect.width(), track_h),
+            );
+            painter.rect_filled(track_rect, CornerRadius::same(2), Color32::from_rgb(0xdd, 0xdd, 0xdd));
+
+            let frac = ((current - min) / (max - min).max(1e-10)).clamp(0.0, 1.0) as f32;
+            let fill_rect = Rect::from_min_size(
+                track_rect.left_top(),
+                vec2(track_rect.width() * frac, track_h),
+            );
+            painter.rect_filled(fill_rect, CornerRadius::same(2), ACCENT);
+
+            // Knob
+            let knob_x = slider_rect.left() + slider_rect.width() * frac;
+            painter.circle_filled(
+                pos2(knob_x, slider_rect.center().y),
+                5.0 * zoom,
+                Color32::WHITE,
+            );
+            painter.circle_stroke(
+                pos2(knob_x, slider_rect.center().y),
+                5.0 * zoom,
+                Stroke::new(1.0 * zoom, ACCENT),
+            );
+
+            // Handle drag on slider
+            let slider_sense_rect = slider_rect.expand(2.0 * zoom);
+            let slider_id = egui::Id::new(("node_slider", node_id, &wdecl.name));
+            let slider_resp = ui.interact(slider_sense_rect, slider_id, Sense::drag());
+            if slider_resp.dragged() {
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    let local_x = (pos.x - slider_rect.left()) / slider_rect.width();
+                    let new_val = min + (max - min) * local_x.clamp(0.0, 1.0) as f64;
+                    response.widget_updates.push((node_id, wdecl.name.clone(), Value::F64(new_val)));
+                }
+            }
+
+            wy += WIDGET_ROW_HEIGHT * zoom;
+        }
     }
 
     // Handle interactions
@@ -451,12 +525,35 @@ fn draw_grid(painter: &Painter, rect: Rect, offset: Vec2, zoom: f32) {
     }
 }
 
-fn node_width(template: Option<&NodeTemplate>, _node: &Node) -> f32 {
-    if template.map_or(false, |t| t.builtin == Some(BuiltinKind::Script)) {
+fn node_width(template: Option<&NodeTemplate>, node: &Node) -> f32 {
+    let base = if template.map_or(false, |t| t.builtin == Some(BuiltinKind::Script)) {
         SCRIPT_NODE_WIDTH
     } else {
         NODE_WIDTH
+    };
+    // Expand width if canvas blocks need more space
+    let mut max_canvas_w = 0.0f32;
+    for block in &node.render_blocks {
+        if let crate::render::RenderBlock::Canvas { width, .. } = block {
+            max_canvas_w = max_canvas_w.max(*width as f32 + CANVAS_PREVIEW_PADDING * 2.0);
+        }
     }
+    base.max(max_canvas_w)
+}
+
+const WIDGET_ROW_HEIGHT: f32 = 22.0;
+const CANVAS_PREVIEW_PADDING: f32 = 4.0;
+
+fn node_preview_height(node: &Node) -> f32 {
+    let mut h = 0.0;
+    h += node.widget_decls.len() as f32 * WIDGET_ROW_HEIGHT;
+    for block in &node.render_blocks {
+        if let crate::render::RenderBlock::Canvas { height, .. } = block {
+            h += *height as f32 + CANVAS_PREVIEW_PADDING * 2.0;
+        }
+    }
+    if h > 0.0 { h += 4.0; }
+    h
 }
 
 fn node_height(template: Option<&NodeTemplate>, node: &Node) -> f32 {
@@ -470,6 +567,7 @@ fn node_height(template: Option<&NodeTemplate>, node: &Node) -> f32 {
     HEADER_HEIGHT
         + port_count as f32 * PORT_ROW_HEIGHT
         + if has_result { RESULT_HEIGHT } else { 0.0 }
+        + node_preview_height(node)
         + 4.0
 }
 
@@ -760,6 +858,109 @@ fn draw_node(
             );
         }
 
+        // Draw preview: canvas blocks
+        let preview_h = node_preview_height(node);
+        if preview_h > 0.0 {
+            let preview_y = rect.bottom() - preview_h * zoom;
+            painter.line_segment(
+                [
+                    pos2(rect.left() + 4.0, preview_y),
+                    pos2(rect.right() - 4.0, preview_y),
+                ],
+                Stroke::new(0.5, NODE_BORDER),
+            );
+            let mut cy = preview_y + 4.0 * zoom;
+            // Widget decl labels (actual sliders drawn via ui later)
+            for wdecl in &node.widget_decls {
+                let font = FontId::proportional(10.0 * zoom);
+                painter.text(
+                    pos2(rect.left() + 8.0 * zoom, cy + WIDGET_ROW_HEIGHT * zoom * 0.5),
+                    egui::Align2::LEFT_CENTER,
+                    &wdecl.name,
+                    font,
+                    TEXT_DIM,
+                );
+                cy += WIDGET_ROW_HEIGHT * zoom;
+            }
+            // Canvas blocks
+            for block in &node.render_blocks {
+                if let crate::render::RenderBlock::Canvas { width, height, commands } = block {
+                    let cw = *width as f32;
+                    let ch = *height as f32;
+                    let scale = zoom.min((rect.width() - CANVAS_PREVIEW_PADDING * 2.0 * zoom) / cw);
+                    let origin = pos2(
+                        rect.left() + CANVAS_PREVIEW_PADDING * zoom,
+                        cy + CANVAS_PREVIEW_PADDING * zoom,
+                    );
+                    paint_draw_cmds(painter, commands, origin, scale);
+                    cy += (ch + CANVAS_PREVIEW_PADDING * 2.0) * zoom;
+                }
+            }
+        }
+
+    }
+}
+
+fn parse_hex_color(s: &str) -> Color32 {
+    let s = s.trim_start_matches('#');
+    if s.len() >= 6 {
+        let r = u8::from_str_radix(&s[0..2], 16).unwrap_or(128);
+        let g = u8::from_str_radix(&s[2..4], 16).unwrap_or(128);
+        let b = u8::from_str_radix(&s[4..6], 16).unwrap_or(128);
+        Color32::from_rgb(r, g, b)
+    } else {
+        Color32::from_rgb(128, 128, 128)
+    }
+}
+
+fn paint_draw_cmds(painter: &Painter, commands: &[DrawCmd], origin: Pos2, scale: f32) {
+    for cmd in commands {
+        match cmd {
+            DrawCmd::Line { x1, y1, x2, y2, color, width } => {
+                painter.line_segment(
+                    [
+                        origin + vec2(*x1 as f32 * scale, *y1 as f32 * scale),
+                        origin + vec2(*x2 as f32 * scale, *y2 as f32 * scale),
+                    ],
+                    Stroke::new(*width as f32 * scale, parse_hex_color(color)),
+                );
+            }
+            DrawCmd::Rect { x, y, w, h, fill } => {
+                let r = Rect::from_min_size(
+                    origin + vec2(*x as f32 * scale, *y as f32 * scale),
+                    vec2(*w as f32 * scale, *h as f32 * scale),
+                );
+                painter.rect_filled(r, CornerRadius::ZERO, parse_hex_color(fill));
+            }
+            DrawCmd::Circle { x, y, r, fill } => {
+                painter.circle_filled(
+                    origin + vec2(*x as f32 * scale, *y as f32 * scale),
+                    *r as f32 * scale,
+                    parse_hex_color(fill),
+                );
+            }
+            DrawCmd::Polyline { points, color, width } => {
+                if points.len() >= 2 {
+                    let stroke = Stroke::new(*width as f32 * scale, parse_hex_color(color));
+                    let pts: Vec<Pos2> = points.iter()
+                        .map(|p| origin + vec2(p[0] as f32 * scale, p[1] as f32 * scale))
+                        .collect();
+                    for pair in pts.windows(2) {
+                        painter.line_segment([pair[0], pair[1]], stroke);
+                    }
+                }
+            }
+            DrawCmd::Text { x, y, text, color, size } => {
+                let font = FontId::proportional(*size as f32 * scale);
+                painter.text(
+                    origin + vec2(*x as f32 * scale, *y as f32 * scale),
+                    egui::Align2::LEFT_TOP,
+                    text,
+                    font,
+                    parse_hex_color(color),
+                );
+            }
+        }
     }
 }
 
@@ -857,4 +1058,5 @@ pub struct CanvasResponse {
     pub node_selected: Option<NodeId>,
     pub new_connection: Option<(NodeId, String, NodeId, String)>,
     pub delete_nodes: Vec<NodeId>,
+    pub widget_updates: Vec<(NodeId, String, Value)>,
 }

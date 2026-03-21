@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DrawCmd {
+    Line { x1: f64, y1: f64, x2: f64, y2: f64, color: String, width: f64 },
+    Rect { x: f64, y: f64, w: f64, h: f64, fill: String },
+    Circle { x: f64, y: f64, r: f64, fill: String },
+    Polyline { points: Vec<[f64; 2]>, color: String, width: f64 },
+    Text { x: f64, y: f64, text: String, color: String, size: f64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RenderBlock {
     Text(String),
     Bold(String),
@@ -20,6 +29,7 @@ pub enum RenderBlock {
     TextInput { key: String, placeholder: String },
     Slider { key: String, min: f64, max: f64 },
     EditableList { key: String },
+    Canvas { width: f64, height: f64, commands: Vec<DrawCmd> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

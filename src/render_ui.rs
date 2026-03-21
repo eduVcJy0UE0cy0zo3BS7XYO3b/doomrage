@@ -227,6 +227,10 @@ pub fn paint_render_blocks(
             | RenderBlock::EditableList { .. } => {
                 y += line_height;
             }
+            RenderBlock::Canvas { height, .. } => {
+                // Canvas blocks are rendered in the inspector panel
+                y += *height as f32 * zoom;
+            }
         }
     }
 

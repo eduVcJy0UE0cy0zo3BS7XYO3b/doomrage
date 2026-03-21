@@ -1,7 +1,8 @@
 use crate::db::Db;
 use crate::render::RenderBlock;
-use crate::scheme_engine::{parse_port_declarations, SchemeEngine, ScriptResult};
+use crate::scheme_engine::{SchemeEngine, ScriptResult};
 use crate::types::{NodeId, Value};
+use std::collections::HashMap;
 
 /// Work request — stored, executed next frame in main thread
 pub enum WorkRequest {
@@ -13,8 +14,7 @@ pub enum WorkRequest {
     Compute {
         node_id: NodeId,
         code: String,
-        input_bindings: Vec<(String, Value)>,
-        output_names: Vec<String>,
+        available_inputs: HashMap<String, Value>,
         db: Db,
     },
 }
@@ -70,10 +70,7 @@ fn execute_request(engine: &SchemeEngine, request: WorkRequest) -> WorkResult {
             code,
             db,
         } => {
-            let (input_decls, _) = parse_port_declarations(&code);
-            let input_names: Vec<String> = input_decls.iter().map(|d| d.name.clone()).collect();
-
-            match engine.preview_script(&input_names, Some(&db), &code) {
+            match engine.preview_script(Some(&db), &code) {
                 Ok(r) => WorkResult::Preview {
                     node_id,
                     blocks: r.render_blocks,
@@ -87,10 +84,9 @@ fn execute_request(engine: &SchemeEngine, request: WorkRequest) -> WorkResult {
         WorkRequest::Compute {
             node_id,
             code,
-            input_bindings,
-            output_names,
+            available_inputs,
             db,
-        } => match engine.execute_script(&input_bindings, &output_names, Some(&db), &code) {
+        } => match engine.execute_script(&available_inputs, Some(&db), &code) {
             Ok(result) => WorkResult::Compute { node_id, result },
             Err(e) => WorkResult::Error {
                 node_id,

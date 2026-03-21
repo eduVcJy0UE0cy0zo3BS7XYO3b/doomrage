@@ -1,11 +1,10 @@
-use crate::preprocessor;
 use crate::render::RenderBlock;
 use crate::scheme_convert::try_parse_render_from_value;
-pub use crate::scheme_convert::{parse_port_declarations, scheme_value_to_json};
+pub use crate::scheme_convert::scheme_value_to_json;
 use anyhow::Result;
 use scheme_rs::env::TopLevelEnvironment;
 use scheme_rs::runtime::Runtime;
-use scheme_rs::value::Value;
+use scheme_rs::value::{UnpackedValue, Value};
 use std::collections::HashMap;
 
 const CANVAS_RENDER_LIB: &str = r#"
@@ -15,7 +14,8 @@ const CANVAS_RENDER_LIB: &str = r#"
           plot-line plot-scatter plot-bar
           numbered-list bullet-list
           button checkbox text-input slider editable-list
-          json-null)
+          json-null
+          canvas draw-line draw-rect draw-circle draw-polyline draw-text)
   (import (rnrs))
 
   ;; Sentinel for uncomputed values
@@ -94,6 +94,14 @@ const CANVAS_RENDER_LIB: &str = r#"
     (list 'render-slider key lo hi))
   (define (editable-list key)
     (list 'render-editable-list key))
+
+  ;; Generic canvas drawing
+  (define (canvas w h . cmds) (list 'render-canvas w h cmds))
+  (define (draw-line x1 y1 x2 y2 color width) (list 'line x1 y1 x2 y2 color width))
+  (define (draw-rect x y w h fill) (list 'rect x y w h fill))
+  (define (draw-circle x y r fill) (list 'circle x y r fill))
+  (define (draw-polyline pts color width) (list 'polyline pts color width))
+  (define (draw-text x y txt color size) (list 'text x y txt color size))
 )
 "#;
 
@@ -119,6 +127,216 @@ const CANVAS_PREVIEW_LIB: &str = r#"
 )
 "#;
 
+const CANVAS_SCRIBBLE_LIB: &str = r###"
+(library (canvas scribble)
+  (export scribble-preprocess)
+  (import (rnrs))
+
+  ;; --- String utilities ---
+
+  (define (string-lines str)
+    (let ((len (string-length str)))
+      (let loop ((i 0) (start 0) (acc '()))
+        (cond
+          ((= i len)
+           (reverse (cons (substring str start len) acc)))
+          ((char=? (string-ref str i) #\newline)
+           (loop (+ i 1) (+ i 1) (cons (substring str start i) acc)))
+          (else (loop (+ i 1) start acc))))))
+
+  (define (string-trim str)
+    (let* ((len (string-length str))
+           (s (let loop ((i 0))
+                (if (and (< i len) (char-whitespace? (string-ref str i)))
+                    (loop (+ i 1)) i)))
+           (e (let loop ((i len))
+                (if (and (> i s) (char-whitespace? (string-ref str (- i 1))))
+                    (loop (- i 1)) i))))
+      (substring str s e)))
+
+  (define (starts-with? str pre)
+    (let ((sl (string-length str)) (pl (string-length pre)))
+      (and (>= sl pl) (string=? (substring str 0 pl) pre))))
+
+  (define (ends-with? str suf)
+    (let ((sl (string-length str)) (pl (string-length suf)))
+      (and (>= sl pl) (string=? (substring str (- sl pl) sl) suf))))
+
+  (define (split-by-char str ch)
+    (let ((len (string-length str)))
+      (let loop ((i 0) (start 0) (acc '()))
+        (cond
+          ((= i len) (reverse (cons (substring str start len) acc)))
+          ((char=? (string-ref str i) ch)
+           (loop (+ i 1) (+ i 1) (cons (substring str start i) acc)))
+          (else (loop (+ i 1) start acc))))))
+
+  (define (str-join lst sep)
+    (if (null? lst) ""
+        (let loop ((rest (cdr lst)) (out (car lst)))
+          (if (null? rest) out
+              (loop (cdr rest) (string-append out sep (car rest)))))))
+
+  (define (every-char? pred str)
+    (let ((len (string-length str)))
+      (let loop ((i 0))
+        (or (= i len) (and (pred (string-ref str i)) (loop (+ i 1)))))))
+
+  (define (all? pred lst)
+    (or (null? lst) (and (pred (car lst)) (all? pred (cdr lst)))))
+
+  (define (escape s)
+    (let ((len (string-length s)))
+      (let loop ((i 0) (out '()))
+        (if (= i len) (list->string (reverse out))
+            (let ((c (string-ref s i)))
+              (cond
+                ((char=? c #\\) (loop (+ i 1) (cons #\\ (cons #\\ out))))
+                ((char=? c #\") (loop (+ i 1) (cons #\" (cons #\\ out))))
+                (else (loop (+ i 1) (cons c out)))))))))
+
+  (define (ident-char? c)
+    (or (char-alphabetic? c) (char-numeric? c)
+        (char=? c #\-) (char=? c #\_) (char=? c #\?) (char=? c #\!)))
+
+  ;; --- Inline @-expression processing ---
+
+  (define (process-inline text)
+    (let ((len (string-length text)))
+      (let loop ((i 0) (s 0) (parts '()))
+        (cond
+          ((= i len)
+           (let ((final (if (< s i)
+                            (cons (string-append "\"" (escape (substring text s i)) "\"") parts)
+                            parts)))
+             (if (null? final) "\"\""
+                 (str-join (reverse final) " "))))
+
+          ((and (char=? (string-ref text i) #\@) (< (+ i 1) len))
+           (let ((nc (string-ref text (+ i 1))))
+             (cond
+               ;; @(expr)
+               ((char=? nc #\()
+                (let ((flushed (if (< s i)
+                                   (cons (string-append "\"" (escape (substring text s i)) "\"") parts)
+                                   parts)))
+                  (let ploop ((j (+ i 1)) (d 0))
+                    (cond
+                      ((= j len) (loop len len (cons (substring text (+ i 1) j) flushed)))
+                      ((char=? (string-ref text j) #\() (ploop (+ j 1) (+ d 1)))
+                      ((char=? (string-ref text j) #\))
+                       (if (= d 1)
+                           (loop (+ j 1) (+ j 1) (cons (substring text (+ i 1) (+ j 1)) flushed))
+                           (ploop (+ j 1) (- d 1))))
+                      (else (ploop (+ j 1) d))))))
+
+               ;; @name
+               ((ident-char? nc)
+                (let ((flushed (if (< s i)
+                                   (cons (string-append "\"" (escape (substring text s i)) "\"") parts)
+                                   parts)))
+                  (let nloop ((j (+ i 1)))
+                    (if (and (< j len) (ident-char? (string-ref text j)))
+                        (nloop (+ j 1))
+                        (loop j j (cons (substring text (+ i 1) j) flushed))))))
+
+               ;; bare @
+               (else (loop (+ i 1) s parts)))))
+
+          (else (loop (+ i 1) s parts))))))
+
+  ;; --- Table builder ---
+
+  (define (build-table headers rows)
+    (string-append
+     "(table (list " (str-join (map process-inline headers) " ")
+     ") (list " (str-join (map (lambda (row)
+                                 (string-append "(list " (str-join (map process-inline row) " ") ")"))
+                               rows) " ")
+     "))"))
+
+  ;; Flush pending table into render parts
+  (define (flush-tbl render hdr rows)
+    (if hdr (cons (build-table hdr (reverse rows)) render) render))
+
+  ;; --- Main preprocessor ---
+
+  (define (scribble-preprocess source)
+    (let ((lines (string-lines source)))
+      (let loop ((ls lines) (scm '()) (ren '()) (hdr #f) (trows '()) (in-r #f))
+        (if (null? ls)
+            (let ((final-ren (flush-tbl ren hdr trows)))
+              (build-output (reverse scm) (reverse final-ren)))
+
+            (let ((t (string-trim (car ls))) (rest (cdr ls)))
+              (cond
+                ;; blank line
+                ((= (string-length t) 0)
+                 (loop rest scm (flush-tbl ren hdr trows) #f '() in-r))
+
+                ;; scheme line (starts with paren, not in render mode)
+                ((and (char=? (string-ref t 0) #\() (not in-r))
+                 (loop rest (cons t scm) (flush-tbl ren hdr trows) #f '() #f))
+
+                ;; hr
+                ((or (string=? t "---") (string=? t "***") (string=? t "___"))
+                 (loop rest scm (cons "(hr)" (flush-tbl ren hdr trows)) #f '() #t))
+
+                ;; ## heading
+                ((starts-with? t "## ")
+                 (let ((txt (substring t 3 (string-length t))))
+                   (loop rest scm
+                         (cons (string-append "(italic " (process-inline txt) ")")
+                               (flush-tbl ren hdr trows))
+                         #f '() #t)))
+
+                ;; # heading
+                ((starts-with? t "# ")
+                 (let ((txt (substring t 2 (string-length t))))
+                   (loop rest scm
+                         (cons (string-append "(bold " (process-inline txt) ")")
+                               (flush-tbl ren hdr trows))
+                         #f '() #t)))
+
+                ;; table row
+                ((and (char=? (string-ref t 0) #\|) (ends-with? t "|"))
+                 (let* ((inner (substring t 1 (- (string-length t) 1)))
+                        (cells (map string-trim (split-by-char inner #\|))))
+                   (if (all? (lambda (c)
+                               (every-char? (lambda (ch) (or (char=? ch #\-) (char=? ch #\:))) c))
+                             cells)
+                       ;; separator row - skip
+                       (loop rest scm ren hdr trows #t)
+                       ;; data row
+                       (if hdr
+                           (loop rest scm ren hdr (cons cells trows) #t)
+                           (loop rest scm ren cells '() #t)))))
+
+                ;; standalone @(expr)
+                ((and (starts-with? t "@(") (ends-with? t ")"))
+                 (loop rest scm
+                       (cons (substring t 1 (string-length t))
+                             (flush-tbl ren hdr trows))
+                       #f '() #t))
+
+                ;; plain text
+                (else
+                 (loop rest scm
+                       (cons (string-append "(text " (process-inline t) ")")
+                             (flush-tbl ren hdr trows))
+                       #f '() #t))))))))
+
+  ;; Build final output
+  (define (build-output scm-lines ren-parts)
+    (string-append
+     (str-join (map (lambda (l) (string-append l "\n")) scm-lines) "")
+     (if (null? ren-parts) ""
+         (string-append "(render\n"
+                        (str-join (map (lambda (p) (string-append "  " p "\n")) ren-parts) "")
+                        ")"))))
+)
+"###;
+
 pub struct SchemeEngine {
     pub runtime: Runtime,
     env: TopLevelEnvironment,
@@ -142,6 +360,8 @@ impl SchemeEngine {
             .map_err(|e| anyhow::anyhow!("Failed to define (canvas render): {}", e))?;
         runtime.def_lib(CANVAS_PREVIEW_LIB)
             .map_err(|e| anyhow::anyhow!("Failed to define (canvas preview): {}", e))?;
+        runtime.def_lib(CANVAS_SCRIBBLE_LIB)
+            .map_err(|e| anyhow::anyhow!("Failed to define (canvas scribble): {}", e))?;
 
         let env = TopLevelEnvironment::new_repl(&runtime);
         env.eval(true, "(import (rnrs))")
@@ -150,10 +370,23 @@ impl SchemeEngine {
             .map_err(|e| anyhow::anyhow!("Failed to import canvas db: {}", e))?;
         env.eval(true, "(import (canvas render))")
             .map_err(|e| anyhow::anyhow!("Failed to import canvas render: {}", e))?;
+        env.eval(true, "(import (canvas ports))")
+            .map_err(|e| anyhow::anyhow!("Failed to import canvas ports: {}", e))?;
+        env.eval(true, "(import (canvas scribble))")
+            .map_err(|e| anyhow::anyhow!("Failed to import canvas scribble: {}", e))?;
 
-        // Port declarations are no-ops at runtime (parsed statically by Rust)
-        env.eval(false, "(define (input name type) \"\") (define (output name type) \"\")")
-            .map_err(|e| anyhow::anyhow!("Failed to define input/output stubs: {}", e))?;
+        // Port declaration wrappers: call bridge functions from (canvas ports)
+        env.eval(false, r#"
+            (define (input name type) (register-input name type))
+            (define (output name type) (register-output name type))
+            (define (widget name type . params)
+              (register-widget name type
+                (if (null? params) 0 (car params))
+                (if (or (null? params) (null? (cdr params))) 0 (cadr params))))
+            (define (slider name lo hi) (register-widget name 'slider lo hi))
+            (define (checkbox name) (register-widget name 'checkbox 0 0))
+        "#)
+            .map_err(|e| anyhow::anyhow!("Failed to define port wrappers: {}", e))?;
 
         log::info!("SchemeEngine ready");
         Ok(Self { runtime, env })
@@ -166,10 +399,19 @@ impl SchemeEngine {
     /// Create a persistent REPL environment with all canvas libraries imported.
     pub fn make_repl_env(&self) -> Result<TopLevelEnvironment> {
         let env = TopLevelEnvironment::new_repl(&self.runtime);
-        env.eval(true, "(import (rnrs) (canvas db) (canvas render) (canvas graph))")
+        env.eval(true, "(import (rnrs) (canvas db) (canvas render) (canvas graph) (canvas ports))")
             .map_err(|e| anyhow::anyhow!("Failed to setup REPL env: {}", e))?;
-        env.eval(false, "(define (input name type) \"\") (define (output name type) \"\")")
-            .map_err(|e| anyhow::anyhow!("Failed to define stubs in REPL env: {}", e))?;
+        env.eval(false, r#"
+            (define (input name type) (register-input name type))
+            (define (output name type) (register-output name type))
+            (define (widget name type . params)
+              (register-widget name type
+                (if (null? params) 0 (car params))
+                (if (or (null? params) (null? (cdr params))) 0 (cadr params))))
+            (define (slider name lo hi) (register-widget name 'slider lo hi))
+            (define (checkbox name) (register-widget name 'checkbox 0 0))
+        "#)
+            .map_err(|e| anyhow::anyhow!("Failed to define port wrappers in REPL env: {}", e))?;
         Ok(env)
     }
 
@@ -232,6 +474,84 @@ impl SchemeEngine {
         }
     }
 
+    /// Call the Scheme preprocessor to convert Scribble markup into pure Scheme.
+    fn preprocess_code(&self, env: &TopLevelEnvironment, code: &str) -> Result<String> {
+        let code_literal = crate::types::Value::Str(code.to_string()).to_scheme_literal();
+        let results = env.eval(false, &format!("(scribble-preprocess {})", code_literal))
+            .map_err(|e| anyhow::anyhow!("Preprocessing failed: {}", e))?;
+        match results.first() {
+            Some(val) => match val.clone().unpack() {
+                UnpackedValue::String(s) => Ok(String::from(s)),
+                _ => Err(anyhow::anyhow!("Preprocessor returned non-string: {}", val)),
+            },
+            None => Ok(String::new()),
+        }
+    }
+
+    /// Split code string into individual top-level S-expressions.
+    /// Tracks paren depth and string literals to find form boundaries.
+    fn split_toplevel_forms(code: &str) -> Vec<String> {
+        let mut forms = Vec::new();
+        let mut depth: i32 = 0;
+        let mut start = None;
+        let mut in_string = false;
+        let mut escape = false;
+
+        for (i, c) in code.char_indices() {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if c == '\\' && in_string {
+                escape = true;
+                continue;
+            }
+            if c == '"' {
+                in_string = !in_string;
+                continue;
+            }
+            if in_string {
+                continue;
+            }
+
+            if c == '(' {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start {
+                        forms.push(code[s..=i].to_string());
+                        start = None;
+                    }
+                }
+            }
+        }
+        forms
+    }
+
+    /// Eval preprocessed code form-by-form.
+    /// Imports need `eval(true, ...)`. Everything else uses `eval(false, ...)`
+    /// which persists defines in the REPL env and allows runtime variable lookup.
+    fn eval_forms(env: &TopLevelEnvironment, code: &str) -> Result<Vec<Value>> {
+        let forms = Self::split_toplevel_forms(code);
+        let mut results = Vec::new();
+        for form in &forms {
+            let trimmed = form.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let is_import = trimmed.starts_with("(import ");
+            let r = env
+                .eval(is_import, trimmed)
+                .map_err(|e| anyhow::anyhow!("Eval failed: {}", e))?;
+            results.extend(r);
+        }
+        Ok(results)
+    }
+
     pub fn eval(&self, code: &str) -> Result<Vec<Value>> {
         let env = self.make_env();
         let results = env
@@ -240,38 +560,30 @@ impl SchemeEngine {
         Ok(results)
     }
 
-    /// Execute a script node: bind inputs + db, eval code, extract outputs by name
+    /// Execute a script node: bind inputs via bridge, eval code, extract outputs dynamically
     pub fn execute_script(
         &self,
-        input_bindings: &[(String, crate::types::Value)],
-        output_names: &[String],
+        available_inputs: &HashMap<String, crate::types::Value>,
         db: Option<&crate::db::Db>,
         code: &str,
     ) -> Result<ScriptResult> {
         let env = self.make_env();
 
-        let stripped = preprocessor::preprocess(code);
+        let stripped = self.preprocess_code(&env, code)?;
 
-        if !input_bindings.is_empty() {
-            let defines: String = input_bindings
-                .iter()
-                .map(|(name, val)| format!("(define {} {})", name, val.to_scheme_literal()))
-                .collect::<Vec<_>>()
-                .join(" ");
-            env.eval(false, &defines)
-                .map_err(|e| anyhow::anyhow!("Binding setup failed: {}", e))?;
-        }
-
-        let eval_fn = || {
-            env.eval(true, &stripped)
-                .map_err(|e| anyhow::anyhow!("Eval failed: {}", e))
-        };
-
-        let results = if let Some(db) = db {
-            crate::bridge::with_db_context(db, eval_fn)?
-        } else {
-            eval_fn()?
-        };
+        // Eval with port context, each top-level form separately
+        let (eval_result, port_registry) = crate::bridge::with_port_context(
+            Some(available_inputs),
+            || {
+                let eval_fn = || Self::eval_forms(&env, &stripped);
+                if let Some(db) = db {
+                    crate::bridge::with_db_context(db, eval_fn)
+                } else {
+                    eval_fn()
+                }
+            },
+        );
+        let results = eval_result?;
 
         let mut render_blocks = Vec::new();
         for val in &results {
@@ -280,9 +592,13 @@ impl SchemeEngine {
             }
         }
 
+        let (declared_inputs, declared_outputs, widget_decls) =
+            (port_registry.inputs, port_registry.outputs, port_registry.widgets);
+
         // Collect output values by name from environment
+        let output_names: Vec<String> = declared_outputs.iter().map(|(name, _)| name.clone()).collect();
         let mut output_values = HashMap::new();
-        for name in output_names {
+        for name in &output_names {
             if let Ok(vals) = env.eval(false, name) {
                 if let Some(val) = vals.first() {
                     let typed_val = if let Some(f) = val.cast_to_scheme_type::<f64>() {
@@ -298,29 +614,21 @@ impl SchemeEngine {
         Ok(ScriptResult {
             output_values,
             render_blocks,
+            declared_inputs,
+            declared_outputs,
+            widget_decls,
         })
     }
 
     /// Preview: bind all inputs as <compute> placeholder, eval for structure only
     pub fn preview_script(
         &self,
-        input_names: &[String],
         db: Option<&crate::db::Db>,
         code: &str,
     ) -> Result<ScriptResult> {
         let env = self.make_env();
 
-        let stripped = preprocessor::preprocess(code);
-
-        if !input_names.is_empty() {
-            let defines: String = input_names
-                .iter()
-                .map(|name| format!("(define {} <compute>)", name))
-                .collect::<Vec<_>>()
-                .join(" ");
-            env.eval(false, &defines)
-                .map_err(|e| anyhow::anyhow!("Preview binding failed: {}", e))?;
-        }
+        let stripped = self.preprocess_code(&env, code)?;
 
         env.eval(true, "(import (canvas preview))")
             .map_err(|e| anyhow::anyhow!("Preview import failed: {}", e))?;
@@ -334,16 +642,19 @@ impl SchemeEngine {
         "#)
             .map_err(|e| anyhow::anyhow!("Safe override failed: {}", e))?;
 
-        let eval_fn = || {
-            env.eval(false, &stripped)
-                .map_err(|e| anyhow::anyhow!("Preview eval failed: {}", e))
-        };
-
-        let results = if let Some(db) = db {
-            crate::bridge::with_db_context(db, eval_fn)?
-        } else {
-            eval_fn()?
-        };
+        // Eval with port context (None = preview mode, inputs return <compute>)
+        let (eval_result, _port_registry) = crate::bridge::with_port_context(
+            None,
+            || {
+                let eval_fn = || Self::eval_forms(&env, &stripped);
+                if let Some(db) = db {
+                    crate::bridge::with_db_context(db, eval_fn)
+                } else {
+                    eval_fn()
+                }
+            },
+        );
+        let results = eval_result?;
 
         let mut render_blocks = Vec::new();
         for val in &results {
@@ -355,6 +666,9 @@ impl SchemeEngine {
         Ok(ScriptResult {
             output_values: HashMap::new(),
             render_blocks,
+            declared_inputs: Vec::new(),
+            declared_outputs: Vec::new(),
+            widget_decls: Vec::new(),
         })
     }
 
@@ -364,11 +678,97 @@ impl SchemeEngine {
 pub struct ScriptResult {
     pub output_values: HashMap<String, crate::types::Value>,
     pub render_blocks: Vec<RenderBlock>,
+    pub declared_inputs: Vec<(String, String)>,
+    pub declared_outputs: Vec<(String, String)>,
+    pub widget_decls: Vec<crate::bridge::WidgetDecl>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_scribble_preprocess() {
+        let engine = SchemeEngine::new().unwrap();
+        let env = engine.make_env();
+        let output = engine.preprocess_code(&env, r#"(define x (input 'x 'f64))
+(define result (output 'result 'f64))
+
+(set! result (* x 2))
+
+# My Analysis
+
+The result is @result.
+
+---
+
+| name | value |
+|------|-------|
+| x    | @x    |
+
+@(plot-line '(1 2 3) "test")
+"#).unwrap();
+        println!("--- preprocessed ---\n{}\n---", output);
+        assert!(output.contains("(define x (input 'x 'f64))"));
+        assert!(output.contains("(define result (output 'result 'f64))"));
+        assert!(output.contains("(set! result (* x 2))"));
+        assert!(output.contains("(render"));
+        assert!(output.contains(r#"(bold "My Analysis")"#));
+        assert!(output.contains("result"));
+        assert!(output.contains("(hr)"));
+        assert!(output.contains("(table"));
+        assert!(output.contains("(plot-line '(1 2 3) \"test\")"));
+    }
+
+    #[test]
+    fn test_scribble_inline_expressions() {
+        let engine = SchemeEngine::new().unwrap();
+        let env = engine.make_env();
+
+        // Test inline @name
+        let output = engine.preprocess_code(&env, "hello @name world").unwrap();
+        assert!(output.contains(r#""hello " name " world""#));
+
+        // Test inline @(expr)
+        let output = engine.preprocess_code(&env, "sum = @(+ x y)!").unwrap();
+        assert!(output.contains(r#""sum = " (+ x y) "!""#));
+
+        // Test plain text
+        let output = engine.preprocess_code(&env, "no at signs").unwrap();
+        assert!(output.contains(r#""no at signs""#));
+    }
+
+    #[test]
+    fn test_interleaved_defines() {
+        let engine = SchemeEngine::new().unwrap();
+        let db = crate::db::Db::new().unwrap();
+        db.kv_set("gain", serde_json::json!(2.0));
+        // define after set!, then use the defined variable
+        let result = engine.execute_script(
+            &inputs(&[("x", 5.0)]),
+            Some(&db),
+            "(define x (input 'x 'f64))\n(define r (output 'r 'f64))\n(set! r (* x 2))\n(define gain (store-get \"gain\"))\n(set! r (* r gain))",
+        ).unwrap();
+        // x=5, r=5*2=10, gain=2, r=10*2=20
+        assert!(matches!(result.output_values.get("r"), Some(crate::types::Value::F64(v)) if (*v - 20.0).abs() < 1e-10));
+    }
+
+    #[test]
+    fn test_define_visible_in_render_block() {
+        let engine = SchemeEngine::new().unwrap();
+        let db = crate::db::Db::new().unwrap();
+        db.kv_set("gain", serde_json::json!(2.0));
+        // define from store-get, then reference in Scribble render block
+        let result = engine.execute_script(
+            &HashMap::new(),
+            Some(&db),
+            "(define gain (store-get \"gain\"))\n\n# Result\n\nGain is @gain.",
+        ).unwrap();
+        assert!(!result.render_blocks.is_empty());
+        let has_gain = result.render_blocks.iter().any(|b|
+            matches!(b, RenderBlock::Text(t) if t.contains("2")));
+        assert!(has_gain, "Expected render block with gain value, got: {:?}", result.render_blocks);
+    }
 
     #[test]
     fn test_basic_arithmetic() {
@@ -380,14 +780,15 @@ mod tests {
         assert!(val.is_some());
     }
 
+    fn inputs(pairs: &[(&str, f64)]) -> HashMap<String, crate::types::Value> {
+        pairs.iter().map(|(k, v)| (k.to_string(), crate::types::Value::F64(*v))).collect()
+    }
+
     #[test]
     fn test_with_bindings() {
         let engine = SchemeEngine::new().unwrap();
-        let bindings = vec![
-            ("x".to_string(), crate::types::Value::F64(7.0)),
-            ("y".to_string(), crate::types::Value::F64(3.0)),
-        ];
-        let result = engine.execute_script(&bindings, &["result".to_string()], None, "(define result (* x y))").unwrap();
+        let map = inputs(&[("x", 7.0), ("y", 3.0)]);
+        let result = engine.execute_script(&map, None, "(define x (input 'x 'f64))\n(define y (input 'y 'f64))\n(define result (output 'result 'f64))\n(set! result (* x y))").unwrap();
         match result.output_values.get("result") {
             Some(crate::types::Value::F64(v)) => assert!((*v - 21.0).abs() < 1e-10),
             other => panic!("Expected F64(21.0), got {:?}", other),
@@ -407,7 +808,7 @@ mod tests {
     #[test]
     fn test_render_bold() {
         let engine = SchemeEngine::new().unwrap();
-        let result = engine.execute_script(&[], &[], None, "(bold \"hello world\")").unwrap();
+        let result = engine.execute_script(&HashMap::new(), None, "(bold \"hello world\")").unwrap();
         println!("render blocks: {:?}", result.render_blocks);
         assert!(!result.render_blocks.is_empty());
         match &result.render_blocks[0] {
@@ -421,10 +822,10 @@ mod tests {
         let engine = SchemeEngine::new().unwrap();
         let result = engine
             .execute_script(
-                &[("x".to_string(), crate::types::Value::F64(42.0))],
-                &[],
+                &inputs(&[("x", 42.0)]),
                 None,
-                r#"(render (bold "Result") (text "Value: " (number->string x)))"#,
+                r#"(define x (input 'x 'f64))
+(render (bold "Result") (text "Value: " (number->string x)))"#,
             )
             .unwrap();
         println!("render blocks: {:?}", result.render_blocks);
@@ -436,9 +837,10 @@ mod tests {
         let engine = SchemeEngine::new().unwrap();
         let result = engine
             .preview_script(
-                &["x".to_string(), "y".to_string()],
                 None,
-                r#"(render (bold "Analysis") (text "x + y = " (+ x y)) (hr) (plot-line (list 1 2 x 4) "test"))"#,
+                r#"(define x (input 'x 'f64))
+(define y (input 'y 'f64))
+(render (bold "Analysis") (text "x + y = " (+ x y)) (hr) (plot-line (list 1 2 x 4) "test"))"#,
             )
             .unwrap();
         println!("preview blocks: {:?}", result.render_blocks);
@@ -478,8 +880,7 @@ mod tests {
 
         let result = engine
             .execute_script(
-                &[],
-                &[],
+                &HashMap::new(),
                 None,
                 r#"(render (bold "Test") (button "Click Me" 'set "key1" "val1"))"#,
             )
@@ -500,8 +901,7 @@ mod tests {
         // store-set! then store-get in same script works via bridge
         let result = engine
             .execute_script(
-                &[],
-                &[],
+                &HashMap::new(),
                 Some(&db),
                 r#"(store-set! "k" "v") (store-get "k")"#,
             )
@@ -515,10 +915,9 @@ mod tests {
         let engine = SchemeEngine::new().unwrap();
         let db = crate::db::Db::new().unwrap();
 
-        let result = engine
+        let _result = engine
             .execute_script(
-                &[],
-                &[],
+                &HashMap::new(),
                 Some(&db),
                 r#"(db-run "CREATE items SET name = 'apple', qty = 3") (db-query "SELECT * FROM items")"#,
             )
@@ -530,15 +929,12 @@ mod tests {
 
     #[test]
     fn test_bridge_store_keys() {
-        use serde_json::json;
-
         let engine = SchemeEngine::new().unwrap();
         let db = crate::db::Db::new().unwrap();
 
         let _result = engine
             .execute_script(
-                &[],
-                &[],
+                &HashMap::new(),
                 Some(&db),
                 r#"(store-set! "a" 1) (store-set! "b" 2) (store-keys)"#,
             )
@@ -553,8 +949,7 @@ mod tests {
         let engine = SchemeEngine::new().unwrap();
         let result = engine
             .execute_script(
-                &[],
-                &[],
+                &HashMap::new(),
                 None,
                 r#"(render (checkbox "Enabled" "is-on") (text-input "name" "Enter..."))"#,
             )
@@ -585,10 +980,9 @@ mod tests {
         std::env::set_var("SCHEME_RS_LOAD_PATH", &dir);
         let engine = SchemeEngine::new().unwrap();
         let result = engine.execute_script(
-            &[],
-            &["msg".to_string()],
+            &HashMap::new(),
             None,
-            r#"(import (mylib)) (define msg (greet "World"))"#,
+            "(import (mylib))\n(define msg (output 'msg 'str))\n(set! msg (greet \"World\"))",
         );
         // Clean up
         std::fs::remove_file(&lib_file).ok();
@@ -605,8 +999,7 @@ mod tests {
     fn test_missing_library_error() {
         let engine = SchemeEngine::new().unwrap();
         let result = engine.execute_script(
-            &[],
-            &[],
+            &HashMap::new(),
             None,
             "(import (nonexistent-lib-xyz))",
         );
@@ -614,12 +1007,68 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_input_port() {
+        let engine = SchemeEngine::new().unwrap();
+        let mut map = HashMap::new();
+        map.insert("x".to_string(), crate::types::Value::F64(7.0));
+        let result = engine.execute_script(&map, None,
+            "(define x (input 'x 'f64))\n(define r (output 'r 'f64))\n(set! r (* x 3))").unwrap();
+        assert_eq!(result.declared_inputs.len(), 1);
+        assert_eq!(result.declared_inputs[0].0, "x");
+        assert_eq!(result.declared_outputs.len(), 1);
+        assert_eq!(result.declared_outputs[0].0, "r");
+        assert!(matches!(result.output_values.get("r"), Some(crate::types::Value::F64(v)) if (*v - 21.0).abs() < 1e-10));
+    }
+
+    #[test]
+    fn test_widget_as_output() {
+        let engine = SchemeEngine::new().unwrap();
+        let mut map = HashMap::new();
+        map.insert("brightness".to_string(), crate::types::Value::F64(200.0));
+        let result = engine.execute_script(&map, None,
+            "(define brightness (slider 'brightness 0 255))").unwrap();
+        assert_eq!(result.widget_decls.len(), 1);
+        assert_eq!(result.widget_decls[0].name, "brightness");
+        assert_eq!(result.widget_decls[0].widget_type, "slider");
+        assert!(matches!(result.output_values.get("brightness"), Some(crate::types::Value::F64(v)) if (*v - 200.0).abs() < 1e-10));
+    }
+
+    #[test]
+    fn test_widget_default_value() {
+        let engine = SchemeEngine::new().unwrap();
+        // No persisted value — should use min (0) as default
+        let result = engine.execute_script(&HashMap::new(), None,
+            "(define brightness (slider 'brightness 0 255))").unwrap();
+        assert!(matches!(result.output_values.get("brightness"), Some(crate::types::Value::F64(v)) if (*v - 0.0).abs() < 1e-10));
+    }
+
+    #[test]
+    fn test_new_syntax_input_returns_value() {
+        let engine = SchemeEngine::new().unwrap();
+        let map = inputs(&[("a", 3.0), ("b", 4.0)]);
+        let result = engine.execute_script(&map, None,
+            "(define a (input 'a 'f64))\n(define b (input 'b 'f64))\n(define r (output 'r 'f64))\n(set! r (+ a b))").unwrap();
+        assert!(matches!(result.output_values.get("r"), Some(crate::types::Value::F64(v)) if (*v - 7.0).abs() < 1e-10));
+    }
+
+    #[test]
+    fn test_checkbox_widget() {
+        let engine = SchemeEngine::new().unwrap();
+        let mut map = HashMap::new();
+        map.insert("enabled".to_string(), crate::types::Value::F64(1.0));
+        let result = engine.execute_script(&map, None,
+            "(define enabled (checkbox 'enabled))").unwrap();
+        assert_eq!(result.widget_decls.len(), 1);
+        assert_eq!(result.widget_decls[0].widget_type, "checkbox");
+        assert!(matches!(result.output_values.get("enabled"), Some(crate::types::Value::F64(v)) if (*v - 1.0).abs() < 1e-10));
+    }
+
+    #[test]
     fn test_scribble_to_render_pipeline() {
         let engine = SchemeEngine::new().unwrap();
-        let code = "(input x f64)\n(output result f64)\n(define result (* x 2))\n\n# Title\n\nResult is @result.";
+        let code = "(define x (input 'x 'f64))\n(define result (output 'result 'f64))\n(set! result (* x 2))\n\n# Title\n\nResult is @result.";
         let result = engine.execute_script(
-            &[("x".to_string(), crate::types::Value::F64(5.0))],
-            &["result".to_string()],
+            &inputs(&[("x", 5.0)]),
             None,
             code,
         ).unwrap();
@@ -628,5 +1077,60 @@ mod tests {
         assert!(!result.render_blocks.is_empty());
         assert!(result.render_blocks.iter().any(|b| matches!(b, RenderBlock::Bold(_))));
         assert!(result.render_blocks.iter().any(|b| matches!(b, RenderBlock::Text(t) if t.contains("10"))));
+    }
+
+    #[test]
+    fn test_canvas_draw_commands() {
+        let engine = SchemeEngine::new().unwrap();
+        let result = engine
+            .execute_script(
+                &HashMap::new(),
+                None,
+                r##"
+                (canvas 200 100
+                    (draw-rect 0 0 200 100 "#ff0000")
+                    (draw-line 0 0 200 100 "#00ff00" 2)
+                    (draw-circle 100 50 20 "#0000ff")
+                    (draw-text 10 10 "hello" "#000000" 12))
+                "##,
+            )
+            .unwrap();
+        println!("canvas blocks: {:?}", result.render_blocks);
+        assert!(!result.render_blocks.is_empty());
+        assert!(result.render_blocks.iter().any(|b| matches!(b, RenderBlock::Canvas { .. })));
+    }
+
+    #[test]
+    fn test_canvas_wave_script() {
+        let engine = SchemeEngine::new().unwrap();
+        let script = r##"
+(define gain-raw (input 'gain 'f64))
+(define freq-raw (input 'freq 'f64))
+(define gain (if (compute? gain-raw) 50.0 gain-raw))
+(define freq (if (compute? freq-raw) 5.0 freq-raw))
+
+(define pi 3.14159265)
+(define w 300.0)
+(define h 150.0)
+(define mid (/ h 2.0))
+(define n 60)
+
+(define (wave-points i acc)
+  (if (= i n) acc
+    (let* ((x (* (/ i n) w))
+           (y (+ mid (* gain (sin (* freq (/ i n) pi 4.0))))))
+      (wave-points (+ i 1) (cons (list x y) acc)))))
+
+(define pts (reverse (wave-points 0 '())))
+
+(canvas w h
+    (draw-rect 0 0 w h "#f5f5f0")
+    (draw-line 0 mid w mid "#cccccc" 1)
+    (draw-polyline pts "#2266cc" 2)
+    (draw-text 4 4 "oscilloscope" "#666666" 12))
+        "##;
+        let result = engine.execute_script(&HashMap::new(), None, script).unwrap();
+        println!("wave blocks: {:?}", result.render_blocks);
+        assert!(result.render_blocks.iter().any(|b| matches!(b, RenderBlock::Canvas { .. })));
     }
 }

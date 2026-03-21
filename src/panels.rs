@@ -1,7 +1,7 @@
 use crate::db::Db;
 use crate::debug_log::DebugLog;
 use crate::registry::NodeRegistry;
-use crate::render::{PlotData, RenderBlock, StoreAction};
+use crate::render::{DrawCmd, PlotData, RenderBlock, StoreAction};
 use crate::theme::*;
 use crate::types::*;
 use egui::{Color32, CornerRadius, RichText, Sense};
@@ -41,13 +41,13 @@ pub enum PanelAction {
     RunGraph,
     ComputeNode(NodeId),
     CancelCompute,
-    SyncScriptPorts(NodeId),
     RecomputeSelected,
     StepGraph,
     ToggleAutoRun,
     SaveGraph,
     LoadGraph,
     DeleteNode(NodeId),
+    UpdateWidget(NodeId, String, Value),
 }
 
 pub fn draw_toolbar(ui: &mut egui::Ui, auto_run: bool) -> Vec<PanelAction> {
@@ -262,7 +262,6 @@ pub fn draw_inspector(
                             let n = graph.nodes.get_mut(&node_id).unwrap();
                             n.script_code = code;
                             n.render_blocks.clear();
-                            actions.push(PanelAction::SyncScriptPorts(node_id));
                         }
 
                         // Input port overrides
@@ -309,9 +308,44 @@ pub fn draw_inspector(
                                     actions.push(PanelAction::CancelCompute);
                                 }
                             });
-                        } else if node.render_blocks.is_empty() {
+                        } else if node.render_blocks.is_empty() && node.widget_decls.is_empty() {
                             ui.label(RichText::new("Press Compute to evaluate").color(TEXT_DIM));
                         } else {
+                            // Draw new-style widgets from widget_decls
+                            for wdecl in &node.widget_decls {
+                                let current = graph.nodes.get(&node_id).unwrap()
+                                    .widget_values.get(&wdecl.name)
+                                    .map(|v| v.as_f64())
+                                    .unwrap_or(wdecl.params.first().copied().unwrap_or(0.0));
+                                match wdecl.widget_type.as_str() {
+                                    "slider" => {
+                                        let min = wdecl.params.first().copied().unwrap_or(0.0);
+                                        let max = wdecl.params.get(1).copied().unwrap_or(100.0);
+                                        let mut val = current;
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(&wdecl.name).color(TEXT_DIM));
+                                            if ui.add(egui::Slider::new(&mut val, min..=max)).changed() {
+                                                actions.push(PanelAction::UpdateWidget(
+                                                    node_id, wdecl.name.clone(), Value::F64(val),
+                                                ));
+                                            }
+                                        });
+                                    }
+                                    "checkbox" => {
+                                        let mut checked = current != 0.0;
+                                        if ui.checkbox(&mut checked, RichText::new(&wdecl.name).color(TEXT)).changed() {
+                                            actions.push(PanelAction::UpdateWidget(
+                                                node_id, wdecl.name.clone(),
+                                                Value::F64(if checked { 1.0 } else { 0.0 }),
+                                            ));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if !node.widget_decls.is_empty() && !node.render_blocks.is_empty() {
+                                ui.separator();
+                            }
                             if draw_render_blocks(ui, &node.render_blocks, db, debug_log) {
                                 actions.push(PanelAction::RecomputeSelected);
                             }
@@ -668,6 +702,9 @@ fn draw_render_blocks(ui: &mut egui::Ui, blocks: &[RenderBlock], db: &Db, debug_
                     ui.label(RichText::new("(empty list)").color(TEXT_DIM).italics());
                 }
             }
+            RenderBlock::Canvas { width, height, commands } => {
+                draw_canvas_block(ui, *width, *height, commands);
+            }
             RenderBlock::Slider { key, min, max } => {
                 let current = db
                     .kv_get(key)
@@ -710,7 +747,75 @@ fn block_id_hint(block: &RenderBlock) -> String {
         RenderBlock::Plot(_) => "plot".to_string(),
         RenderBlock::Bold(t) => format!("b_{}", &t[..t.len().min(8)]),
         RenderBlock::Text(t) => format!("t_{}", &t[..t.len().min(8)]),
+        RenderBlock::Canvas { .. } => "canvas".to_string(),
         _ => "x".to_string(),
+    }
+}
+
+fn parse_hex_color(s: &str) -> Color32 {
+    let s = s.trim_start_matches('#');
+    if s.len() >= 6 {
+        let r = u8::from_str_radix(&s[0..2], 16).unwrap_or(128);
+        let g = u8::from_str_radix(&s[2..4], 16).unwrap_or(128);
+        let b = u8::from_str_radix(&s[4..6], 16).unwrap_or(128);
+        Color32::from_rgb(r, g, b)
+    } else {
+        Color32::from_rgb(128, 128, 128)
+    }
+}
+
+fn draw_canvas_block(ui: &mut egui::Ui, width: f64, height: f64, commands: &[DrawCmd]) {
+    let size = egui::vec2(width as f32, height as f32);
+    let (response, painter) = ui.allocate_painter(size, Sense::hover());
+    let origin = response.rect.min;
+
+    for cmd in commands {
+        match cmd {
+            DrawCmd::Line { x1, y1, x2, y2, color, width } => {
+                painter.line_segment(
+                    [
+                        origin + egui::vec2(*x1 as f32, *y1 as f32),
+                        origin + egui::vec2(*x2 as f32, *y2 as f32),
+                    ],
+                    egui::Stroke::new(*width as f32, parse_hex_color(color)),
+                );
+            }
+            DrawCmd::Rect { x, y, w, h, fill } => {
+                let rect = egui::Rect::from_min_size(
+                    origin + egui::vec2(*x as f32, *y as f32),
+                    egui::vec2(*w as f32, *h as f32),
+                );
+                painter.rect_filled(rect, CornerRadius::ZERO, parse_hex_color(fill));
+            }
+            DrawCmd::Circle { x, y, r, fill } => {
+                painter.circle_filled(
+                    origin + egui::vec2(*x as f32, *y as f32),
+                    *r as f32,
+                    parse_hex_color(fill),
+                );
+            }
+            DrawCmd::Polyline { points, color, width } => {
+                if points.len() >= 2 {
+                    let pts: Vec<egui::Pos2> = points.iter()
+                        .map(|p| origin + egui::vec2(p[0] as f32, p[1] as f32))
+                        .collect();
+                    let stroke = egui::Stroke::new(*width as f32, parse_hex_color(color));
+                    for pair in pts.windows(2) {
+                        painter.line_segment([pair[0], pair[1]], stroke);
+                    }
+                }
+            }
+            DrawCmd::Text { x, y, text, color, size } => {
+                let font = egui::FontId::proportional(*size as f32);
+                painter.text(
+                    origin + egui::vec2(*x as f32, *y as f32),
+                    egui::Align2::LEFT_TOP,
+                    text,
+                    font,
+                    parse_hex_color(color),
+                );
+            }
+        }
     }
 }
 

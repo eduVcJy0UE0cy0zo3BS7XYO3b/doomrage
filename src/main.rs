@@ -5,7 +5,6 @@ mod executor;
 mod panels;
 mod persistence;
 mod registry;
-mod preprocessor;
 mod render;
 mod db;
 mod debug_log;
