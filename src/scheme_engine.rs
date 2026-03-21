@@ -1,185 +1,281 @@
 use crate::preprocessor;
-use crate::render::{PlotData, RenderBlock};
+use crate::render::RenderBlock;
+use crate::scheme_convert::try_parse_render_from_value;
+pub use crate::scheme_convert::{parse_port_declarations, scheme_value_to_json};
 use anyhow::Result;
 use scheme_rs::env::TopLevelEnvironment;
 use scheme_rs::runtime::Runtime;
 use scheme_rs::value::Value;
 use std::collections::HashMap;
 
-const RENDER_PRELUDE: &str = r#"
-;; Sentinel for uncomputed values
-(define <compute> "<compute>")
-(define (compute? x) (and (string? x) (string=? x "<compute>")))
+const CANVAS_RENDER_LIB: &str = r#"
+(library (canvas render)
+  (export <compute> compute? ->str
+          text bold italic code link hr table render
+          plot-line plot-scatter plot-bar
+          numbered-list bullet-list
+          button checkbox text-input slider editable-list
+          json-null)
+  (import (rnrs))
 
-;; Stringify helper: propagates <compute>
-(define (->str x)
-  (cond
-    ((compute? x) "<compute>")
-    ((string? x) x)
-    ((number? x) (number->string x))
-    ((boolean? x) (if x "true" "false"))
-    (else "?")))
+  ;; Sentinel for uncomputed values
+  (define <compute> "<compute>")
+  (define (compute? x) (and (string? x) (string=? x "<compute>")))
 
-;; Arithmetic that propagates <compute>
-(define (orig+ . args) (apply + args))
-(define (orig- . args) (apply - args))
-(define (orig* . args) (apply * args))
-(define (orig/ . args) (apply / args))
+  ;; Stringify helper: propagates <compute>
+  (define (->str x)
+    (cond
+      ((compute? x) "<compute>")
+      ((string? x) x)
+      ((number? x) (number->string x))
+      ((boolean? x) (if x "true" "false"))
+      ((null? x) "")
+      ((pair? x)
+       (string-append "(" (let loop ((lst x))
+         (cond
+           ((null? lst) ")")
+           ((pair? lst)
+            (string-append (->str (car lst))
+                           (if (null? (cdr lst)) ")" (string-append ", " (loop (cdr lst))))))
+           (else (string-append ". " (->str lst) ")"))))))
+      (else "?")))
 
-(define (safe+ . args) (if (exists compute? args) <compute> (apply orig+ args)))
-(define (safe- . args) (if (exists compute? args) <compute> (apply orig- args)))
-(define (safe* . args) (if (exists compute? args) <compute> (apply orig* args)))
-(define (safe/ . args) (if (exists compute? args) <compute> (apply orig/ args)))
-(define (safe-min . args) (if (exists compute? args) <compute> (apply min args)))
-(define (safe-max . args) (if (exists compute? args) <compute> (apply max args)))
-(define (safe-abs x) (if (compute? x) <compute> (abs x)))
-(define (safe-sqrt x) (if (compute? x) <compute> (sqrt x)))
+  ;; Render primitives
+  (define (text . args) (list 'render-text (apply string-append (map ->str args))))
+  (define (bold . args) (list 'render-bold (apply string-append (map ->str args))))
+  (define (italic . args) (list 'render-italic (apply string-append (map ->str args))))
+  (define (code str) (list 'render-code (->str str)))
+  (define (link url label) (list 'render-link url label))
+  (define (hr) (list 'render-hr))
+  (define (table headers rows) (list 'render-table (map ->str headers) (map (lambda (r) (map ->str r)) rows)))
+  (define (plot-line data . rest)
+    (if (exists compute? data)
+      (list 'render-text "<plot: waiting for data>")
+      (list 'render-plot-line data (if (null? rest) "" (car rest)))))
+  (define (plot-scatter xs ys . rest)
+    (if (or (exists compute? xs) (exists compute? ys))
+      (list 'render-text "<plot: waiting for data>")
+      (list 'render-plot-scatter xs ys (if (null? rest) "" (car rest)))))
+  (define (plot-bar labels values . rest)
+    (if (exists compute? values)
+      (list 'render-text "<plot: waiting for data>")
+      (list 'render-plot-bar labels values (if (null? rest) "" (car rest)))))
+  (define (render . blocks) (list 'render-group blocks))
 
-;; Render primitives
-(define (text . args) (list 'render-text (apply string-append (map ->str args))))
-(define (bold . args) (list 'render-bold (apply string-append (map ->str args))))
-(define (italic . args) (list 'render-italic (apply string-append (map ->str args))))
-(define (code str) (list 'render-code (->str str)))
-(define (link url label) (list 'render-link url label))
-(define (hr) (list 'render-hr))
-(define (table headers rows) (list 'render-table (map ->str headers) (map (lambda (r) (map ->str r)) rows)))
-(define (plot-line data . rest)
-  (if (exists compute? data)
-    (list 'render-text "<plot: waiting for data>")
-    (list 'render-plot-line data (if (null? rest) "" (car rest)))))
-(define (plot-scatter xs ys . rest)
-  (if (or (exists compute? xs) (exists compute? ys))
-    (list 'render-text "<plot: waiting for data>")
-    (list 'render-plot-scatter xs ys (if (null? rest) "" (car rest)))))
-(define (plot-bar labels values . rest)
-  (if (exists compute? values)
-    (list 'render-text "<plot: waiting for data>")
-    (list 'render-plot-bar labels values (if (null? rest) "" (car rest)))))
-(define (render . blocks) (list 'render-group blocks))
+  ;; List rendering helpers
+  (define (numbered-list items)
+    (if (or (null? items) (string? items))
+      (list 'render-text "(empty)")
+      (list 'render-group
+        (let loop ((lst items) (i 1))
+          (if (null? lst) '()
+            (cons (list 'render-text (string-append (number->string i) ". " (->str (car lst))))
+                  (loop (cdr lst) (+ i 1))))))))
+  (define (bullet-list items)
+    (if (or (null? items) (string? items))
+      (list 'render-text "(empty)")
+      (list 'render-group
+        (let loop ((lst items))
+          (if (null? lst) '()
+            (cons (list 'render-text (string-append "  - " (->str (car lst))))
+                  (loop (cdr lst))))))))
 
-;; Port declarations are no-ops at runtime (parsed statically by Rust)
-(define (input name type) "")
-(define (output name type) "")
+  ;; JSON null sentinel
+  (define json-null 'json-null)
 
-;; Store: store-get is injected as defines before eval.
-;; store-set!/store-append!/store-delete! return tagged lists for Rust to process.
-(define (store-set! key value) (list 'store-set key (->str value)))
-(define (store-append! key value) (list 'store-append key (->str value)))
-(define (store-delete! key) (list 'store-delete key))
+  ;; Interactive widgets — each gets its own tagged list
+  (define (button label action-type . args)
+    (list 'render-button label (symbol->string action-type) args))
+  (define (checkbox label key)
+    (list 'render-checkbox label key))
+  (define (text-input key . rest)
+    (list 'render-text-input key (if (null? rest) "" (car rest))))
+  (define (slider key lo hi)
+    (list 'render-slider key lo hi))
+  (define (editable-list key)
+    (list 'render-editable-list key))
+)
+"#;
 
-;; Interactive widgets (return tagged render blocks)
-(define (button label action-expr) (list 'render-button label action-expr))
-(define (checkbox label key) (list 'render-checkbox label key))
-(define (text-input key . rest) (list 'render-text-input key (if (null? rest) "" (car rest))))
-(define (slider key lo hi) (list 'render-slider key lo hi))
+const CANVAS_PREVIEW_LIB: &str = r#"
+(library (canvas preview)
+  (export safe+ safe- safe* safe/
+          safe-min safe-max safe-abs safe-sqrt)
+  (import (rnrs) (canvas render))
+
+  (define (orig+ . args) (apply + args))
+  (define (orig- . args) (apply - args))
+  (define (orig* . args) (apply * args))
+  (define (orig/ . args) (apply / args))
+
+  (define (safe+ . args) (if (exists compute? args) <compute> (apply orig+ args)))
+  (define (safe- . args) (if (exists compute? args) <compute> (apply orig- args)))
+  (define (safe* . args) (if (exists compute? args) <compute> (apply orig* args)))
+  (define (safe/ . args) (if (exists compute? args) <compute> (apply orig/ args)))
+  (define (safe-min . args) (if (exists compute? args) <compute> (apply min args)))
+  (define (safe-max . args) (if (exists compute? args) <compute> (apply max args)))
+  (define (safe-abs x) (if (compute? x) <compute> (abs x)))
+  (define (safe-sqrt x) (if (compute? x) <compute> (sqrt x)))
+)
 "#;
 
 pub struct SchemeEngine {
+    pub runtime: Runtime,
     env: TopLevelEnvironment,
 }
 
 impl SchemeEngine {
     pub fn new() -> Result<Self> {
+        // Set up user library path (don't override if already set)
+        if std::env::var("SCHEME_RS_LOAD_PATH").is_err() {
+            let lib_dir = dirs::home_dir()
+                .unwrap_or_default()
+                .join(".canvas")
+                .join("lib");
+            std::fs::create_dir_all(&lib_dir).ok();
+            std::env::set_var("SCHEME_RS_LOAD_PATH", &lib_dir);
+        }
+
         let runtime = Runtime::new();
+
+        runtime.def_lib(CANVAS_RENDER_LIB)
+            .map_err(|e| anyhow::anyhow!("Failed to define (canvas render): {}", e))?;
+        runtime.def_lib(CANVAS_PREVIEW_LIB)
+            .map_err(|e| anyhow::anyhow!("Failed to define (canvas preview): {}", e))?;
+
         let env = TopLevelEnvironment::new_repl(&runtime);
         env.eval(true, "(import (rnrs))")
             .map_err(|e| anyhow::anyhow!("Failed to import rnrs: {}", e))?;
-        env.eval(false, RENDER_PRELUDE)
-            .map_err(|e| anyhow::anyhow!("Failed to load render prelude: {}", e))?;
+        env.eval(true, "(import (canvas db))")
+            .map_err(|e| anyhow::anyhow!("Failed to import canvas db: {}", e))?;
+        env.eval(true, "(import (canvas render))")
+            .map_err(|e| anyhow::anyhow!("Failed to import canvas render: {}", e))?;
+
+        // Port declarations are no-ops at runtime (parsed statically by Rust)
+        env.eval(false, "(define (input name type) \"\") (define (output name type) \"\")")
+            .map_err(|e| anyhow::anyhow!("Failed to define input/output stubs: {}", e))?;
+
         log::info!("SchemeEngine ready");
-        Ok(Self { env })
+        Ok(Self { runtime, env })
     }
 
-    fn make_env(&self) -> Result<TopLevelEnvironment> {
-        // Reuse cached env — (rnrs) and prelude already loaded
-        // Defines from previous evals persist but get overwritten
-        Ok(self.env.clone())
+    pub fn make_env(&self) -> TopLevelEnvironment {
+        self.env.clone()
+    }
+
+    /// Create a persistent REPL environment with all canvas libraries imported.
+    pub fn make_repl_env(&self) -> Result<TopLevelEnvironment> {
+        let env = TopLevelEnvironment::new_repl(&self.runtime);
+        env.eval(true, "(import (rnrs) (canvas db) (canvas render) (canvas graph))")
+            .map_err(|e| anyhow::anyhow!("Failed to setup REPL env: {}", e))?;
+        env.eval(false, "(define (input name type) \"\") (define (output name type) \"\")")
+            .map_err(|e| anyhow::anyhow!("Failed to define stubs in REPL env: {}", e))?;
+        Ok(env)
+    }
+
+    /// Eval code in a given REPL env (persistent across calls).
+    pub fn eval_repl(
+        &self,
+        env: &TopLevelEnvironment,
+        db: Option<&crate::db::Db>,
+        graph: Option<(&mut crate::types::Graph, &crate::registry::NodeRegistry)>,
+        code: &str,
+    ) -> Result<Vec<Value>> {
+        let eval_fn = || {
+            env.eval(true, code)
+                .map_err(|e| anyhow::anyhow!("REPL eval failed: {}", e))
+        };
+
+        // Set up both db and graph contexts
+        match (db, graph) {
+            (Some(db), Some((graph, registry))) => {
+                crate::bridge::with_db_context(db, || {
+                    crate::bridge::with_graph_context(graph, registry, eval_fn)
+                })
+            }
+            (Some(db), None) => {
+                crate::bridge::with_db_context(db, eval_fn)
+            }
+            (None, Some((graph, registry))) => {
+                crate::bridge::with_graph_context(graph, registry, eval_fn)
+            }
+            (None, None) => eval_fn(),
+        }
+    }
+
+    /// Register a node's outputs as an R6RS library `(node <id>)`.
+    /// After this, script nodes can do `(import (node 3))` to access upstream outputs.
+    pub fn register_node_library(
+        &self,
+        node_id: crate::types::NodeId,
+        outputs: &HashMap<String, crate::types::Value>,
+    ) {
+        if outputs.is_empty() {
+            return;
+        }
+
+        let exports: Vec<String> = outputs.keys().cloned().collect();
+        let defines: Vec<String> = outputs
+            .iter()
+            .map(|(name, val)| format!("(define {} {})", name, val.to_scheme_literal()))
+            .collect();
+
+        let lib_str = format!(
+            "(library (node n{}) (export {}) (import (rnrs)) {})",
+            node_id,
+            exports.join(" "),
+            defines.join(" ")
+        );
+
+        if let Err(e) = self.runtime.def_lib(&lib_str) {
+            log::warn!("Failed to register node {} library: {}", node_id, e);
+        }
     }
 
     pub fn eval(&self, code: &str) -> Result<Vec<Value>> {
-        let env = self.make_env()?;
+        let env = self.make_env();
         let results = env
             .eval(false, code)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         Ok(results)
     }
 
-    pub fn eval_with_bindings(
-        &self,
-        bindings: &[(String, f64)],
-        code: &str,
-    ) -> Result<Vec<Value>> {
-        let env = self.make_env()?;
-
-        if !bindings.is_empty() {
-            let defines: String = bindings
-                .iter()
-                .map(|(name, val)| format!("(define {} {})", name, val))
-                .collect::<Vec<_>>()
-                .join(" ");
-            env.eval(false, &defines)
-                .map_err(|e| anyhow::anyhow!("Binding setup failed: {}", e))?;
-        }
-
-        let results = env
-            .eval(false, code)
-            .map_err(|e| anyhow::anyhow!("Eval failed: {}", e))?;
-        Ok(results)
-    }
-
-    /// Execute a script node: bind inputs + store, eval code, extract outputs by name
+    /// Execute a script node: bind inputs + db, eval code, extract outputs by name
     pub fn execute_script(
         &self,
-        input_bindings: &[(String, f64)],
+        input_bindings: &[(String, crate::types::Value)],
         output_names: &[String],
-        store: Option<&crate::store::Store>,
+        db: Option<&crate::db::Db>,
         code: &str,
     ) -> Result<ScriptResult> {
-        let env = self.make_env()?;
+        let env = self.make_env();
 
-        // Inject store values as (define (store-get key) ...) via a lookup alist
-        if let Some(store) = store {
-            let mut alist_items = Vec::new();
-            for key in store.keys() {
-                if let Some(val) = store.get(&key) {
-                    alist_items.push(format!(
-                        "(list \"{}\" {})",
-                        key,
-                        crate::store::Store::value_to_scheme(&val)
-                    ));
-                }
-            }
-            let store_define = format!(
-                "(define __store (list {})) (define (store-get key) (let ((pair (find (lambda (p) (string=? (car p) key)) __store))) (if pair (car (cdr pair)) \"\")))",
-                alist_items.join(" ")
-            );
-            env.eval(false, &store_define)
-                .map_err(|e| anyhow::anyhow!("Store injection failed: {}", e))?;
-        }
+        let stripped = preprocessor::preprocess(code);
 
         if !input_bindings.is_empty() {
             let defines: String = input_bindings
                 .iter()
-                .map(|(name, val)| format!("(define {} {})", name, val))
+                .map(|(name, val)| format!("(define {} {})", name, val.to_scheme_literal()))
                 .collect::<Vec<_>>()
                 .join(" ");
             env.eval(false, &defines)
                 .map_err(|e| anyhow::anyhow!("Binding setup failed: {}", e))?;
         }
 
-        let stripped = preprocessor::preprocess(code);
+        let eval_fn = || {
+            env.eval(true, &stripped)
+                .map_err(|e| anyhow::anyhow!("Eval failed: {}", e))
+        };
 
-        let results = env
-            .eval(false, &stripped)
-            .map_err(|e| anyhow::anyhow!("Eval failed: {}", e))?;
+        let results = if let Some(db) = db {
+            crate::bridge::with_db_context(db, eval_fn)?
+        } else {
+            eval_fn()?
+        };
 
         let mut render_blocks = Vec::new();
-        let mut store_mutations = Vec::new();
         for val in &results {
-            let display = format!("{}", val);
-            if display.starts_with("(store-set ") || display.starts_with("(store-append ") || display.starts_with("(store-delete ") {
-                store_mutations.push(display);
-            } else if let Some(blocks) = self.try_parse_render(val) {
+            if let Some(blocks) = try_parse_render_from_value(val) {
                 render_blocks.extend(blocks);
             }
         }
@@ -189,7 +285,12 @@ impl SchemeEngine {
         for name in output_names {
             if let Ok(vals) = env.eval(false, name) {
                 if let Some(val) = vals.first() {
-                    output_values.insert(name.clone(), value_to_f64_or_string(val));
+                    let typed_val = if let Some(f) = val.cast_to_scheme_type::<f64>() {
+                        crate::types::Value::F64(f)
+                    } else {
+                        crate::types::Value::Str(format!("{}", val))
+                    };
+                    output_values.insert(name.clone(), typed_val);
                 }
             }
         }
@@ -197,7 +298,6 @@ impl SchemeEngine {
         Ok(ScriptResult {
             output_values,
             render_blocks,
-            store_mutations,
         })
     }
 
@@ -205,30 +305,12 @@ impl SchemeEngine {
     pub fn preview_script(
         &self,
         input_names: &[String],
-        store: Option<&crate::store::Store>,
+        db: Option<&crate::db::Db>,
         code: &str,
     ) -> Result<ScriptResult> {
-        let env = self.make_env()?;
+        let env = self.make_env();
 
-        // Inject store values if available, otherwise store-get returns <compute>
-        if let Some(store) = store {
-            let mut alist_items = Vec::new();
-            for key in store.keys() {
-                if let Some(val) = store.get(&key) {
-                    alist_items.push(format!(
-                        "(list \"{}\" {})",
-                        key,
-                        crate::store::Store::value_to_scheme(&val)
-                    ));
-                }
-            }
-            let store_define = format!(
-                "(define __store (list {})) (define (store-get key) (let ((pair (find (lambda (p) (string=? (car p) key)) __store))) (if pair (car (cdr pair)) \"\")))",
-                alist_items.join(" ")
-            );
-            env.eval(false, &store_define)
-                .map_err(|e| anyhow::anyhow!("Store injection failed: {}", e))?;
-        }
+        let stripped = preprocessor::preprocess(code);
 
         if !input_names.is_empty() {
             let defines: String = input_names
@@ -240,6 +322,8 @@ impl SchemeEngine {
                 .map_err(|e| anyhow::anyhow!("Preview binding failed: {}", e))?;
         }
 
+        env.eval(true, "(import (canvas preview))")
+            .map_err(|e| anyhow::anyhow!("Preview import failed: {}", e))?;
         env.eval(false, r#"
             (define + safe+) (define - safe-) (define * safe*) (define / safe/)
             (define min safe-min) (define max safe-max) (define abs safe-abs) (define sqrt safe-sqrt)
@@ -250,15 +334,20 @@ impl SchemeEngine {
         "#)
             .map_err(|e| anyhow::anyhow!("Safe override failed: {}", e))?;
 
-        let stripped = preprocessor::preprocess(code);
+        let eval_fn = || {
+            env.eval(false, &stripped)
+                .map_err(|e| anyhow::anyhow!("Preview eval failed: {}", e))
+        };
 
-        let results = env
-            .eval(false, &stripped)
-            .map_err(|e| anyhow::anyhow!("Preview eval failed: {}", e))?;
+        let results = if let Some(db) = db {
+            crate::bridge::with_db_context(db, eval_fn)?
+        } else {
+            eval_fn()?
+        };
 
         let mut render_blocks = Vec::new();
         for val in &results {
-            if let Some(blocks) = self.try_parse_render(val) {
+            if let Some(blocks) = try_parse_render_from_value(val) {
                 render_blocks.extend(blocks);
             }
         }
@@ -266,371 +355,15 @@ impl SchemeEngine {
         Ok(ScriptResult {
             output_values: HashMap::new(),
             render_blocks,
-            store_mutations: Vec::new(),
         })
     }
 
-    fn try_parse_render(&self, val: &Value) -> Option<Vec<RenderBlock>> {
-        let display = format!("{}", val);
-
-        // Check if it's a tagged render list
-        if !display.starts_with('(') {
-            return None;
-        }
-
-        parse_render_from_display(&display)
-    }
-
-    pub fn value_to_f64(val: &Value) -> Option<f64> {
-        val.cast_to_scheme_type::<f64>()
-    }
-
-    pub fn value_to_string(val: &Value) -> String {
-        format!("{}", val)
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct ScriptResult {
-    pub output_values: HashMap<String, ScriptValue>,
+    pub output_values: HashMap<String, crate::types::Value>,
     pub render_blocks: Vec<RenderBlock>,
-    pub store_mutations: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub enum ScriptValue {
-    Number(f64),
-    Str(String),
-}
-
-/// Port declaration parsed from Scheme code
-#[derive(Debug, Clone)]
-pub struct PortDecl {
-    pub name: String,
-    pub port_type: String, // "f64", "string", etc.
-}
-
-/// Parse (input name type) and (output name type) declarations from code
-pub fn parse_port_declarations(code: &str) -> (Vec<PortDecl>, Vec<PortDecl>) {
-    let mut inputs = Vec::new();
-    let mut outputs = Vec::new();
-
-    for line in code.lines() {
-        let line = line.trim();
-        if line.starts_with("(input ") {
-            if let Some(decl) = parse_single_decl(line) {
-                inputs.push(decl);
-            }
-        } else if line.starts_with("(output ") {
-            if let Some(decl) = parse_single_decl(line) {
-                outputs.push(decl);
-            }
-        }
-    }
-
-    (inputs, outputs)
-}
-
-fn parse_single_decl(s: &str) -> Option<PortDecl> {
-    // "(input x f64)" or "(output sum f64)"
-    let s = s.trim();
-    let inner = s.strip_prefix('(')?.strip_suffix(')')?;
-    let parts: Vec<&str> = inner.split_whitespace().collect();
-    if parts.len() >= 3 {
-        Some(PortDecl {
-            name: parts[1].to_string(),
-            port_type: parts[2].to_string(),
-        })
-    } else {
-        None
-    }
-}
-
-/// Strip (input ...) and (output ...) lines so they don't eval as code
-fn strip_declarations(code: &str) -> String {
-    code.lines()
-        .filter(|line| {
-            let t = line.trim();
-            !t.starts_with("(input ") && !t.starts_with("(output ")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn value_to_f64_or_string(val: &Value) -> ScriptValue {
-    if let Some(f) = val.cast_to_scheme_type::<f64>() {
-        ScriptValue::Number(f)
-    } else {
-        ScriptValue::Str(format!("{}", val))
-    }
-}
-
-// Parse render blocks from Scheme display output like "(render-bold \"hello\")"
-fn parse_render_from_display(s: &str) -> Option<Vec<RenderBlock>> {
-    let s = s.trim();
-    if !s.starts_with('(') || !s.ends_with(')') {
-        return None;
-    }
-    let inner = &s[1..s.len() - 1];
-
-    // Get tag
-    let (tag, rest) = split_first_token(inner)?;
-
-    match tag {
-        "render-text" => {
-            let text = extract_string(rest);
-            Some(vec![RenderBlock::Text(text)])
-        }
-        "render-bold" => {
-            let text = extract_string(rest);
-            Some(vec![RenderBlock::Bold(text)])
-        }
-        "render-italic" => {
-            let text = extract_string(rest);
-            Some(vec![RenderBlock::Italic(text)])
-        }
-        "render-code" => {
-            let text = extract_string(rest);
-            Some(vec![RenderBlock::Code(text)])
-        }
-        "render-link" => {
-            let parts = extract_two_strings(rest);
-            Some(vec![RenderBlock::Link {
-                url: parts.0,
-                label: parts.1,
-            }])
-        }
-        "render-hr" => Some(vec![RenderBlock::Hr]),
-        "render-table" => {
-            let (headers, rows) = parse_table(rest);
-            Some(vec![RenderBlock::Table { headers, rows }])
-        }
-        "render-plot-line" => {
-            let (data, title) = parse_plot_line(rest);
-            Some(vec![RenderBlock::Plot(PlotData::Line {
-                y: data,
-                title: if title.is_empty() { None } else { Some(title) },
-            })])
-        }
-        "render-group" => {
-            let blocks = parse_group(rest);
-            Some(blocks)
-        }
-        "render-button" => {
-            let parts = extract_two_strings(rest);
-            // For now, button action is store-set parsed from the second string
-            Some(vec![RenderBlock::Button {
-                label: parts.0,
-                action: crate::render::StoreAction::Set {
-                    key: "last-button".to_string(),
-                    value: parts.1,
-                },
-            }])
-        }
-        "render-checkbox" => {
-            let parts = extract_two_strings(rest);
-            Some(vec![RenderBlock::Checkbox {
-                label: parts.0,
-                key: parts.1,
-            }])
-        }
-        "render-text-input" => {
-            let parts = extract_two_strings(rest);
-            Some(vec![RenderBlock::TextInput {
-                key: parts.0,
-                placeholder: parts.1,
-            }])
-        }
-        "render-slider" => {
-            // (render-slider "key" min max)
-            let (key_str, rest2) = find_balanced_parens(rest);
-            let key = extract_string(&key_str);
-            let nums: Vec<f64> = rest2
-                .split_whitespace()
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            let min = nums.first().copied().unwrap_or(0.0);
-            let max = nums.get(1).copied().unwrap_or(100.0);
-            Some(vec![RenderBlock::Slider { key, min, max }])
-        }
-        _ => None,
-    }
-}
-
-fn split_first_token(s: &str) -> Option<(&str, &str)> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    if let Some(idx) = s.find(|c: char| c.is_whitespace()) {
-        Some((s[..idx].trim(), s[idx..].trim()))
-    } else {
-        Some((s, ""))
-    }
-}
-
-fn extract_string(s: &str) -> String {
-    let s = s.trim();
-    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        s[1..s.len() - 1].replace("\\\"", "\"").replace("\\n", "\n")
-    } else {
-        s.to_string()
-    }
-}
-
-fn extract_two_strings(s: &str) -> (String, String) {
-    let s = s.trim();
-    // Find two quoted strings
-    let mut strings = Vec::new();
-    let mut i = 0;
-    let bytes = s.as_bytes();
-    while i < bytes.len() && strings.len() < 2 {
-        if bytes[i] == b'"' {
-            let start = i + 1;
-            i += 1;
-            while i < bytes.len() && bytes[i] != b'"' {
-                if bytes[i] == b'\\' {
-                    i += 1;
-                }
-                i += 1;
-            }
-            if i < bytes.len() {
-                strings.push(s[start..i].to_string());
-            }
-        }
-        i += 1;
-    }
-    let first = strings.first().cloned().unwrap_or_default();
-    let second = strings.get(1).cloned().unwrap_or_default();
-    (first, second)
-}
-
-fn parse_list_of_strings(s: &str) -> Vec<String> {
-    // Parse scheme list like ("a" "b" "c") or (1 2 3)
-    let s = s.trim();
-    if s.starts_with('(') && s.ends_with(')') {
-        let inner = &s[1..s.len() - 1];
-        inner
-            .split_whitespace()
-            .map(|t| {
-                let t = t.trim().trim_matches('"');
-                t.to_string()
-            })
-            .filter(|t| !t.is_empty())
-            .collect()
-    } else {
-        vec![s.to_string()]
-    }
-}
-
-fn parse_list_of_f64(s: &str) -> Vec<f64> {
-    let s = s.trim();
-    if s.starts_with('(') && s.ends_with(')') {
-        let inner = &s[1..s.len() - 1];
-        inner
-            .split_whitespace()
-            .filter_map(|t| t.trim().parse::<f64>().ok())
-            .collect()
-    } else {
-        Vec::new()
-    }
-}
-
-fn parse_table(s: &str) -> (Vec<String>, Vec<Vec<String>>) {
-    // Expect: ("h1" "h2") (("r1c1" "r1c2") ("r2c1" "r2c2"))
-    // For now, simplified parsing
-    let s = s.trim();
-    let (headers_str, rest) = find_balanced_parens(s);
-    let headers = parse_list_of_strings(&headers_str);
-
-    let (rows_str, _) = find_balanced_parens(rest.trim());
-    let mut rows = Vec::new();
-    let rows_inner = if rows_str.starts_with('(') && rows_str.ends_with(')') {
-        &rows_str[1..rows_str.len() - 1]
-    } else {
-        &rows_str
-    };
-
-    let mut remaining = rows_inner.trim();
-    while !remaining.is_empty() {
-        let (row_str, rest) = find_balanced_parens(remaining);
-        if row_str.is_empty() {
-            break;
-        }
-        rows.push(parse_list_of_strings(&row_str));
-        remaining = rest.trim();
-    }
-
-    (headers, rows)
-}
-
-fn parse_plot_line(s: &str) -> (Vec<f64>, String) {
-    let s = s.trim();
-    let (data_str, rest) = find_balanced_parens(s);
-    let data = parse_list_of_f64(&data_str);
-    let title = extract_string(rest.trim());
-    (data, title)
-}
-
-fn parse_group(s: &str) -> Vec<RenderBlock> {
-    let s = s.trim();
-    let (list_str, _) = find_balanced_parens(s);
-    let inner = if list_str.starts_with('(') && list_str.ends_with(')') {
-        &list_str[1..list_str.len() - 1]
-    } else {
-        &list_str
-    };
-
-    let mut blocks = Vec::new();
-    let mut remaining = inner.trim();
-    while !remaining.is_empty() {
-        let (item_str, rest) = find_balanced_parens(remaining);
-        if item_str.is_empty() {
-            break;
-        }
-        if let Some(parsed) = parse_render_from_display(&item_str) {
-            blocks.extend(parsed);
-        }
-        remaining = rest.trim();
-    }
-    blocks
-}
-
-fn find_balanced_parens(s: &str) -> (String, &str) {
-    let s = s.trim();
-    if !s.starts_with('(') {
-        // Not a paren expression — take until whitespace or end
-        if let Some(idx) = s.find(|c: char| c.is_whitespace()) {
-            return (s[..idx].to_string(), &s[idx..]);
-        }
-        return (s.to_string(), "");
-    }
-
-    let mut depth = 0;
-    let mut in_string = false;
-    for (i, c) in s.char_indices() {
-        if in_string {
-            if c == '\\' {
-                continue;
-            }
-            if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => in_string = true,
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return (s[..=i].to_string(), &s[i + 1..]);
-                }
-            }
-            _ => {}
-        }
-    }
-    (s.to_string(), "")
 }
 
 #[cfg(test)]
@@ -642,7 +375,7 @@ mod tests {
         let engine = SchemeEngine::new().unwrap();
         let results = engine.eval("(+ 2 3)").unwrap();
         assert_eq!(results.len(), 1);
-        let val = SchemeEngine::value_to_f64(&results[0]);
+        let val = results[0].cast_to_scheme_type::<f64>();
         println!("(+ 2 3) = {:?}", val);
         assert!(val.is_some());
     }
@@ -650,12 +383,15 @@ mod tests {
     #[test]
     fn test_with_bindings() {
         let engine = SchemeEngine::new().unwrap();
-        let bindings = vec![("x".to_string(), 7.0), ("y".to_string(), 3.0)];
-        let results = engine.eval_with_bindings(&bindings, "(* x y)").unwrap();
-        assert_eq!(results.len(), 1);
-        let val = SchemeEngine::value_to_f64(&results[0]).unwrap();
-        println!("(* 7.0 3.0) = {}", val);
-        assert!((val - 21.0).abs() < 1e-10);
+        let bindings = vec![
+            ("x".to_string(), crate::types::Value::F64(7.0)),
+            ("y".to_string(), crate::types::Value::F64(3.0)),
+        ];
+        let result = engine.execute_script(&bindings, &["result".to_string()], None, "(define result (* x y))").unwrap();
+        match result.output_values.get("result") {
+            Some(crate::types::Value::F64(v)) => assert!((*v - 21.0).abs() < 1e-10),
+            other => panic!("Expected F64(21.0), got {:?}", other),
+        }
     }
 
     #[test]
@@ -663,7 +399,7 @@ mod tests {
         let engine = SchemeEngine::new().unwrap();
         let results = engine.eval("\"hello\"").unwrap();
         assert_eq!(results.len(), 1);
-        let s = SchemeEngine::value_to_string(&results[0]);
+        let s = format!("{}", results[0]);
         println!("string = {}", s);
         assert!(s.contains("hello"));
     }
@@ -685,7 +421,7 @@ mod tests {
         let engine = SchemeEngine::new().unwrap();
         let result = engine
             .execute_script(
-                &[("x".to_string(), 42.0)],
+                &[("x".to_string(), crate::types::Value::F64(42.0))],
                 &[],
                 None,
                 r#"(render (bold "Result") (text "Value: " (number->string x)))"#,
@@ -720,5 +456,177 @@ mod tests {
             }
             other => panic!("Expected Text, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_button_parsing() {
+        let engine = SchemeEngine::new().unwrap();
+
+        // Test standalone button
+        let results = engine.eval(r#"(button "Add Task" 'append "tasks" "new-task")"#).unwrap();
+        for r in &results {
+            let display = format!("{}", r);
+            println!("button standalone: {:?}", display);
+            assert!(display.contains("render-button"));
+        }
+
+        // Test button inside render group — first see raw output
+        let raw = engine.eval(r#"(render (bold "Test") (button "Click Me" 'set "key1" "val1"))"#).unwrap();
+        for r in &raw {
+            println!("render-group raw: {:?}", format!("{}", r));
+        }
+
+        let result = engine
+            .execute_script(
+                &[],
+                &[],
+                None,
+                r#"(render (bold "Test") (button "Click Me" 'set "key1" "val1"))"#,
+            )
+            .unwrap();
+        println!("button render blocks: {:?}", result.render_blocks);
+
+        let has_button = result.render_blocks.iter().any(|b| matches!(b, RenderBlock::Button { label, .. } if label == "Click Me"));
+        assert!(has_button, "Expected a Button with label 'Click Me', got: {:?}", result.render_blocks);
+    }
+
+    #[test]
+    fn test_bridge_store_roundtrip() {
+        use serde_json::json;
+
+        let engine = SchemeEngine::new().unwrap();
+        let db = crate::db::Db::new().unwrap();
+
+        // store-set! then store-get in same script works via bridge
+        let result = engine
+            .execute_script(
+                &[],
+                &[],
+                Some(&db),
+                r#"(store-set! "k" "v") (store-get "k")"#,
+            )
+            .unwrap();
+        // Verify via direct DB access
+        assert_eq!(db.kv_get("k"), Some(json!("v")));
+    }
+
+    #[test]
+    fn test_bridge_db_query_live() {
+        let engine = SchemeEngine::new().unwrap();
+        let db = crate::db::Db::new().unwrap();
+
+        let result = engine
+            .execute_script(
+                &[],
+                &[],
+                Some(&db),
+                r#"(db-run "CREATE items SET name = 'apple', qty = 3") (db-query "SELECT * FROM items")"#,
+            )
+            .unwrap();
+        // Verify data exists
+        let rows = db.query("SELECT * FROM items").unwrap();
+        assert!(!rows.is_empty());
+    }
+
+    #[test]
+    fn test_bridge_store_keys() {
+        use serde_json::json;
+
+        let engine = SchemeEngine::new().unwrap();
+        let db = crate::db::Db::new().unwrap();
+
+        let _result = engine
+            .execute_script(
+                &[],
+                &[],
+                Some(&db),
+                r#"(store-set! "a" 1) (store-set! "b" 2) (store-keys)"#,
+            )
+            .unwrap();
+        let mut keys = db.kv_keys();
+        keys.sort();
+        assert_eq!(keys, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_checkbox_and_input() {
+        let engine = SchemeEngine::new().unwrap();
+        let result = engine
+            .execute_script(
+                &[],
+                &[],
+                None,
+                r#"(render (checkbox "Enabled" "is-on") (text-input "name" "Enter..."))"#,
+            )
+            .unwrap();
+        println!("widget blocks: {:?}", result.render_blocks);
+        assert!(result.render_blocks.iter().any(|b| matches!(b, RenderBlock::Checkbox { label, .. } if label == "Enabled")));
+        assert!(result.render_blocks.iter().any(|b| matches!(b, RenderBlock::TextInput { key, .. } if key == "name")));
+    }
+
+    #[test]
+    fn test_import_canvas_render() {
+        let engine = SchemeEngine::new().unwrap();
+        // Import should work in fresh env
+        let env = engine.make_env();
+        let result = env.eval(true, "(import (canvas render))");
+        assert!(result.is_ok(), "Failed to import (canvas render): {:?}", result.err());
+    }
+
+    #[test]
+    fn test_load_user_library() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("canvas-test-libs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib_file = dir.join("mylib.sls");
+        let mut f = std::fs::File::create(&lib_file).unwrap();
+        writeln!(f, r#"(library (mylib) (export greet) (import (rnrs)) (define (greet name) (string-append "Hello, " name "!")))"#).unwrap();
+
+        std::env::set_var("SCHEME_RS_LOAD_PATH", &dir);
+        let engine = SchemeEngine::new().unwrap();
+        let result = engine.execute_script(
+            &[],
+            &["msg".to_string()],
+            None,
+            r#"(import (mylib)) (define msg (greet "World"))"#,
+        );
+        // Clean up
+        std::fs::remove_file(&lib_file).ok();
+        std::fs::remove_dir(&dir).ok();
+
+        let result = result.unwrap();
+        match result.output_values.get("msg") {
+            Some(crate::types::Value::Str(s)) => assert!(s.contains("Hello"), "Got: {}", s),
+            other => panic!("Expected string output, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_missing_library_error() {
+        let engine = SchemeEngine::new().unwrap();
+        let result = engine.execute_script(
+            &[],
+            &[],
+            None,
+            "(import (nonexistent-lib-xyz))",
+        );
+        assert!(result.is_err(), "Expected error for missing library");
+    }
+
+    #[test]
+    fn test_scribble_to_render_pipeline() {
+        let engine = SchemeEngine::new().unwrap();
+        let code = "(input x f64)\n(output result f64)\n(define result (* x 2))\n\n# Title\n\nResult is @result.";
+        let result = engine.execute_script(
+            &[("x".to_string(), crate::types::Value::F64(5.0))],
+            &["result".to_string()],
+            None,
+            code,
+        ).unwrap();
+        assert!(matches!(result.output_values.get("result"),
+            Some(crate::types::Value::F64(v)) if (*v - 10.0).abs() < f64::EPSILON));
+        assert!(!result.render_blocks.is_empty());
+        assert!(result.render_blocks.iter().any(|b| matches!(b, RenderBlock::Bold(_))));
+        assert!(result.render_blocks.iter().any(|b| matches!(b, RenderBlock::Text(t) if t.contains("10"))));
     }
 }

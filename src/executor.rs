@@ -1,6 +1,8 @@
+use crate::db::Db;
 use crate::registry::NodeRegistry;
 use crate::scheme_engine::SchemeEngine;
-use crate::store::Store as AppStore;
+#[allow(unused_imports)]
+use crate::bridge;
 use crate::types::*;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -13,7 +15,7 @@ pub struct Executor {
     engine: Engine,
     component_cache: HashMap<String, Arc<Component>>,
     pub scheme: SchemeEngine,
-    pub store: AppStore,
+    pub db: Db,
 }
 
 impl Executor {
@@ -22,12 +24,28 @@ impl Executor {
         cfg.wasm_component_model(true);
         let engine = Engine::new(&cfg)?;
         let scheme = SchemeEngine::new()?;
-        let store = AppStore::load(std::path::Path::new("./store.json"))?;
+        let db = Db::new()?;
+
+        // One-time migration: import store.json then rename it
+        let store_path = std::path::Path::new("./store.json");
+        if store_path.exists() {
+            if let Ok(text) = std::fs::read_to_string(store_path) {
+                if let Ok(data) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&text)
+                {
+                    for (key, value) in data {
+                        db.kv_set(&key, value);
+                    }
+                    let _ = std::fs::rename(store_path, "./store.json.migrated");
+                    log::info!("Migrated store.json to SurrealDB kv table");
+                }
+            }
+        }
+
         Ok(Self {
             engine,
             component_cache: HashMap::new(),
             scheme,
-            store,
+            db,
         })
     }
 
@@ -110,17 +128,8 @@ impl Executor {
 
             let start = Instant::now();
 
-            let mut input_vals: HashMap<String, Value> = node.input_values.clone();
             let eff_inputs = node.effective_inputs(Some(template));
-            for port in eff_inputs {
-                if let Some(conn) = graph.input_connection(node_id, &port.name) {
-                    if let Some(src_node) = graph.nodes.get(&conn.from_node) {
-                        if let Some(val) = src_node.output_values.get(&conn.from_port) {
-                            input_vals.insert(port.name.clone(), val.clone());
-                        }
-                    }
-                }
-            }
+            let input_vals = graph.resolve_input_values(node_id, eff_inputs);
 
             let result = if let Some(BuiltinKind::Const) = template.builtin {
                 self.execute_const(&node, &input_vals)
@@ -140,6 +149,7 @@ impl Executor {
                         n.output_values = output_values.clone();
                         n.last_exec_us = Some(duration_us);
                     }
+                    self.scheme.register_node_library(node_id, output_values);
                     let preview = output_values
                         .iter()
                         .map(|(k, v)| format!("{}: {}", k, v.display()))
@@ -223,6 +233,10 @@ impl Executor {
         };
 
         let linker: Linker<()> = Linker::new(&self.engine);
+        // NOTE: Host imports for canvas-db (store-get, store-set, db-query, etc.)
+        // are defined in wit/canvas-db.wit but require WASM components compiled
+        // against that WIT to be useful. Current math nodes don't import them.
+
         let mut store = Store::new(&self.engine, ());
 
         let instance = linker.instantiate(&mut store, &component)?;
@@ -265,7 +279,7 @@ impl Executor {
         graph: &mut Graph,
         node_id: NodeId,
     ) -> Result<HashMap<String, Value>> {
-        use crate::scheme_engine::{parse_port_declarations, ScriptValue};
+        use crate::scheme_engine::parse_port_declarations;
 
         let code = &node.script_code;
         if code.trim().is_empty() {
@@ -275,30 +289,17 @@ impl Executor {
         let (input_decls, output_decls) = parse_port_declarations(code);
 
         // Build bindings from declared inputs
-        let bindings: Vec<(String, f64)> = input_decls
+        let bindings: Vec<(String, Value)> = input_decls
             .iter()
             .filter_map(|decl| {
                 let val = input_vals.get(&decl.name)?;
-                let f = match val {
-                    Value::F64(v) => *v,
-                    Value::F32(v) => *v as f64,
-                    Value::I64(v) => *v as f64,
-                    Value::I32(v) => *v as f64,
-                    Value::Bool(v) => if *v { 1.0 } else { 0.0 },
-                    _ => return None,
-                };
-                Some((decl.name.clone(), f))
+                Some((decl.name.clone(), val.clone()))
             })
             .collect();
 
         let output_names: Vec<String> = output_decls.iter().map(|d| d.name.clone()).collect();
 
-        let script_result = self.scheme.execute_script(&bindings, &output_names, Some(&self.store), code)?;
-
-        // Process store mutations
-        for mutation in &script_result.store_mutations {
-            self.apply_store_mutation(mutation);
-        }
+        let script_result = self.scheme.execute_script(&bindings, &output_names, Some(&self.db), code)?;
 
         // Store render blocks
         if let Some(n) = graph.nodes.get_mut(&node_id) {
@@ -308,53 +309,12 @@ impl Executor {
         // Convert outputs
         let mut output_values = HashMap::new();
         for (name, val) in &script_result.output_values {
-            match val {
-                ScriptValue::Number(f) => {
-                    output_values.insert(name.clone(), Value::F64(*f));
-                }
-                ScriptValue::Str(s) => {
-                    output_values.insert(name.clone(), Value::Str(s.clone()));
-                }
-            }
+            output_values.insert(name.clone(), val.clone());
         }
 
         Ok(output_values)
     }
 
-    pub fn apply_store_mutation_pub(&self, mutation: &str) {
-        self.apply_store_mutation(mutation);
-    }
-
-    fn apply_store_mutation(&self, mutation: &str) {
-        // Parse "(store-set key value)" etc.
-        let inner = mutation.trim().strip_prefix('(').and_then(|s| s.strip_suffix(')'));
-        let inner = match inner {
-            Some(s) => s,
-            None => return,
-        };
-
-        let parts: Vec<&str> = inner.splitn(3, ' ').collect();
-        match parts.first().copied() {
-            Some("store-set") if parts.len() >= 3 => {
-                let key = parts[1].trim_matches('"');
-                let val_str = parts[2].trim_matches('"');
-                self.store.set(key, AppStore::scheme_to_value(val_str));
-                let _ = self.store.save();
-            }
-            Some("store-append") if parts.len() >= 3 => {
-                let key = parts[1].trim_matches('"');
-                let val_str = parts[2].trim_matches('"');
-                self.store.append(key, AppStore::scheme_to_value(val_str));
-                let _ = self.store.save();
-            }
-            Some("store-delete") if parts.len() >= 2 => {
-                let key = parts[1].trim_matches('"');
-                self.store.delete(key);
-                let _ = self.store.save();
-            }
-            _ => {}
-        }
-    }
 }
 
 fn value_to_wasm_val(val: &Value) -> Val {
@@ -379,5 +339,445 @@ fn wasm_val_to_value(val: &Val) -> Value {
         Val::Bool(v) => Value::Bool(*v),
         Val::String(v) => Value::Str(v.clone()),
         _ => Value::F64(f64::NAN),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::NodeRegistry;
+    use crate::scheme_engine::parse_port_declarations;
+
+    fn fresh_executor() -> Executor {
+        let mut cfg = Config::new();
+        cfg.wasm_component_model(true);
+        let engine = Engine::new(&cfg).unwrap();
+        let scheme = crate::scheme_engine::SchemeEngine::new().unwrap();
+        let db = crate::db::Db::new().unwrap();
+        Executor {
+            engine,
+            component_cache: HashMap::new(),
+            scheme,
+            db,
+        }
+    }
+
+    fn builtin_registry() -> NodeRegistry {
+        let mut reg = NodeRegistry {
+            templates: HashMap::new(),
+            nodes_dir: std::path::PathBuf::from("/tmp/wasm-canvas-test-nodes"),
+        };
+        reg.register_builtins();
+        reg
+    }
+
+    fn const_node(id: NodeId, value: Value) -> Node {
+        let mut input_values = HashMap::new();
+        input_values.insert("value".to_string(), value);
+        Node {
+            id,
+            template_name: "Const".to_string(),
+            label: format!("Const_{}", id),
+            pos: [0.0, 0.0],
+            input_values,
+            output_values: HashMap::new(),
+            script_code: String::new(),
+            script_inputs: Vec::new(),
+            script_outputs: Vec::new(),
+            error: None,
+            last_exec_us: None,
+            render_blocks: Vec::new(),
+        }
+    }
+
+    fn output_node(id: NodeId) -> Node {
+        Node {
+            id,
+            template_name: "Output".to_string(),
+            label: format!("Output_{}", id),
+            pos: [0.0, 0.0],
+            input_values: HashMap::new(),
+            output_values: HashMap::new(),
+            script_code: String::new(),
+            script_inputs: Vec::new(),
+            script_outputs: Vec::new(),
+            error: None,
+            last_exec_us: None,
+            render_blocks: Vec::new(),
+        }
+    }
+
+    fn script_node(id: NodeId, code: &str) -> Node {
+        let (input_decls, output_decls) = parse_port_declarations(code);
+        let script_inputs: Vec<PortDef> = input_decls
+            .iter()
+            .filter_map(|d| {
+                PortType::from_str(&d.port_type).map(|pt| PortDef {
+                    name: d.name.clone(),
+                    port_type: pt,
+                })
+            })
+            .collect();
+        let script_outputs: Vec<PortDef> = output_decls
+            .iter()
+            .filter_map(|d| {
+                PortType::from_str(&d.port_type).map(|pt| PortDef {
+                    name: d.name.clone(),
+                    port_type: pt,
+                })
+            })
+            .collect();
+        Node {
+            id,
+            template_name: "Script".to_string(),
+            label: format!("Script_{}", id),
+            pos: [0.0, 0.0],
+            input_values: HashMap::new(),
+            output_values: HashMap::new(),
+            script_code: code.to_string(),
+            script_inputs,
+            script_outputs,
+            error: None,
+            last_exec_us: None,
+            render_blocks: Vec::new(),
+        }
+    }
+
+    fn make_graph(nodes: Vec<Node>, connections: Vec<(NodeId, &str, NodeId, &str)>) -> Graph {
+        let mut graph = Graph::new();
+        for node in nodes {
+            let id = node.id;
+            graph.nodes.insert(id, node);
+            if id >= graph.next_node_id {
+                graph.next_node_id = id + 1;
+            }
+        }
+        for (from_node, from_port, to_node, to_port) in connections {
+            graph.add_connection(from_node, from_port.to_string(), to_node, to_port.to_string());
+        }
+        graph
+    }
+
+    // ── Tier 1: Const and Output ──
+
+    #[test]
+    fn test_const_f64() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        let mut graph = make_graph(vec![const_node(1, Value::F64(42.0))], vec![]);
+        let events = exec.execute_graph(&mut graph, &reg);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].result.is_ok());
+        let out = &graph.nodes[&1].output_values["out"];
+        assert!(matches!(out, Value::F64(v) if (*v - 42.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn test_const_string() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        let mut graph = make_graph(vec![const_node(1, Value::Str("hello".into()))], vec![]);
+        exec.execute_graph(&mut graph, &reg);
+        let out = &graph.nodes[&1].output_values["out"];
+        assert!(matches!(out, Value::Str(s) if s == "hello"));
+    }
+
+    #[test]
+    fn test_output_passthrough() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        let mut node = output_node(1);
+        node.input_values.insert("in".to_string(), Value::F64(7.0));
+        let mut graph = make_graph(vec![node], vec![]);
+        exec.execute_graph(&mut graph, &reg);
+        let out = &graph.nodes[&1].output_values["display"];
+        assert!(matches!(out, Value::F64(v) if (*v - 7.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn test_missing_template() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        let node = Node {
+            id: 1,
+            template_name: "NonExistent".to_string(),
+            label: "Bad".to_string(),
+            pos: [0.0, 0.0],
+            input_values: HashMap::new(),
+            output_values: HashMap::new(),
+            script_code: String::new(),
+            script_inputs: Vec::new(),
+            script_outputs: Vec::new(),
+            error: None,
+            last_exec_us: None,
+            render_blocks: Vec::new(),
+        };
+        let mut graph = make_graph(vec![node], vec![]);
+        let events = exec.execute_graph(&mut graph, &reg);
+        assert!(events[0].result.is_err());
+        assert!(events[0].result.as_ref().unwrap_err().contains("not found"));
+        assert!(graph.nodes[&1].error.is_some());
+    }
+
+    // ── Tier 2: DB operations ──
+
+    #[test]
+    fn test_db_kv_set() {
+        let exec = fresh_executor();
+        exec.db.kv_set("test_key", serde_json::json!("test_val"));
+        let got = exec.db.kv_get("test_key");
+        assert_eq!(got, Some(serde_json::json!("test_val")));
+    }
+
+    #[test]
+    fn test_db_kv_append() {
+        let exec = fresh_executor();
+        exec.db.kv_append("arr", serde_json::json!(1));
+        exec.db.kv_append("arr", serde_json::json!(2));
+        let got = exec.db.kv_get("arr").unwrap();
+        assert_eq!(got, serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn test_db_kv_delete() {
+        let exec = fresh_executor();
+        exec.db.kv_set("gone", serde_json::json!(99));
+        exec.db.kv_delete("gone");
+        assert!(exec.db.kv_get("gone").is_none());
+    }
+
+    #[test]
+    fn test_db_run() {
+        let exec = fresh_executor();
+        exec.db.run("CREATE tasks SET title = 'hello', done = false").unwrap();
+        let rows = exec.db.query("SELECT * FROM tasks").unwrap();
+        assert!(!rows.is_empty());
+        assert_eq!(rows[0]["title"], serde_json::json!("hello"));
+    }
+
+    // ── Tier 3: Script execution ──
+
+    #[test]
+    fn test_script_arithmetic() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        let code = "(input x f64)\n(output result f64)\n(define result (* x 2))";
+        let mut node = script_node(1, code);
+        node.input_values.insert("x".to_string(), Value::F64(5.0));
+        let mut graph = make_graph(vec![node], vec![]);
+        exec.execute_graph(&mut graph, &reg);
+        let out = &graph.nodes[&1].output_values["result"];
+        assert!(matches!(out, Value::F64(v) if (*v - 10.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn test_script_render_blocks() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        let code = "(render (bold \"hi\"))";
+        let node = script_node(1, code);
+        let mut graph = make_graph(vec![node], vec![]);
+        exec.execute_graph(&mut graph, &reg);
+        let blocks = &graph.nodes[&1].render_blocks;
+        assert!(!blocks.is_empty());
+    }
+
+    #[test]
+    fn test_script_db_mutation() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        let code = "(store-set! \"mykey\" \"myval\")";
+        let node = script_node(1, code);
+        let mut graph = make_graph(vec![node], vec![]);
+        exec.execute_graph(&mut graph, &reg);
+        let got = exec.db.kv_get("mykey");
+        assert_eq!(got, Some(serde_json::json!("myval")));
+    }
+
+    #[test]
+    fn test_script_db_query() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        // Pre-seed data
+        exec.db.run("CREATE items SET name = 'apple', qty = 3").unwrap();
+        let code = "(db-query \"SELECT * FROM items\")";
+        let node = script_node(1, code);
+        let mut graph = make_graph(vec![node], vec![]);
+        let events = exec.execute_graph(&mut graph, &reg);
+        assert!(events[0].result.is_ok());
+    }
+
+    #[test]
+    fn test_script_empty_code() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        let mut node = script_node(1, "");
+        node.script_code = "   ".to_string(); // whitespace only
+        let mut graph = make_graph(vec![node], vec![]);
+        let events = exec.execute_graph(&mut graph, &reg);
+        assert!(events[0].result.is_ok());
+        assert!(graph.nodes[&1].output_values.is_empty());
+    }
+
+    // ── Tier 4: Chains ──
+
+    #[test]
+    fn test_const_to_output_chain() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        let mut graph = make_graph(
+            vec![const_node(1, Value::F64(42.0)), output_node(2)],
+            vec![(1, "out", 2, "in")],
+        );
+        exec.execute_graph(&mut graph, &reg);
+        let out = &graph.nodes[&2].output_values["display"];
+        assert!(matches!(out, Value::F64(v) if (*v - 42.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn test_const_to_script_chain() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        let code = "(input x f64)\n(output result f64)\n(define result (* x 10))";
+        let mut graph = make_graph(
+            vec![const_node(1, Value::F64(3.0)), script_node(2, code)],
+            vec![(1, "out", 2, "x")],
+        );
+        exec.execute_graph(&mut graph, &reg);
+        let out = &graph.nodes[&2].output_values["result"];
+        assert!(matches!(out, Value::F64(v) if (*v - 30.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn test_cycle_detection() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        let code_a = "(input x f64)\n(output result f64)\n(define result x)";
+        let code_b = "(input x f64)\n(output result f64)\n(define result x)";
+        let mut graph = make_graph(
+            vec![script_node(1, code_a), script_node(2, code_b)],
+            vec![(1, "result", 2, "x"), (2, "result", 1, "x")],
+        );
+        let events = exec.execute_graph(&mut graph, &reg);
+        assert!(events.iter().any(|e| e.result.as_ref().unwrap_err().contains("Cycle")));
+    }
+
+    #[test]
+    fn test_execute_up_to() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        let code = "(input x f64)\n(output result f64)\n(define result (* x 2))";
+        // node 3 is independent, should not execute
+        let mut graph = make_graph(
+            vec![
+                const_node(1, Value::F64(5.0)),
+                script_node(2, code),
+                const_node(3, Value::F64(99.0)),
+            ],
+            vec![(1, "out", 2, "x")],
+        );
+        let events = exec.execute_up_to(&mut graph, &reg, 2);
+        // Only nodes 1 and 2 should have executed
+        let executed_ids: Vec<NodeId> = events.iter().map(|e| e.node_id).collect();
+        assert!(executed_ids.contains(&1));
+        assert!(executed_ids.contains(&2));
+        assert!(!executed_ids.contains(&3));
+        let out = &graph.nodes[&2].output_values["result"];
+        assert!(matches!(out, Value::F64(v) if (*v - 10.0).abs() < f64::EPSILON));
+    }
+
+    // ── Tier 5: DB roundtrip ──
+
+    #[test]
+    fn test_script_creates_then_queries() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        let create_code = "(db-run \"CREATE items SET name = 'banana', qty = 5\")";
+        let query_code = "(db-query \"SELECT * FROM items\")";
+        let mut graph = make_graph(
+            vec![script_node(1, create_code), script_node(2, query_code)],
+            // Connection to enforce ordering: node 1 before node 2
+            // We use a dummy port — but since there's no declared port, let's rely on topo order.
+            // Nodes with lower IDs come first in topo sort (sorted queue).
+            vec![],
+        );
+        exec.execute_graph(&mut graph, &reg);
+        // Both should succeed
+        assert!(graph.nodes[&1].error.is_none());
+        assert!(graph.nodes[&2].error.is_none());
+        // Verify data actually exists
+        let rows = exec.db.query("SELECT * FROM items").unwrap();
+        assert!(!rows.is_empty());
+    }
+
+    #[test]
+    fn test_script_store_set_then_read() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        // Script 1 sets a kv value
+        let set_code = "(store-set! \"color\" \"red\")";
+        // Script 2 reads it back via store-get (injected at script start)
+        // Use db-query as a reliable fallback to verify the value landed in DB
+        let read_code = "(db-query \"SELECT * FROM kv WHERE key = 'color'\")";
+        let mut graph = make_graph(
+            vec![script_node(1, set_code), script_node(2, read_code)],
+            vec![],
+        );
+        exec.execute_graph(&mut graph, &reg);
+        assert!(graph.nodes[&1].error.is_none());
+        assert!(graph.nodes[&2].error.is_none());
+        // Verify via direct DB access
+        let got = exec.db.kv_get("color");
+        assert_eq!(got, Some(serde_json::json!("red")));
+    }
+
+    // ── Tier 6: Node as R6RS module ──
+
+    #[test]
+    fn test_node_library_registration() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        let mut graph = make_graph(vec![const_node(1, Value::F64(42.0))], vec![]);
+        exec.execute_graph(&mut graph, &reg);
+        // After execution, node 1's output should be registered as (node 1)
+        let env = exec.scheme.make_env();
+        env.eval(true, "(import (node n1))").unwrap();
+        let results = env.eval(false, "out").unwrap();
+        let val = results[0].cast_to_scheme_type::<f64>().unwrap();
+        assert!((val - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_chain_via_import() {
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+
+        // Const(42) → Script that imports (node n1) via R6RS module.
+        // We need a connection to ensure topo order (1 before 2).
+        let code = "(import (node n1))\n(output result f64)\n(define result (* out 2))";
+        let mut graph = make_graph(
+            vec![const_node(1, Value::F64(42.0)), script_node(2, code)],
+            // Dummy connection to enforce ordering
+            vec![(1, "out", 2, "x")],
+        );
+        exec.execute_graph(&mut graph, &reg);
+        assert!(graph.nodes[&2].error.is_none(), "Script error: {:?}", graph.nodes[&2].error);
+        let out = &graph.nodes[&2].output_values["result"];
+        assert!(matches!(out, Value::F64(v) if (*v - 84.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn test_backward_compat_input_injection() {
+        // Old style (input x f64) still works with connections
+        let mut exec = fresh_executor();
+        let reg = builtin_registry();
+        let code = "(input x f64)\n(output result f64)\n(define result (* x 3))";
+        let mut graph = make_graph(
+            vec![const_node(1, Value::F64(10.0)), script_node(2, code)],
+            vec![(1, "out", 2, "x")],
+        );
+        exec.execute_graph(&mut graph, &reg);
+        let out = &graph.nodes[&2].output_values["result"];
+        assert!(matches!(out, Value::F64(v) if (*v - 30.0).abs() < f64::EPSILON));
     }
 }

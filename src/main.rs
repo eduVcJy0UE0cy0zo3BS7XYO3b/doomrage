@@ -1,4 +1,5 @@
 mod app;
+mod bridge;
 mod canvas;
 mod executor;
 mod panels;
@@ -6,8 +7,10 @@ mod persistence;
 mod registry;
 mod preprocessor;
 mod render;
-mod store;
+mod db;
+mod debug_log;
 mod render_ui;
+mod scheme_convert;
 mod scheme_engine;
 mod theme;
 mod types;

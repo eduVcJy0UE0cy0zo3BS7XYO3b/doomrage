@@ -1,6 +1,7 @@
+use crate::db::Db;
+use crate::debug_log::DebugLog;
 use crate::registry::NodeRegistry;
 use crate::render::{PlotData, RenderBlock, StoreAction};
-use crate::store::Store;
 use crate::theme::*;
 use crate::types::*;
 use egui::{Color32, CornerRadius, RichText, Sense};
@@ -16,6 +17,7 @@ pub struct PanelState {
     pub show_library: bool,
     pub show_inspector: bool,
     pub show_log: bool,
+    pub show_debug: bool,
     pub selected_node: Option<NodeId>,
     pub script_view: ScriptViewMode,
 }
@@ -27,6 +29,7 @@ impl PanelState {
             show_library: true,
             show_inspector: true,
             show_log: true,
+            show_debug: false,
             selected_node: None,
             script_view: ScriptViewMode::Rendered,
         }
@@ -39,6 +42,7 @@ pub enum PanelAction {
     ComputeNode(NodeId),
     CancelCompute,
     SyncScriptPorts(NodeId),
+    RecomputeSelected,
     StepGraph,
     ToggleAutoRun,
     SaveGraph,
@@ -184,8 +188,9 @@ pub fn draw_inspector(
     graph: &mut Graph,
     registry: &NodeRegistry,
     panel: &mut PanelState,
-    store: &Store,
+    db: &Db,
     is_computing: bool,
+    debug_log: &mut DebugLog,
 ) -> Vec<PanelAction> {
     let mut actions = Vec::new();
 
@@ -307,12 +312,9 @@ pub fn draw_inspector(
                         } else if node.render_blocks.is_empty() {
                             ui.label(RichText::new("Press Compute to evaluate").color(TEXT_DIM));
                         } else {
-                            egui::ScrollArea::vertical()
-                                .id_salt("script_render_scroll")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    draw_render_blocks(ui, &node.render_blocks, store);
-                                });
+                            if draw_render_blocks(ui, &node.render_blocks, db, debug_log) {
+                                actions.push(PanelAction::RecomputeSelected);
+                            }
                         }
                     }
                 }
@@ -488,9 +490,12 @@ pub fn draw_execution_log(ui: &mut egui::Ui, events: &[RunEvent]) {
         });
 }
 
-fn draw_render_blocks(ui: &mut egui::Ui, blocks: &[RenderBlock], store: &Store) {
+/// Returns true if db was mutated (needs recompute)
+fn draw_render_blocks(ui: &mut egui::Ui, blocks: &[RenderBlock], db: &Db, debug_log: &mut DebugLog) -> bool {
+    let mut store_mutated = false;
     for (block_idx, block) in blocks.iter().enumerate() {
-        ui.push_id(block_idx, |ui| {
+        let stable_id = format!("rb_{}_{}", block_idx, block_id_hint(block));
+        ui.push_id(stable_id, |ui| {
         match block {
             RenderBlock::Text(t) => {
                 ui.label(RichText::new(t).color(TEXT));
@@ -550,77 +555,162 @@ fn draw_render_blocks(ui: &mut egui::Ui, blocks: &[RenderBlock], store: &Store) 
                 draw_plot(ui, plot_data);
             }
             RenderBlock::Group(inner) => {
-                draw_render_blocks(ui, inner, store);
+                if draw_render_blocks(ui, inner, db, debug_log) {
+                    store_mutated = true;
+                }
             }
             RenderBlock::Button { label, action } => {
                 if ui.button(RichText::new(label).color(ACCENT)).clicked() {
                     match action {
                         StoreAction::Set { key, value } => {
-                            store.set(key, Store::scheme_to_value(value));
-                            let _ = store.save();
+                            let resolved = resolve_store_ref(value, db);
+                            debug_log.log("button", format!("set {:?} = {:?} (from {:?})", key, resolved, value));
+                            db.kv_set(key, serde_json::Value::String(resolved));
                         }
                         StoreAction::Append { key, value } => {
-                            store.append(key, Store::scheme_to_value(value));
-                            let _ = store.save();
+                            let resolved = resolve_store_ref(value, db);
+                            debug_log.log("button", format!("append {:?} ← {:?} (from {:?})", key, resolved, value));
+                            if !resolved.is_empty() {
+                                db.kv_append(key, serde_json::Value::String(resolved));
+                            }
                         }
                         StoreAction::Delete { key } => {
-                            store.delete(key);
-                            let _ = store.save();
+                            debug_log.log("button", format!("delete {:?}", key));
+                            db.kv_delete(key);
                         }
                     }
+                    store_mutated = true;
                 }
             }
             RenderBlock::Checkbox { label, key } => {
-                ui.push_id(format!("cb_{}", key), |ui| {
-                    let current = store
-                        .get(key)
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let mut checked = current;
-                    if ui.checkbox(&mut checked, RichText::new(label).color(TEXT)).changed() {
-                        store.set(key, serde_json::Value::Bool(checked));
-                        let _ = store.save();
-                    }
-                });
+                let id = egui::Id::new(format!("wg_cb_{}", key));
+                let mut checked = ui.ctx().data_mut(|d| *d.get_temp_mut_or(id, false));
+                let resp = ui.checkbox(&mut checked, RichText::new(label).color(TEXT));
+                ui.ctx().data_mut(|d| d.insert_temp(id, checked));
+                if resp.changed() {
+                    db.kv_set(key, serde_json::Value::Bool(checked));
+                }
             }
             RenderBlock::TextInput { key, placeholder } => {
-                ui.push_id(format!("ti_{}", key), |ui| {
-                    let current = store
-                        .get(key)
-                        .and_then(|v| v.as_str().map(|s| s.to_string()))
-                        .unwrap_or_default();
-                    let mut text = current;
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut text)
-                            .hint_text(placeholder)
-                            .desired_width(ui.available_width()),
-                    );
-                    if response.changed() {
-                        store.set(key, serde_json::Value::String(text));
-                        let _ = store.save();
-                    }
+                let id = egui::Id::new(format!("wg_ti_{}", key));
+                let mut is_new = false;
+                let mut text = ui.ctx().data_mut(|d| {
+                    d.get_temp_mut_or_insert_with(id, || {
+                        is_new = true;
+                        db.kv_get(key)
+                            .and_then(|v| v.as_str().map(|s| s.to_string()))
+                            .unwrap_or_default()
+                    }).clone()
                 });
+                // Ensure kv key exists on first render so buttons can resolve it
+                if is_new && db.kv_get(key).is_none() {
+                    db.kv_set(key, serde_json::Value::String(text.clone()));
+                }
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut text)
+                        .hint_text(placeholder)
+                        .desired_width(ui.available_width()),
+                );
+                if response.changed() {
+                    ui.ctx().data_mut(|d| d.insert_temp(id, text.clone()));
+                    db.kv_set(key, serde_json::Value::String(text));
+                }
+            }
+            RenderBlock::EditableList { key } => {
+                let items = db
+                    .kv_get(key)
+                    .and_then(|v| v.as_array().cloned())
+                    .unwrap_or_default();
+
+                let mut to_delete: Option<usize> = None;
+
+                for (i, item) in items.iter().enumerate() {
+                    let item_str = item.as_str().unwrap_or("").to_string();
+                    let item_id = egui::Id::new(format!("el_{}_{}", key, i));
+
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{}.", i + 1)).color(TEXT_DIM));
+
+                        let mut text = ui.ctx().data_mut(|d| {
+                            d.get_temp_mut_or_insert_with(item_id, || item_str.clone()).clone()
+                        });
+
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut text)
+                                .desired_width(150.0),
+                        );
+                        if resp.changed() {
+                            ui.ctx().data_mut(|d| d.insert_temp(item_id, text.clone()));
+                            let mut arr = items.clone();
+                            arr[i] = serde_json::Value::String(text);
+                            db.kv_set(key, serde_json::Value::Array(arr));
+                            store_mutated = true;
+                        }
+
+                        if ui.button(RichText::new("x").color(Color32::from_rgb(0xff, 0x44, 0x44))).clicked() {
+                            to_delete = Some(i);
+                        }
+                    });
+                }
+
+                if let Some(idx) = to_delete {
+                    let mut arr = items.clone();
+                    arr.remove(idx);
+                    db.kv_set(key, serde_json::Value::Array(arr));
+                    for i in 0..20 {
+                        let id = egui::Id::new(format!("el_{}_{}", key, i));
+                        ui.ctx().data_mut(|d| d.remove_temp::<String>(id));
+                    }
+                    store_mutated = true;
+                }
+
+                if items.is_empty() {
+                    ui.label(RichText::new("(empty list)").color(TEXT_DIM).italics());
+                }
             }
             RenderBlock::Slider { key, min, max } => {
-                ui.push_id(format!("sl_{}", key), |ui| {
-                    let current = store
-                        .get(key)
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(*min);
-                    let mut val = current;
-                    if ui.add(egui::Slider::new(&mut val, *min..=*max)).changed() {
-                        store.set(
-                            key,
-                            serde_json::Number::from_f64(val)
-                                .map(serde_json::Value::Number)
-                                .unwrap_or(serde_json::Value::Null),
+                let current = db
+                    .kv_get(key)
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(*min);
+                let mut val = current;
+                if ui.add(egui::Slider::new(&mut val, *min..=*max)).changed() {
+                    db.kv_set(
+                        key,
+                        serde_json::Number::from_f64(val)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null),
                     );
-                    let _ = store.save();
                 }
-                });
             }
         }
         }); // push_id
+    }
+    store_mutated
+}
+
+/// If value is a kv key, resolve to current value; otherwise return as-is
+fn resolve_store_ref(value: &str, db: &Db) -> String {
+    if let Some(val) = db.kv_get(value) {
+        if let Some(s) = val.as_str() {
+            return s.to_string();
+        }
+        return format!("{}", val);
+    }
+    value.to_string()
+}
+
+fn block_id_hint(block: &RenderBlock) -> String {
+    match block {
+        RenderBlock::Checkbox { key, .. } => format!("cb_{}", key),
+        RenderBlock::TextInput { key, .. } => format!("ti_{}", key),
+        RenderBlock::Slider { key, .. } => format!("sl_{}", key),
+        RenderBlock::Button { label, .. } => format!("btn_{}", label),
+        RenderBlock::Table { .. } => "table".to_string(),
+        RenderBlock::Plot(_) => "plot".to_string(),
+        RenderBlock::Bold(t) => format!("b_{}", &t[..t.len().min(8)]),
+        RenderBlock::Text(t) => format!("t_{}", &t[..t.len().min(8)]),
+        _ => "x".to_string(),
     }
 }
 
@@ -695,4 +785,87 @@ fn draw_plot(ui: &mut egui::Ui, plot_data: &PlotData) {
                 });
         }
     }
+}
+
+pub fn draw_debug_panel(ui: &mut egui::Ui, db: &Db, debug_log: &mut DebugLog) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Debug").color(ACCENT).strong());
+        if ui.button(RichText::new("Clear").color(TEXT_DIM).small()).clicked() {
+            debug_log.clear();
+        }
+    });
+    ui.separator();
+
+    egui::ScrollArea::horizontal()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                // Left: DB state
+                ui.vertical(|ui| {
+                    ui.set_min_width(250.0);
+                    ui.label(RichText::new("kv state").color(TEXT_DIM).small());
+                    ui.separator();
+                    let pairs = db.kv_all();
+                    if pairs.is_empty() {
+                        ui.label(RichText::new("(empty)").color(TEXT_DIM).small());
+                    }
+                    for (key, value) in &pairs {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(key).color(ACCENT).monospace().small());
+                            let val_str = match value {
+                                serde_json::Value::String(s) => format!("\"{}\"", s),
+                                other => format!("{}", other),
+                            };
+                            let truncated = if val_str.len() > 60 {
+                                format!("{}...", &val_str[..57])
+                            } else {
+                                val_str
+                            };
+                            ui.label(RichText::new(truncated).color(TEXT).monospace().small());
+                        });
+                    }
+                });
+
+                ui.separator();
+
+                // Right: Event log
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Event log").color(TEXT_DIM).small());
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for entry in debug_log.entries() {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("{:>6}ms", entry.elapsed_ms))
+                                            .color(TEXT_DIM)
+                                            .monospace()
+                                            .small(),
+                                    );
+                                    let source_color = match entry.source {
+                                        "error" => Color32::from_rgb(0xff, 0x44, 0x44),
+                                        "mutation" => Color32::from_rgb(0x22, 0x8b, 0x22),
+                                        "button" => ACCENT,
+                                        _ => TEXT_DIM,
+                                    };
+                                    ui.label(
+                                        RichText::new(entry.source)
+                                            .color(source_color)
+                                            .monospace()
+                                            .small(),
+                                    );
+                                    ui.label(
+                                        RichText::new(&entry.message)
+                                            .color(TEXT)
+                                            .monospace()
+                                            .small(),
+                                    );
+                                });
+                            }
+                        });
+                });
+            });
+        });
 }

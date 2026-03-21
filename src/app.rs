@@ -1,12 +1,13 @@
 use crate::canvas::{self, CanvasState};
+use crate::debug_log::DebugLog;
 use crate::executor::Executor;
 use crate::panels::{self, PanelAction, PanelState, ScriptViewMode};
 use crate::persistence::{self, UndoHistory};
 use crate::registry::NodeRegistry;
-use crate::scheme_engine::{parse_port_declarations, ScriptValue};
+use crate::scheme_engine::parse_port_declarations;
 use crate::theme;
 use crate::types::*;
-use crate::worker::{WorkRequest, WorkResult, Worker};
+use crate::worker::{DeferredQueue, WorkRequest, WorkResult};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -14,7 +15,7 @@ pub struct WasmCanvasApp {
     graph: Graph,
     registry: NodeRegistry,
     executor: Executor,
-    worker: Worker,
+    worker: DeferredQueue,
     canvas_state: CanvasState,
     panel_state: PanelState,
     undo_history: UndoHistory,
@@ -23,8 +24,8 @@ pub struct WasmCanvasApp {
     graph_dirty: bool,
     current_file: Option<PathBuf>,
     theme_applied: bool,
-    /// Nodes currently being computed in background
     pending_nodes: HashSet<NodeId>,
+    debug_log: DebugLog,
 }
 
 impl WasmCanvasApp {
@@ -36,12 +37,18 @@ impl WasmCanvasApp {
         }
 
         let executor = Executor::new().expect("Failed to create WASM executor");
-        let worker = Worker::new();
+        let worker = DeferredQueue::new();
+
+        // Restore DB state from previous session
+        let db_auto_path = PathBuf::from("./db.json");
+        if let Err(e) = persistence::load_db(&executor.db, &db_auto_path) {
+            log::warn!("Failed to restore DB: {}", e);
+        }
 
         // Try loading demo graph on first launch
         let demo_path = PathBuf::from("./demo.json");
         let graph = if demo_path.exists() {
-            match persistence::load_graph(&demo_path) {
+            match persistence::load_graph(&demo_path, &executor.db) {
                 Ok(g) => {
                     log::info!("Loaded demo graph");
                     g
@@ -79,6 +86,7 @@ impl WasmCanvasApp {
             current_file: None,
             theme_applied: false,
             pending_nodes: HashSet::new(),
+            debug_log: DebugLog::new(),
         }
     }
 
@@ -140,40 +148,17 @@ impl WasmCanvasApp {
                 let code = node.script_code.clone();
                 let (input_decls, output_decls) = parse_port_declarations(&code);
 
-                let input_bindings: Vec<(String, f64)> = input_decls
-                    .iter()
-                    .filter_map(|decl| {
-                        let val = node.input_values.get(&decl.name)?;
-                        let f = match val {
-                            Value::F64(v) => *v,
-                            Value::F32(v) => *v as f64,
-                            Value::I64(v) => *v as f64,
-                            Value::I32(v) => *v as f64,
-                            _ => return None,
-                        };
-                        Some((decl.name.clone(), f))
-                    })
-                    .collect();
-
-                // Also gather from connected upstream outputs
                 let eff_inputs = node.effective_inputs(
                     self.registry.templates.get(&node.template_name).map(|t| t as &NodeTemplate),
                 );
-                let mut bindings = input_bindings;
-                for port in eff_inputs {
-                    if let Some(conn) = self.graph.input_connection(node_id, &port.name) {
-                        if let Some(src) = self.graph.nodes.get(&conn.from_node) {
-                            if let Some(val) = src.output_values.get(&conn.from_port) {
-                                if let Value::F64(f) = val {
-                                    // Override with connected value
-                                    if let Some(existing) = bindings.iter_mut().find(|(n, _)| n == &port.name) {
-                                        existing.1 = *f;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                let resolved = self.graph.resolve_input_values(node_id, eff_inputs);
+                let bindings: Vec<(String, Value)> = input_decls
+                    .iter()
+                    .filter_map(|decl| {
+                        let val = resolved.get(&decl.name)?;
+                        Some((decl.name.clone(), val.clone()))
+                    })
+                    .collect();
 
                 let output_names: Vec<String> = output_decls.iter().map(|d| d.name.clone()).collect();
 
@@ -183,7 +168,7 @@ impl WasmCanvasApp {
                     code,
                     input_bindings: bindings,
                     output_names,
-                    store: self.executor.store.clone(),
+                    db: self.executor.db.clone(),
                 });
                 return;
             }
@@ -192,29 +177,6 @@ impl WasmCanvasApp {
         // Fallback: non-script node
         let events = self.executor.execute_up_to(&mut self.graph, &self.registry, node_id);
         self.run_events.extend(events);
-    }
-
-    fn ensure_script_preview(&mut self, node_id: NodeId) {
-        let node = match self.graph.nodes.get(&node_id) {
-            Some(n) if n.template_name == "Script" && n.render_blocks.is_empty() => n,
-            _ => return,
-        };
-
-        if self.pending_nodes.contains(&node_id) {
-            return; // Already computing
-        }
-
-        let code = node.script_code.clone();
-        if code.trim().is_empty() {
-            return;
-        }
-
-        self.pending_nodes.insert(node_id);
-        self.worker.send(WorkRequest::Preview {
-            node_id,
-            code,
-            store: self.executor.store.clone(),
-        });
     }
 
     fn poll_worker_results(&mut self) {
@@ -228,25 +190,24 @@ impl WasmCanvasApp {
                 }
                 WorkResult::Compute { node_id, result } => {
                     self.pending_nodes.remove(&node_id);
+                    let label = self.graph.nodes.get(&node_id)
+                        .map(|n| n.label.clone()).unwrap_or_default();
+                    self.debug_log.log("compute", format!(
+                        "#{} \"{}\" → {} blocks, {} outputs",
+                        node_id, label,
+                        result.render_blocks.len(),
+                        result.output_values.len()
+                    ));
                     if let Some(n) = self.graph.nodes.get_mut(&node_id) {
                         n.render_blocks = result.render_blocks;
                         n.error = None;
                         for (name, val) in &result.output_values {
-                            match val {
-                                ScriptValue::Number(f) => {
-                                    n.output_values.insert(name.clone(), Value::F64(*f));
-                                }
-                                ScriptValue::Str(s) => {
-                                    n.output_values.insert(name.clone(), Value::Str(s.clone()));
-                                }
-                            }
-                        }
-                        for mutation in &result.store_mutations {
-                            self.executor.apply_store_mutation_pub(mutation);
+                            n.output_values.insert(name.clone(), val.clone());
                         }
                     }
                 }
                 WorkResult::Error { node_id, message } => {
+                    self.debug_log.log("error", format!("#{}: {}", node_id, &message));
                     self.pending_nodes.remove(&node_id);
                     if let Some(n) = self.graph.nodes.get_mut(&node_id) {
                         n.error = Some(message);
@@ -268,6 +229,14 @@ impl WasmCanvasApp {
                 PanelAction::CancelCompute => {
                     self.worker.cancel();
                     self.pending_nodes.clear();
+                }
+                PanelAction::RecomputeSelected => {
+                    if let Some(node_id) = self.panel_state.selected_node {
+                        if let Some(n) = self.graph.nodes.get_mut(&node_id) {
+                            n.render_blocks.clear();
+                        }
+                        self.compute_node(node_id);
+                    }
                 }
                 PanelAction::SyncScriptPorts(id) => {
                     if let Some(node) = self.graph.nodes.get_mut(&id) {
@@ -322,7 +291,7 @@ impl WasmCanvasApp {
         });
 
         if let Some(path) = path {
-            if let Err(e) = persistence::save_graph(&self.graph, &path) {
+            if let Err(e) = persistence::save_graph(&self.graph, &path, &self.executor.db) {
                 log::error!("Failed to save graph: {}", e);
             } else {
                 self.current_file = Some(path);
@@ -337,7 +306,7 @@ impl WasmCanvasApp {
             .pick_file();
 
         if let Some(path) = path {
-            match persistence::load_graph(&path) {
+            match persistence::load_graph(&path, &self.executor.db) {
                 Ok(graph) => {
                     self.graph = graph;
                     self.undo_history.push(&self.graph);
@@ -390,19 +359,33 @@ impl eframe::App for WasmCanvasApp {
             actions.extend(toolbar_actions);
         });
 
-        // Bottom panel - execution log
-        if self.panel_state.show_log {
-            egui::TopBottomPanel::bottom("exec_log")
+        // Bottom panel - execution log or debug
+        if self.panel_state.show_log || self.panel_state.show_debug {
+            egui::TopBottomPanel::bottom("bottom_panel")
                 .resizable(true)
-                .default_height(120.0)
+                .default_height(150.0)
                 .show(ctx, |ui| {
-                    panels::draw_execution_log(ui, &self.run_events);
+                    if self.panel_state.show_debug {
+                        panels::draw_debug_panel(ui, &self.executor.db, &mut self.debug_log);
+                    } else {
+                        panels::draw_execution_log(ui, &self.run_events);
+                    }
                 });
         }
 
-        // Toggle log with backtick
+        // Toggle log with backtick, debug with D
         if ctx.input(|i| i.key_pressed(egui::Key::Backtick)) {
-            self.panel_state.show_log = !self.panel_state.show_log;
+            if self.panel_state.show_debug {
+                self.panel_state.show_debug = false;
+            } else {
+                self.panel_state.show_log = !self.panel_state.show_log;
+            }
+        }
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::D)) {
+            self.panel_state.show_debug = !self.panel_state.show_debug;
+            if self.panel_state.show_debug {
+                self.panel_state.show_log = false;
+            }
         }
 
         // Left panel - node library
@@ -430,8 +413,9 @@ impl eframe::App for WasmCanvasApp {
                         &mut self.graph,
                         &self.registry,
                         &mut self.panel_state,
-                        &self.executor.store,
+                        &self.executor.db,
                         computing,
+                        &mut self.debug_log,
                     );
                     actions.extend(insp_actions);
                 });
@@ -526,6 +510,12 @@ impl eframe::App for WasmCanvasApp {
         // Auto-run
         if self.auto_run && self.graph_dirty {
             self.run_graph();
+        }
+    }
+
+    fn on_exit(&mut self) {
+        if let Err(e) = persistence::save_db(&self.executor.db, &PathBuf::from("./db.json")) {
+            log::error!("Failed to auto-save DB: {}", e);
         }
     }
 }

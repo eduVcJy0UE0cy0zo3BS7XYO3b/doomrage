@@ -90,7 +90,7 @@ impl NodeRegistry {
         Ok(())
     }
 
-    fn register_builtins(&mut self) {
+    pub(crate) fn register_builtins(&mut self) {
         self.templates.insert(
             "Const".to_string(),
             NodeTemplate {

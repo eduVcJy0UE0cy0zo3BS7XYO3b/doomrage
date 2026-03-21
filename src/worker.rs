@@ -1,21 +1,21 @@
+use crate::db::Db;
 use crate::render::RenderBlock;
 use crate::scheme_engine::{parse_port_declarations, SchemeEngine, ScriptResult};
-use crate::store::Store;
-use crate::types::NodeId;
+use crate::types::{NodeId, Value};
 
 /// Work request — stored, executed next frame in main thread
 pub enum WorkRequest {
     Preview {
         node_id: NodeId,
         code: String,
-        store: Store,
+        db: Db,
     },
     Compute {
         node_id: NodeId,
         code: String,
-        input_bindings: Vec<(String, f64)>,
+        input_bindings: Vec<(String, Value)>,
         output_names: Vec<String>,
-        store: Store,
+        db: Db,
     },
 }
 
@@ -34,12 +34,12 @@ pub enum WorkResult {
     },
 }
 
-/// Simple deferred worker — queues requests, processes one per frame in main thread
-pub struct Worker {
+/// Deferred queue — queues requests, processes one per frame in main thread
+pub struct DeferredQueue {
     queue: Vec<WorkRequest>,
 }
 
-impl Worker {
+impl DeferredQueue {
     pub fn new() -> Self {
         Self { queue: Vec::new() }
     }
@@ -68,12 +68,12 @@ fn execute_request(engine: &SchemeEngine, request: WorkRequest) -> WorkResult {
         WorkRequest::Preview {
             node_id,
             code,
-            store,
+            db,
         } => {
             let (input_decls, _) = parse_port_declarations(&code);
             let input_names: Vec<String> = input_decls.iter().map(|d| d.name.clone()).collect();
 
-            match engine.preview_script(&input_names, Some(&store), &code) {
+            match engine.preview_script(&input_names, Some(&db), &code) {
                 Ok(r) => WorkResult::Preview {
                     node_id,
                     blocks: r.render_blocks,
@@ -89,8 +89,8 @@ fn execute_request(engine: &SchemeEngine, request: WorkRequest) -> WorkResult {
             code,
             input_bindings,
             output_names,
-            store,
-        } => match engine.execute_script(&input_bindings, &output_names, Some(&store), &code) {
+            db,
+        } => match engine.execute_script(&input_bindings, &output_names, Some(&db), &code) {
             Ok(result) => WorkResult::Compute { node_id, result },
             Err(e) => WorkResult::Error {
                 node_id,

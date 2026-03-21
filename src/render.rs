@@ -19,6 +19,7 @@ pub enum RenderBlock {
     Checkbox { label: String, key: String },
     TextInput { key: String, placeholder: String },
     Slider { key: String, min: f64, max: f64 },
+    EditableList { key: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

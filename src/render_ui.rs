@@ -223,7 +223,8 @@ pub fn paint_render_blocks(
             RenderBlock::Button { .. }
             | RenderBlock::Checkbox { .. }
             | RenderBlock::TextInput { .. }
-            | RenderBlock::Slider { .. } => {
+            | RenderBlock::Slider { .. }
+            | RenderBlock::EditableList { .. } => {
                 y += line_height;
             }
         }

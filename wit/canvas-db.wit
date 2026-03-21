@@ -1,0 +1,11 @@
+package canvas:db;
+
+interface canvas-db {
+    store-get: func(key: string) -> option<string>;
+    store-set: func(key: string, value: string);
+    store-delete: func(key: string);
+    store-append: func(key: string, value: string);
+    store-keys: func() -> list<string>;
+    db-query: func(surql: string) -> list<string>;
+    db-run: func(surql: string);
+}

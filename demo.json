@@ -25,7 +25,7 @@
       "pos": [50.0, 350.0],
       "input_values": {},
       "output_values": {},
-      "script_code": "# Task Manager\n\n@(text-input \"new-task\" \"New task...\")\n@(button \"Add Task\" (store-append! \"tasks\" (store-get \"new-task\")))\n\n---\n\nStored tasks: @(store-get \"tasks\")"
+      "script_code": "# Task Manager\n\n@(text-input \"new-task\" \"New task...\")\n@(button \"Add Task\" 'append \"tasks\" \"new-task\")\n\n---\n\n## Tasks\n\n@(editable-list \"tasks\")"
     }
   },
   "connections": [

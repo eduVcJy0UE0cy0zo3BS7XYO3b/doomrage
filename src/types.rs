@@ -92,6 +92,17 @@ impl Value {
         }
     }
 
+    pub fn to_scheme_literal(&self) -> String {
+        match self {
+            Value::F64(f) => format!("{}", f),
+            Value::F32(f) => format!("{}", f),
+            Value::I64(i) => format!("{}", i),
+            Value::I32(i) => format!("{}", i),
+            Value::Bool(b) => if *b { "#t" } else { "#f" }.to_string(),
+            Value::Str(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+        }
+    }
+
     pub fn display(&self) -> String {
         match self {
             Value::F64(v) => format!("{v:.6}"),
@@ -273,6 +284,26 @@ impl Graph {
         self.connections
             .iter()
             .find(|c| c.to_node == node_id && c.to_port == port)
+    }
+
+    /// Resolve input values for a node: start from node's input_values,
+    /// override with connected upstream outputs.
+    pub fn resolve_input_values(&self, node_id: NodeId, eff_inputs: &[PortDef]) -> HashMap<String, Value> {
+        let node = match self.nodes.get(&node_id) {
+            Some(n) => n,
+            None => return HashMap::new(),
+        };
+        let mut vals = node.input_values.clone();
+        for port in eff_inputs {
+            if let Some(conn) = self.input_connection(node_id, &port.name) {
+                if let Some(src) = self.nodes.get(&conn.from_node) {
+                    if let Some(val) = src.output_values.get(&conn.from_port) {
+                        vals.insert(port.name.clone(), val.clone());
+                    }
+                }
+            }
+        }
+        vals
     }
 
     pub fn topological_sort(&self) -> Result<Vec<NodeId>, Vec<NodeId>> {
