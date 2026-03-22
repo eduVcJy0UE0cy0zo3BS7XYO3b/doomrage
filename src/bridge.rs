@@ -6,11 +6,14 @@ use scheme_rs::registry::bridge;
 use scheme_rs::value::Value;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 /// Shared network values store: (peer, channel) -> (key -> Value)
 pub type NetValues = Arc<Mutex<HashMap<(String, String), HashMap<String, crate::types::Value>>>>;
+
+/// Shared OCapN slot store: swiss-hex -> mutable slot value
+pub type OCapNSlotStore = Arc<Mutex<HashMap<String, Arc<Mutex<crate::ocapn::syrup::SyrupValue>>>>>;
 
 thread_local! {
     static THREAD_DB: RefCell<Option<Db>> = RefCell::new(None);
@@ -45,23 +48,60 @@ impl PortRegistry {
     }
 }
 
+/// Queued OCapN send: (peer_id, OCapNMessage)
+pub type OCapNSendEntry = (String, crate::ocapn::types::OCapNMessage);
+
+/// Shared connected peers set
+pub type ConnectedPeers = Arc<Mutex<HashSet<String>>>;
+
+/// Shared OCapN call results store
+pub type OCapNCallResults = Arc<Mutex<HashMap<u64, crate::ocapn::syrup::SyrupValue>>>;
+
+/// Per-node actor mailbox: node_id -> queue of messages (each message = Vec<SyrupValue>)
+pub type NodeMailboxes = Arc<Mutex<HashMap<crate::types::NodeId, std::collections::VecDeque<Vec<crate::ocapn::syrup::SyrupValue>>>>>;
+
+// Port-context thread-locals (scope-guarded, stay separate from ActorContext)
 thread_local! {
     static THREAD_INPUTS: RefCell<Option<HashMap<String, crate::types::Value>>> = RefCell::new(None);
     static THREAD_PORTS: RefCell<PortRegistry> = RefCell::new(PortRegistry::new());
-    static THREAD_NET_VALUES: RefCell<Option<NetValues>> = RefCell::new(None);
-    static THREAD_NET_PUBLISH: RefCell<Vec<String>> = RefCell::new(Vec::new());
 }
 
-/// Set thread-local net values store for bridge functions.
-pub fn set_thread_net_values(nv: Option<&NetValues>) {
-    THREAD_NET_VALUES.with(|cell| {
-        *cell.borrow_mut() = nv.cloned();
-    });
-}
+// --- ActorContext-backed accessors ---
+// All bridge functions use with_actor_ctx() from actor.rs.
+// These public functions are kept for callers (app.rs, worker.rs, scheme_engine.rs).
 
-/// Take collected net-publish channel names from thread-local.
+/// Take collected net-publish channel names from actor context.
 pub fn take_net_publishes() -> Vec<String> {
-    THREAD_NET_PUBLISH.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+    crate::actor::with_actor_ctx(|ctx| std::mem::take(&mut ctx.net_publishes))
+        .unwrap_or_default()
+}
+
+/// Take requested tick interval from actor context.
+pub fn take_tick_interval() -> Option<u64> {
+    crate::actor::with_actor_ctx(|ctx| ctx.tick_interval_ms.take())
+        .flatten()
+}
+
+/// Take collected OCapN send commands from actor context.
+pub fn take_ocapn_sends() -> Vec<OCapNSendEntry> {
+    crate::actor::with_actor_ctx(|ctx| std::mem::take(&mut ctx.ocapn_sends))
+        .unwrap_or_default()
+}
+
+/// Take collected recompute requests from actor context.
+pub fn take_recompute_requests() -> Vec<crate::types::NodeId> {
+    crate::actor::with_actor_ctx(|ctx| std::mem::take(&mut ctx.recompute_requests))
+        .unwrap_or_default()
+}
+
+/// Take the has_message_handler flag from actor context.
+pub fn take_has_message_handler() -> bool {
+    crate::actor::with_actor_ctx(|ctx| {
+        let val = ctx.has_message_handler;
+        ctx.has_message_handler = false;
+        val
+    })
+    .unwrap_or(false)
 }
 
 /// Scope-guard: sets thread-local input values and clears port registry before `f`,
@@ -500,8 +540,8 @@ fn bridge_register_widget(
 #[bridge(name = "net-publish-channel", lib = "(canvas net)")]
 fn bridge_net_publish(channel: &Value) -> Result<Vec<Value>, Exception> {
     let ch = value_to_string(channel);
-    THREAD_NET_PUBLISH.with(|cell| {
-        cell.borrow_mut().push(ch);
+    crate::actor::with_actor_ctx(|ctx| {
+        ctx.net_publishes.push(ch);
     });
     Ok(vec![Value::null()])
 }
@@ -511,12 +551,10 @@ fn bridge_net_value(channel: &Value, key: &Value, default: &Value) -> Result<Vec
     let ch = value_to_string(channel);
     let k = value_to_string(key);
 
-    let result = THREAD_NET_VALUES.with(|cell| {
-        let borrow = cell.borrow();
-        match borrow.as_ref() {
+    let result = crate::actor::with_actor_ctx(|ctx| {
+        match ctx.net_values.as_ref() {
             Some(nv) => {
                 let store = nv.lock().unwrap();
-                // Search all peers for this channel
                 for ((_, channel), values) in store.iter() {
                     if *channel == ch {
                         if let Some(val) = values.get(&k) {
@@ -528,7 +566,451 @@ fn bridge_net_value(channel: &Value, key: &Value, default: &Value) -> Result<Vec
             }
             None => default.clone(),
         }
-    });
+    })
+    .unwrap_or_else(|| default.clone());
 
     Ok(vec![result])
+}
+
+// --- (canvas ocapn) bridge functions ---
+
+use crate::ocapn::session::SessionManager;
+use crate::ocapn::syrup::SyrupValue;
+
+pub type SharedSessionManager = Arc<Mutex<SessionManager>>;
+
+fn with_session_mgr<R>(f: impl FnOnce(&mut SessionManager) -> R) -> Result<R, Exception> {
+    crate::actor::with_actor_ctx(|ctx| {
+        ctx.session_mgr.as_ref().map(|mgr| f(&mut mgr.lock().unwrap()))
+    })
+    .flatten()
+    .ok_or_else(|| Exception::error("No OCapN session manager available"))
+}
+
+/// Mutable slot exported via OCapN. Supports "set" and "get" methods.
+struct ExportedSlot {
+    value: Arc<Mutex<SyrupValue>>,
+}
+
+impl crate::ocapn::session::OCapNObject for ExportedSlot {
+    fn deliver(&self, args: &[SyrupValue]) -> Result<Option<SyrupValue>, String> {
+        // Check if first arg is method name
+        let method = args.first().and_then(|a| {
+            if let SyrupValue::Symbol(s) = a { Some(s.as_str()) } else { None }
+        });
+
+        match method {
+            Some("set") if args.len() >= 2 => {
+                let mut val = self.value.lock().unwrap();
+                *val = args[1].clone();
+                Ok(None)
+            }
+            _ => {
+                // "get" or no args → return current value
+                let val = self.value.lock().unwrap();
+                Ok(Some(val.clone()))
+            }
+        }
+    }
+}
+
+/// Convert SyrupValue to Scheme Value
+fn syrup_value_to_scheme(sv: &SyrupValue) -> Value {
+    match sv {
+        SyrupValue::Float64(f) => Value::from(*f),
+        SyrupValue::Float32(f) => Value::from(*f as f64),
+        SyrupValue::Integer(i) => Value::from(*i as f64),
+        SyrupValue::String(s) => Value::from(s.clone()),
+        SyrupValue::Bool(b) => Value::from(*b),
+        SyrupValue::Symbol(s) => Value::from(s.clone()),
+        _ => Value::from(format!("{:?}", sv)),
+    }
+}
+
+/// Convert a Scheme list (pair chain) to Vec<SyrupValue>
+fn scheme_list_to_syrup_vec(val: &Value) -> Vec<SyrupValue> {
+    use scheme_rs::value::UnpackedValue;
+    let mut result = Vec::new();
+    let mut current = val.clone();
+    loop {
+        match current.clone().unpack() {
+            UnpackedValue::Pair(p) => {
+                let item = &p.car();
+                result.push(SyrupValue::from(&crate::scheme_engine::scheme_value_to_types_value(item)));
+                current = p.cdr();
+            }
+            UnpackedValue::Null => break,
+            _ => {
+                result.push(SyrupValue::from(&crate::scheme_engine::scheme_value_to_types_value(&current)));
+                break;
+            }
+        }
+    }
+    result
+}
+
+#[bridge(name = "ocapn-export-value", lib = "(canvas ocapn)")]
+fn bridge_ocapn_export(value: &Value) -> Result<Vec<Value>, Exception> {
+    let syrup_val = SyrupValue::from(&crate::scheme_engine::scheme_value_to_types_value(value));
+
+    // Generate stable key from node_id + export counter
+    let export_key = crate::actor::with_actor_ctx(|ctx| {
+        let counter = ctx.next_export_counter();
+        format!("node:{}:export:{}", ctx.node_id, counter)
+    })
+    .unwrap_or_else(|| "node:0:export:0".into());
+
+    let result = with_session_mgr(|mgr| {
+        let peer_id = mgr.local_peer_id().unwrap_or("local").to_string();
+        let session = mgr.local_session_mut();
+
+        // Check if we already have a keyed export — reuse the slot Arc
+        let swiss_hex = if let Some(existing_swiss) = session.export_by_key.get(&export_key) {
+            let swiss_hex = existing_swiss.to_hex();
+            // Update the slot value in-place via ActorContext
+            crate::actor::with_actor_ctx(|ctx| {
+                if let Some(store) = ctx.ocapn_slots.as_ref() {
+                    let store = store.lock().unwrap();
+                    if let Some(slot) = store.get(&swiss_hex) {
+                        *slot.lock().unwrap() = syrup_val;
+                    }
+                }
+            });
+            swiss_hex
+        } else {
+            let slot_value = Arc::new(Mutex::new(syrup_val));
+            let slot = ExportedSlot { value: Arc::clone(&slot_value) };
+            let (_pos, swiss) = session.export_object_keyed(export_key, Box::new(slot));
+            let swiss_hex = swiss.to_hex();
+
+            crate::actor::with_actor_ctx(|ctx| {
+                if let Some(store) = ctx.ocapn_slots.as_ref() {
+                    store.lock().unwrap().insert(swiss_hex.clone(), Arc::clone(&slot_value));
+                }
+            });
+            swiss_hex
+        };
+
+        format!("ocapn://{}.libp2p/s/{}", peer_id, swiss_hex)
+    })?;
+
+    Ok(vec![Value::from(result)])
+}
+
+#[bridge(name = "ocapn-receive-msg", lib = "(canvas ocapn)")]
+fn bridge_ocapn_receive(uri: &Value, default: &Value) -> Result<Vec<Value>, Exception> {
+    let uri_str = value_to_string(uri);
+
+    // Parse swiss-hex from URI: "ocapn://...libp2p/s/<hex>"
+    let swiss_hex = uri_str.rsplit("/s/").next()
+        .ok_or_else(|| Exception::error("ocapn-receive: invalid URI format"))?
+        .to_string();
+
+    let result = crate::actor::with_actor_ctx(|ctx| {
+        match ctx.ocapn_slots.as_ref() {
+            Some(store) => {
+                let store = store.lock().unwrap();
+                match store.get(&swiss_hex) {
+                    Some(slot) => {
+                        let val = slot.lock().unwrap();
+                        syrup_value_to_scheme(&val)
+                    }
+                    None => default.clone(),
+                }
+            }
+            None => default.clone(),
+        }
+    })
+    .unwrap_or_else(|| default.clone());
+
+    Ok(vec![result])
+}
+
+#[bridge(name = "ocapn-send-msg", lib = "(canvas ocapn)")]
+fn bridge_ocapn_send(locator_str: &Value, method: &Value, args_list: &Value) -> Result<Vec<Value>, Exception> {
+    use crate::ocapn::locator::OCapNLocator;
+    use crate::ocapn::types::{Descriptor, OCapNMessage};
+
+    let loc_str = value_to_string(locator_str);
+    let method_str = value_to_string(method);
+
+    let locator = OCapNLocator::parse(&loc_str)
+        .ok_or_else(|| Exception::error(&format!("ocapn-send: invalid URI: {}", loc_str)))?;
+
+    let swiss = locator.swiss_num
+        .ok_or_else(|| Exception::error("ocapn-send: URI has no swiss-num"))?;
+
+    // Convert Scheme args list to SyrupValue vec
+    let user_args = scheme_list_to_syrup_vec(args_list);
+
+    // Build OpDeliverOnly: [Symbol("deliver-to"), swiss, Symbol(method), ...user_args]
+    let mut args = vec![
+        SyrupValue::Symbol("deliver-to".into()),
+        swiss.to_syrup(),
+        SyrupValue::Symbol(method_str),
+    ];
+    args.extend(user_args);
+
+    let msg = OCapNMessage::OpDeliverOnly {
+        to_desc: Descriptor::Export(0),
+        args,
+    };
+
+    let peer_id = locator.designator;
+
+    crate::actor::with_actor_ctx(|ctx| {
+        ctx.ocapn_sends.push((peer_id.clone(), msg));
+    });
+
+    log::info!("ocapn-send: queued message to {}", peer_id);
+    Ok(vec![Value::null()])
+}
+
+#[bridge(name = "ocapn-export-node-id", lib = "(canvas ocapn)")]
+fn bridge_ocapn_export_node(node_id_val: &Value) -> Result<Vec<Value>, Exception> {
+    let node_id = node_id_val.cast_to_scheme_type::<f64>().unwrap_or(0.0) as crate::types::NodeId;
+
+    // Read node output values from graph context
+    let output_values = with_graph(|graph, _| {
+        graph.nodes.get(&node_id).map(|n| n.output_values.clone())
+    })?;
+
+    let output_values = output_values
+        .ok_or_else(|| Exception::error(&format!("ocapn-export-node: node {} not found", node_id)))?;
+
+    // Build SyrupValue::Dict from output_values
+    let dict_entries: Vec<(SyrupValue, SyrupValue)> = output_values.iter()
+        .map(|(k, v)| (SyrupValue::String(k.clone()), SyrupValue::from(v)))
+        .collect();
+    let syrup_val = SyrupValue::Dict(dict_entries);
+    let slot_value = Arc::new(Mutex::new(syrup_val));
+
+    let result = with_session_mgr(|mgr| {
+        let peer_id = mgr.local_peer_id().unwrap_or("local").to_string();
+        let session = mgr.local_session_mut();
+        let slot = ExportedSlot { value: Arc::clone(&slot_value) };
+        let (_pos, swiss) = session.export_object(Box::new(slot));
+        let swiss_hex = swiss.to_hex();
+
+        crate::actor::with_actor_ctx(|ctx| {
+            if let Some(store) = ctx.ocapn_slots.as_ref() {
+                store.lock().unwrap().insert(swiss_hex.clone(), Arc::clone(&slot_value));
+            }
+        });
+
+        format!("ocapn://{}.libp2p/s/{}", peer_id, swiss_hex)
+    })?;
+
+    Ok(vec![Value::from(result)])
+}
+
+#[bridge(name = "ocapn-peers-list", lib = "(canvas ocapn)")]
+fn bridge_ocapn_peers() -> Result<Vec<Value>, Exception> {
+    let result = crate::actor::with_actor_ctx(|ctx| {
+        match ctx.connected_peers.as_ref() {
+            Some(peers) => {
+                let peers = peers.lock().unwrap();
+                let mut list = Value::null();
+                for peer in peers.iter() {
+                    list = Value::from(scheme_rs::lists::Pair::new(
+                        Value::from(peer.clone()),
+                        list,
+                        true,
+                    ));
+                }
+                list
+            }
+            None => Value::null(),
+        }
+    })
+    .unwrap_or_else(Value::null);
+    Ok(vec![result])
+}
+
+#[bridge(name = "ocapn-local-id-get", lib = "(canvas ocapn)")]
+fn bridge_ocapn_local_id() -> Result<Vec<Value>, Exception> {
+    let result = with_session_mgr(|mgr| {
+        Value::from(mgr.local_peer_id().unwrap_or("").to_string())
+    })?;
+    Ok(vec![result])
+}
+
+#[bridge(name = "ocapn-call-msg", lib = "(canvas ocapn)")]
+fn bridge_ocapn_call(locator_str: &Value, method: &Value, args_list: &Value) -> Result<Vec<Value>, Exception> {
+    use crate::ocapn::locator::OCapNLocator;
+    use crate::ocapn::types::{Descriptor, OCapNMessage};
+
+    let loc_str = value_to_string(locator_str);
+    let method_str = value_to_string(method);
+
+    let locator = OCapNLocator::parse(&loc_str)
+        .ok_or_else(|| Exception::error(&format!("ocapn-call: invalid URI: {}", loc_str)))?;
+
+    let swiss = locator.swiss_num
+        .ok_or_else(|| Exception::error("ocapn-call: URI has no swiss-num"))?;
+
+    let user_args = scheme_list_to_syrup_vec(args_list);
+
+    // Generate a request_id
+    let request_id = rand::random::<u64>();
+
+    let mut args = vec![
+        SyrupValue::Symbol("deliver-to".into()),
+        swiss.to_syrup(),
+        SyrupValue::Symbol(method_str),
+    ];
+    args.extend(user_args);
+
+    let msg = OCapNMessage::OpDeliver {
+        to_desc: Descriptor::Export(0),
+        args,
+        request_id,
+    };
+
+    let peer_id = locator.designator;
+
+    crate::actor::with_actor_ctx(|ctx| {
+        ctx.ocapn_sends.push((peer_id.clone(), msg));
+    });
+
+    log::info!("ocapn-call: queued request {} to {}", request_id, peer_id);
+    Ok(vec![Value::from(request_id as f64)])
+}
+
+#[bridge(name = "ocapn-call-result-get", lib = "(canvas ocapn)")]
+fn bridge_ocapn_call_result(request_id: &Value, default: &Value) -> Result<Vec<Value>, Exception> {
+    let rid = request_id.cast_to_scheme_type::<f64>().unwrap_or(0.0) as u64;
+
+    let result = crate::actor::with_actor_ctx(|ctx| {
+        match ctx.ocapn_call_results.as_ref() {
+            Some(store) => {
+                let store = store.lock().unwrap();
+                match store.get(&rid) {
+                    Some(val) => syrup_value_to_scheme(val),
+                    None => default.clone(),
+                }
+            }
+            None => default.clone(),
+        }
+    })
+    .unwrap_or_else(|| default.clone());
+
+    Ok(vec![result])
+}
+
+// --- (canvas actor) bridge functions ---
+
+#[bridge(name = "actor-node-id", lib = "(canvas actor)")]
+fn bridge_actor_node_id() -> Result<Vec<Value>, Exception> {
+    let id = crate::actor::with_actor_ctx(|ctx| ctx.node_id).unwrap_or(0);
+    Ok(vec![Value::from(id as f64)])
+}
+
+#[bridge(name = "actor-node-address", lib = "(canvas actor)")]
+fn bridge_actor_node_address() -> Result<Vec<Value>, Exception> {
+    let node_id = crate::actor::with_actor_ctx(|ctx| ctx.node_id).unwrap_or(0);
+    let result = with_session_mgr(|mgr| {
+        let peer_id = mgr.local_peer_id().unwrap_or("local").to_string();
+        format!("actor://{}/{}", peer_id, node_id)
+    })?;
+    Ok(vec![Value::from(result)])
+}
+
+#[bridge(name = "actor-send-msg", lib = "(canvas actor)")]
+fn bridge_actor_send(target_id: &Value, method: &Value, args_list: &Value) -> Result<Vec<Value>, Exception> {
+    let tid = target_id.cast_to_scheme_type::<f64>().unwrap_or(0.0) as crate::types::NodeId;
+    let method_str = value_to_string(method);
+
+    let mut msg_args = vec![SyrupValue::Symbol(method_str)];
+    msg_args.extend(scheme_list_to_syrup_vec(args_list));
+
+    crate::actor::with_actor_ctx(|ctx| {
+        if let Some(mailboxes) = ctx.node_mailboxes.as_ref() {
+            mailboxes.lock().unwrap().entry(tid).or_default().push_back(msg_args);
+        }
+        ctx.recompute_requests.push(tid);
+    });
+
+    Ok(vec![Value::null()])
+}
+
+#[bridge(name = "actor-receive-msg", lib = "(canvas actor)")]
+fn bridge_actor_receive() -> Result<Vec<Value>, Exception> {
+    let result = crate::actor::with_actor_ctx(|ctx| {
+        let node_id = ctx.node_id;
+        match ctx.node_mailboxes.as_ref() {
+            Some(mailboxes) => {
+                let mut mailboxes = mailboxes.lock().unwrap();
+                if let Some(queue) = mailboxes.get_mut(&node_id) {
+                    if let Some(msg) = queue.pop_front() {
+                        let mut list = Value::null();
+                        for item in msg.into_iter().rev() {
+                            list = Value::from(scheme_rs::lists::Pair::new(
+                                syrup_value_to_scheme(&item),
+                                list,
+                                true,
+                            ));
+                        }
+                        return list;
+                    }
+                }
+                Value::from(false)
+            }
+            None => Value::from(false),
+        }
+    })
+    .unwrap_or_else(|| Value::from(false));
+
+    Ok(vec![result])
+}
+
+#[bridge(name = "actor-mailbox-count", lib = "(canvas actor)")]
+fn bridge_actor_mailbox_count() -> Result<Vec<Value>, Exception> {
+    let count = crate::actor::with_actor_ctx(|ctx| {
+        let node_id = ctx.node_id;
+        match ctx.node_mailboxes.as_ref() {
+            Some(mailboxes) => mailboxes.lock().unwrap().get(&node_id).map_or(0, |q| q.len()),
+            None => 0,
+        }
+    })
+    .unwrap_or(0);
+
+    Ok(vec![Value::from(count as f64)])
+}
+
+#[bridge(name = "actor-register-handler", lib = "(canvas actor)")]
+fn bridge_actor_register_handler() -> Result<Vec<Value>, Exception> {
+    crate::actor::with_actor_ctx(|ctx| {
+        ctx.has_message_handler = true;
+    });
+    Ok(vec![Value::null()])
+}
+
+#[bridge(name = "actor-self-send-msg", lib = "(canvas actor)")]
+fn bridge_actor_self_send(method: &Value, args_list: &Value) -> Result<Vec<Value>, Exception> {
+    let method_str = value_to_string(method);
+
+    let mut msg_args = vec![SyrupValue::Symbol(method_str)];
+    msg_args.extend(scheme_list_to_syrup_vec(args_list));
+
+    crate::actor::with_actor_ctx(|ctx| {
+        let node_id = ctx.node_id;
+        if let Some(mailboxes) = ctx.node_mailboxes.as_ref() {
+            mailboxes.lock().unwrap().entry(node_id).or_default().push_back(msg_args);
+        }
+        ctx.recompute_requests.push(node_id);
+    });
+
+    Ok(vec![Value::null()])
+}
+
+// --- (canvas timer) bridge function ---
+
+#[bridge(name = "request-tick-ms", lib = "(canvas timer)")]
+fn bridge_request_tick(ms: &Value) -> Result<Vec<Value>, Exception> {
+    let interval = ms.cast_to_scheme_type::<f64>().unwrap_or(100.0) as u64;
+    crate::actor::with_actor_ctx(|ctx| {
+        ctx.tick_interval_ms = Some(interval);
+    });
+    Ok(vec![Value::null()])
 }

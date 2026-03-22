@@ -1,3 +1,4 @@
+mod actor;
 mod app;
 mod bridge;
 mod canvas;
@@ -14,7 +15,7 @@ mod scheme_engine;
 mod theme;
 mod types;
 mod network;
-mod worker;
+mod ocapn;
 
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(

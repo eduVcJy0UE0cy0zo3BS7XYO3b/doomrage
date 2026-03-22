@@ -7,6 +7,20 @@ use scheme_rs::runtime::Runtime;
 use scheme_rs::value::{UnpackedValue, Value};
 use std::collections::HashMap;
 
+/// Convert a Scheme runtime Value into a crate::types::Value.
+pub fn scheme_value_to_types_value(val: &Value) -> crate::types::Value {
+    if let Some(f) = val.cast_to_scheme_type::<f64>() {
+        crate::types::Value::F64(f)
+    } else {
+        let s = format!("{}", val);
+        match s.as_str() {
+            "#t" | "true" => crate::types::Value::Bool(true),
+            "#f" | "false" => crate::types::Value::Bool(false),
+            _ => crate::types::Value::Str(s),
+        }
+    }
+}
+
 const CANVAS_RENDER_LIB: &str = r#"
 (library (canvas render)
   (export <compute> compute? ->str
@@ -376,6 +390,12 @@ impl SchemeEngine {
             .map_err(|e| anyhow::anyhow!("Failed to import canvas scribble: {}", e))?;
         env.eval(true, "(import (canvas net))")
             .map_err(|e| anyhow::anyhow!("Failed to import canvas net: {}", e))?;
+        env.eval(true, "(import (canvas timer))")
+            .map_err(|e| anyhow::anyhow!("Failed to import canvas timer: {}", e))?;
+        env.eval(true, "(import (canvas ocapn))")
+            .map_err(|e| anyhow::anyhow!("Failed to import canvas ocapn: {}", e))?;
+        env.eval(true, "(import (canvas actor))")
+            .map_err(|e| anyhow::anyhow!("Failed to import canvas actor: {}", e))?;
 
         // Port declaration wrappers: call bridge functions from (canvas ports)
         env.eval(false, r#"
@@ -389,6 +409,28 @@ impl SchemeEngine {
             (define (checkbox name) (register-widget name 'checkbox 0 0))
             (define (net-publish channel) (net-publish-channel channel))
             (define (net-value channel key default) (net-value-get channel key default))
+            (define (request-tick ms) (request-tick-ms ms))
+            (define (ocapn-export val) (ocapn-export-value val))
+            (define (ocapn-send locator method . args) (ocapn-send-msg locator method args))
+            (define (ocapn-receive uri default) (ocapn-receive-msg uri default))
+            (define (ocapn-export-node id) (ocapn-export-node-id id))
+            (define (ocapn-peers) (ocapn-peers-list))
+            (define (ocapn-local-id) (ocapn-local-id-get))
+            (define (ocapn-call locator method . args) (ocapn-call-msg locator method args))
+            (define (ocapn-call-result request-id default) (ocapn-call-result-get request-id default))
+            (define (node-id) (actor-node-id))
+            (define (node-address) (actor-node-address))
+            (define (node-send target method . args) (actor-send-msg target method args))
+            (define (receive) (actor-receive-msg))
+            (define (mailbox-count) (actor-mailbox-count))
+            (define (self-send method . args) (actor-self-send-msg method args))
+            (define (on-message handler)
+              (actor-register-handler)
+              (let loop ()
+                (let ((msg (receive)))
+                  (when msg
+                    (handler msg)
+                    (loop)))))
         "#)
             .map_err(|e| anyhow::anyhow!("Failed to define port wrappers: {}", e))?;
 
@@ -571,7 +613,21 @@ impl SchemeEngine {
         db: Option<&crate::db::Db>,
         code: &str,
     ) -> Result<ScriptResult> {
-        let env = self.make_env();
+        let (result, _env) = self.execute_script_cached(None, available_inputs, db, code)?;
+        Ok(result)
+    }
+
+    /// Execute a script, optionally reusing a cached environment.
+    /// Returns (result, env) — caller can cache the env for next eval.
+    /// When env is reused, `set!` mutations persist between computes.
+    pub fn execute_script_cached(
+        &self,
+        cached_env: Option<TopLevelEnvironment>,
+        available_inputs: &HashMap<String, crate::types::Value>,
+        db: Option<&crate::db::Db>,
+        code: &str,
+    ) -> Result<(ScriptResult, TopLevelEnvironment)> {
+        let env = cached_env.unwrap_or_else(|| self.make_env());
 
         let stripped = self.preprocess_code(&env, code)?;
 
@@ -616,15 +672,23 @@ impl SchemeEngine {
         }
 
         let net_publishes = crate::bridge::take_net_publishes();
+        let tick_interval_ms = crate::bridge::take_tick_interval();
+        let ocapn_sends = crate::bridge::take_ocapn_sends();
+        let recompute_requests = crate::bridge::take_recompute_requests();
+        let has_message_handler = crate::bridge::take_has_message_handler();
 
-        Ok(ScriptResult {
+        Ok((ScriptResult {
             output_values,
             render_blocks,
             declared_inputs,
             declared_outputs,
             widget_decls,
             net_publishes,
-        })
+            tick_interval_ms,
+            ocapn_sends,
+            recompute_requests,
+            has_message_handler,
+        }, env))
     }
 
     /// Preview: bind all inputs as <compute> placeholder, eval for structure only
@@ -677,6 +741,10 @@ impl SchemeEngine {
             declared_outputs: Vec::new(),
             widget_decls: Vec::new(),
             net_publishes: Vec::new(),
+            tick_interval_ms: None,
+            ocapn_sends: Vec::new(),
+            recompute_requests: Vec::new(),
+            has_message_handler: false,
         })
     }
 
@@ -690,6 +758,34 @@ pub struct ScriptResult {
     pub declared_outputs: Vec<(String, String)>,
     pub widget_decls: Vec<crate::bridge::WidgetDecl>,
     pub net_publishes: Vec<String>,
+    pub tick_interval_ms: Option<u64>,
+    pub ocapn_sends: Vec<crate::bridge::OCapNSendEntry>,
+    pub recompute_requests: Vec<crate::types::NodeId>,
+    pub has_message_handler: bool,
+}
+
+impl ScriptResult {
+    pub fn empty() -> Self {
+        Self {
+            output_values: HashMap::new(),
+            render_blocks: Vec::new(),
+            declared_inputs: Vec::new(),
+            declared_outputs: Vec::new(),
+            widget_decls: Vec::new(),
+            net_publishes: Vec::new(),
+            tick_interval_ms: None,
+            ocapn_sends: Vec::new(),
+            recompute_requests: Vec::new(),
+            has_message_handler: false,
+        }
+    }
+
+    pub fn with_outputs(output_values: HashMap<String, crate::types::Value>) -> Self {
+        Self {
+            output_values,
+            ..Self::empty()
+        }
+    }
 }
 
 #[cfg(test)]

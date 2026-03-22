@@ -38,52 +38,20 @@ impl PanelState {
 
 pub enum PanelAction {
     AddNode(String, [f32; 2]),
-    RunGraph,
     ComputeNode(NodeId),
     CancelCompute,
     RecomputeSelected,
-    StepGraph,
-    ToggleAutoRun,
     SaveGraph,
     LoadGraph,
     DeleteNode(NodeId),
     UpdateWidget(NodeId, String, Value),
 }
 
-pub fn draw_toolbar(ui: &mut egui::Ui, auto_run: bool) -> Vec<PanelAction> {
+pub fn draw_toolbar(ui: &mut egui::Ui) -> Vec<PanelAction> {
     let mut actions = Vec::new();
 
     ui.horizontal(|ui| {
         ui.visuals_mut().override_text_color = Some(TEXT);
-
-        if ui
-            .button(RichText::new("  Run  ").color(Color32::from_rgb(0x22, 0x8b, 0x22)))
-            .clicked()
-        {
-            actions.push(PanelAction::RunGraph);
-        }
-
-        if ui
-            .button(RichText::new(" Step ").color(ACCENT))
-            .clicked()
-        {
-            actions.push(PanelAction::StepGraph);
-        }
-
-        let auto_label = if auto_run { " Auto [ON] " } else { " Auto [OFF] " };
-        let auto_color = if auto_run {
-            Color32::from_rgb(0x22, 0x8b, 0x22)
-        } else {
-            TEXT_DIM
-        };
-        if ui
-            .button(RichText::new(auto_label).color(auto_color))
-            .clicked()
-        {
-            actions.push(PanelAction::ToggleAutoRun);
-        }
-
-        ui.separator();
 
         if ui.button(RichText::new(" Save ").color(TEXT)).clicked()
             || ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S))

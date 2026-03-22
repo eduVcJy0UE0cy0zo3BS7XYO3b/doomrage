@@ -23,7 +23,8 @@ scheme-rs = { version = "0.1.0", default-features = false, features = ["load-lib
 inventory = "0.3"
 surrealdb = { version = "3.0.4", default-features = false, features = ["kv-mem"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
-libp2p = { version = "0.54", features = ["gossipsub", "mdns", "noise", "yamux", "tcp", "tokio", "macros"] }
+libp2p = { version = "0.54", features = ["gossipsub", "mdns", "noise", "yamux", "tcp", "tokio", "macros", "request-response", "cbor"] }
+rand = "0.8"
 anyhow = "1.0.102"
 dirs = "6"
 log = "0.4.29"

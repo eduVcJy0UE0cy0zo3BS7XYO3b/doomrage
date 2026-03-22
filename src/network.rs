@@ -1,9 +1,13 @@
+use crate::bridge::SharedSessionManager;
+use crate::ocapn::session::SessionManager;
+use crate::ocapn::types::OCapNMessage;
 use crate::types::Value;
 use libp2p::{
     futures::StreamExt,
     gossipsub, mdns, noise,
+    request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, Multiaddr, Swarm,
+    tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm,
 };
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -18,6 +22,10 @@ pub enum NetCommand {
         channel: String,
         values: HashMap<String, Value>,
     },
+    OCapNSend {
+        peer_id: String,
+        message: OCapNMessage,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +37,15 @@ pub enum NetEvent {
         channel: String,
         values: HashMap<String, Value>,
     },
+    OCapNReceived {
+        peer: String,
+        message: OCapNMessage,
+    },
+    OCapNCallResult {
+        request_id: u64,
+        value: crate::ocapn::syrup::SyrupValue,
+    },
+    LocalPeerId(String),
 }
 
 /// Handle held by the main (eframe) thread.
@@ -67,11 +84,18 @@ struct WireMessage {
 struct NodeBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
+    ocapn_rr: request_response::cbor::Behaviour<OCapNReq, OCapNResp>,
 }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OCapNReq(pub Vec<u8>);
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OCapNResp(pub Vec<u8>);
 
 // --- Entry point: spawn network thread ---
 
-pub fn spawn_network(ctx: egui::Context) -> NetHandle {
+pub fn spawn_network(ctx: egui::Context, session_manager: SharedSessionManager) -> NetHandle {
     let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::channel();
 
@@ -82,7 +106,7 @@ pub fn spawn_network(ctx: egui::Context) -> NetHandle {
                 .enable_all()
                 .build()
                 .expect("Failed to create tokio runtime for network");
-            rt.block_on(run_swarm(cmd_rx, event_tx, ctx));
+            rt.block_on(run_swarm(cmd_rx, event_tx, ctx, session_manager));
         })
         .expect("Failed to spawn network thread");
 
@@ -93,6 +117,7 @@ async fn run_swarm(
     mut cmd_rx: tokio_mpsc::UnboundedReceiver<NetCommand>,
     event_tx: mpsc::Sender<NetEvent>,
     ctx: egui::Context,
+    session_manager: SharedSessionManager,
 ) {
     // Build swarm
     let mut swarm = match build_swarm() {
@@ -118,6 +143,8 @@ async fn run_swarm(
 
     let local_peer_id = *swarm.local_peer_id();
     log::info!("Network started. PeerId: {}", local_peer_id);
+    let _ = event_tx.send(NetEvent::LocalPeerId(local_peer_id.to_string()));
+    ctx.request_repaint();
 
     let mut seq: u64 = 0;
     // Track latest seq per (peer, channel) to discard stale
@@ -139,6 +166,14 @@ async fn run_swarm(
                                 Err(e) => log::warn!("Gossipsub publish error: {}", e),
                                 Ok(_) => {}
                             }
+                        }
+                    }
+                    NetCommand::OCapNSend { peer_id, message } => {
+                        if let Ok(pid) = peer_id.parse::<PeerId>() {
+                            let data = message.encode();
+                            swarm.behaviour_mut().ocapn_rr.send_request(&pid, OCapNReq(data));
+                        } else {
+                            log::warn!("Invalid PeerId for OCapN send: {}", peer_id);
                         }
                     }
                 }
@@ -167,6 +202,80 @@ async fn run_swarm(
                                     values: wire.values,
                                 });
                                 ctx.request_repaint();
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(NodeBehaviourEvent::OcapnRr(
+                        request_response::Event::Message { peer, message, .. }
+                    )) => {
+                        match message {
+                            request_response::Message::Request { request, channel, .. } => {
+                                if let Ok(msg) = OCapNMessage::decode(&request.0) {
+                                    match &msg {
+                                        OCapNMessage::OpDeliver { to_desc: _, args, request_id } => {
+                                            // Handle OpDeliver: deliver and respond with result
+                                            let response_data = if args.len() >= 2 {
+                                                if let (
+                                                    crate::ocapn::syrup::SyrupValue::Symbol(method),
+                                                    swiss_val,
+                                                ) = (&args[0], &args[1]) {
+                                                    if method == "deliver-to" {
+                                                        if let Some(swiss) = crate::ocapn::types::SwissNum::from_syrup(swiss_val) {
+                                                            let remaining = &args[2..];
+                                                            let mgr = session_manager.lock().unwrap();
+                                                            match mgr.deliver_by_swiss(&swiss, remaining) {
+                                                                Ok(result) => {
+                                                                    let value = result.unwrap_or(crate::ocapn::syrup::SyrupValue::Bool(false));
+                                                                    let resp_msg = OCapNMessage::OpDeliverResult {
+                                                                        request_id: *request_id,
+                                                                        value,
+                                                                    };
+                                                                    resp_msg.encode()
+                                                                }
+                                                                Err(_) => vec![],
+                                                            }
+                                                        } else { vec![] }
+                                                    } else { vec![] }
+                                                } else { vec![] }
+                                            } else { vec![] };
+                                            let _ = swarm.behaviour_mut().ocapn_rr
+                                                .send_response(channel, OCapNResp(response_data));
+                                            // Also forward as event so main thread can log it
+                                            let _ = event_tx.send(NetEvent::OCapNReceived {
+                                                peer: peer.to_string(),
+                                                message: msg,
+                                            });
+                                            ctx.request_repaint();
+                                        }
+                                        _ => {
+                                            let _ = event_tx.send(NetEvent::OCapNReceived {
+                                                peer: peer.to_string(),
+                                                message: msg,
+                                            });
+                                            ctx.request_repaint();
+                                            // Send empty ack response
+                                            let _ = swarm.behaviour_mut().ocapn_rr
+                                                .send_response(channel, OCapNResp(vec![]));
+                                        }
+                                    }
+                                } else {
+                                    let _ = swarm.behaviour_mut().ocapn_rr
+                                        .send_response(channel, OCapNResp(vec![]));
+                                }
+                            }
+                            request_response::Message::Response { response, .. } => {
+                                // Handle OpDeliverResult responses
+                                if !response.0.is_empty() {
+                                    if let Ok(msg) = OCapNMessage::decode(&response.0) {
+                                        if let OCapNMessage::OpDeliverResult { request_id, value } = msg {
+                                            let _ = event_tx.send(NetEvent::OCapNCallResult {
+                                                request_id,
+                                                value,
+                                            });
+                                            ctx.request_repaint();
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -238,7 +347,12 @@ fn build_swarm() -> Result<Swarm<NodeBehaviour>, Box<dyn std::error::Error>> {
                 key.public().to_peer_id(),
             )?;
 
-            Ok(NodeBehaviour { gossipsub, mdns })
+            let ocapn_rr = request_response::cbor::Behaviour::new(
+                [(StreamProtocol::new("/ocapn/1"), ProtocolSupport::Full)],
+                request_response::Config::default(),
+            );
+
+            Ok(NodeBehaviour { gossipsub, mdns, ocapn_rr })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();

@@ -1,37 +1,43 @@
-use crate::bridge::NetValues;
+use crate::bridge::{NetValues, OCapNSlotStore, SharedSessionManager};
 use crate::canvas::{self, CanvasState};
 use crate::debug_log::DebugLog;
-use crate::executor::Executor;
+use crate::executor::AppResources;
 use crate::network::{self, NetCommand, NetEvent, NetHandle};
+use crate::ocapn::session::SessionManager;
 use crate::panels::{self, PanelAction, PanelState};
 use crate::persistence::{self, UndoHistory};
 use crate::registry::NodeRegistry;
 use crate::theme;
 use crate::types::*;
-use crate::worker::{DeferredQueue, WorkRequest, WorkResult};
+use crate::actor::{ActorMsg, ActorResult, ActorRuntime};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub struct WasmCanvasApp {
     graph: Graph,
     registry: NodeRegistry,
-    executor: Executor,
-    worker: DeferredQueue,
+    resources: AppResources,
+    actor_runtime: ActorRuntime,
     canvas_state: CanvasState,
     panel_state: PanelState,
     undo_history: UndoHistory,
-    run_events: Vec<RunEvent>,
-    auto_run: bool,
-    graph_dirty: bool,
     current_file: Option<PathBuf>,
     theme_applied: bool,
     pending_nodes: HashSet<NodeId>,
     debug_log: DebugLog,
     net_handle: NetHandle,
     net_values: NetValues,
-    /// Nodes that have net-subscribe dependencies (need recompute on net events)
-    net_subscribed_nodes: HashSet<NodeId>,
+    /// Nodes requesting periodic ticks: node_id -> (interval_ms, last_tick)
+    tick_nodes: HashMap<NodeId, (u64, Instant)>,
+    session_manager: SharedSessionManager,
+    ocapn_slots: OCapNSlotStore,
+    connected_peers: crate::bridge::ConnectedPeers,
+    ocapn_call_results: crate::bridge::OCapNCallResults,
+    node_mailboxes: crate::bridge::NodeMailboxes,
+    /// Nodes that registered an on-message handler (reactive actors)
+    actor_nodes: HashSet<NodeId>,
 }
 
 impl WasmCanvasApp {
@@ -42,12 +48,11 @@ impl WasmCanvasApp {
             log::error!("Failed to scan nodes directory: {}", e);
         }
 
-        let executor = Executor::new().expect("Failed to create WASM executor");
-        let worker = DeferredQueue::new();
+        let resources = AppResources::new().expect("Failed to create app resources");
 
         // Restore DB state from previous session
         let db_auto_path = PathBuf::from("./db.json");
-        if let Err(e) = persistence::load_db(&executor.db, &db_auto_path) {
+        if let Err(e) = persistence::load_db(&resources.db, &db_auto_path) {
             log::warn!("Failed to restore DB: {}", e);
         }
 
@@ -56,7 +61,7 @@ impl WasmCanvasApp {
             let scm_path = PathBuf::from("./demo.scm");
             let json_path = PathBuf::from("./demo.json");
             if scm_path.exists() {
-                match persistence::load_graph_scm(&scm_path, &executor.db) {
+                match persistence::load_graph_scm(&scm_path, &resources.db) {
                     Ok(g) => {
                         log::info!("Loaded demo graph from .scm");
                         (g, Some(scm_path))
@@ -67,7 +72,7 @@ impl WasmCanvasApp {
                     }
                 }
             } else if json_path.exists() {
-                match persistence::load_graph(&json_path, &executor.db) {
+                match persistence::load_graph(&json_path, &resources.db) {
                     Ok(g) => {
                         log::info!("Loaded demo graph from .json");
                         (g, Some(json_path))
@@ -84,90 +89,70 @@ impl WasmCanvasApp {
         let mut undo_history = UndoHistory::new(10);
         undo_history.push(&graph);
 
-        let net_handle = network::spawn_network(cc.egui_ctx.clone());
+        let session_manager: SharedSessionManager = Arc::new(Mutex::new(SessionManager::new()));
+        let net_handle = network::spawn_network(cc.egui_ctx.clone(), session_manager.clone());
         let net_values: NetValues = Arc::new(Mutex::new(HashMap::new()));
+        let ocapn_slots: OCapNSlotStore = Arc::new(Mutex::new(HashMap::new()));
+        let connected_peers: crate::bridge::ConnectedPeers = Arc::new(Mutex::new(HashSet::new()));
+        let ocapn_call_results: crate::bridge::OCapNCallResults = Arc::new(Mutex::new(HashMap::new()));
+        let node_mailboxes: crate::bridge::NodeMailboxes = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut actor_runtime = ActorRuntime::new(Arc::clone(&resources.scheme));
+        actor_runtime.set_net_values(net_values.clone());
+        actor_runtime.set_session_mgr(session_manager.clone());
+        actor_runtime.set_ocapn_slots(ocapn_slots.clone());
+        actor_runtime.set_connected_peers(connected_peers.clone());
+        actor_runtime.set_ocapn_call_results(ocapn_call_results.clone());
+        actor_runtime.set_node_mailboxes(node_mailboxes.clone());
+        actor_runtime.set_wasm_runner(resources.wasm.clone());
 
         Self {
             graph,
             registry,
-            executor,
-            worker,
+            resources,
+            actor_runtime,
             canvas_state: CanvasState::new(),
             panel_state: PanelState::new(),
             undo_history,
-            run_events: Vec::new(),
-            auto_run: false,
-            graph_dirty: false,
             current_file,
             theme_applied: false,
             pending_nodes: HashSet::new(),
             debug_log: DebugLog::new(),
             net_handle,
             net_values,
-            net_subscribed_nodes: HashSet::new(),
+            tick_nodes: HashMap::new(),
+            session_manager,
+            ocapn_slots,
+            connected_peers,
+            ocapn_call_results,
+            node_mailboxes,
+            actor_nodes: HashSet::new(),
         }
-    }
-
-    fn run_graph(&mut self) {
-        let events = self.executor.execute_graph(&mut self.graph, &self.registry);
-        self.run_events.extend(events);
-        self.graph_dirty = false;
     }
 
     fn compute_node(&mut self, node_id: NodeId) {
-        // First execute WASM upstream nodes synchronously (they're fast)
-        let ancestors = self.graph.ancestors_sorted(node_id);
-        for &aid in &ancestors {
-            if aid == node_id {
-                continue;
-            }
-            if let Some(node) = self.graph.nodes.get(&aid) {
-                if node.template_name != "Script" {
-                    // Execute non-script nodes synchronously
-                    let events = self.executor.execute_up_to(&mut self.graph, &self.registry, aid);
-                    self.run_events.extend(events);
-                }
-            }
-        }
-
-        // Now dispatch Script node to background worker
         if let Some(node) = self.graph.nodes.get(&node_id) {
-            if node.template_name == "Script" {
-                let code = node.script_code.clone();
+            let template = self.registry.templates.get(&node.template_name).cloned();
 
-                let mut available_inputs = self.graph.resolve_all_input_values(node_id);
-                for (k, v) in &node.widget_values {
-                    available_inputs.entry(k.clone()).or_insert_with(|| v.clone());
-                }
-
-                self.pending_nodes.insert(node_id);
-                self.worker.send(WorkRequest::Compute {
-                    node_id,
-                    code,
-                    available_inputs,
-                    db: self.executor.db.clone(),
-                });
-                return;
+            let mut available_inputs = self.graph.resolve_all_input_values(node_id);
+            for (k, v) in &node.widget_values {
+                available_inputs.entry(k.clone()).or_insert_with(|| v.clone());
             }
-        }
 
-        // Fallback: non-script node
-        let events = self.executor.execute_up_to(&mut self.graph, &self.registry, node_id);
-        self.run_events.extend(events);
+            self.pending_nodes.insert(node_id);
+            self.actor_runtime.send(node_id, ActorMsg {
+                node: node.clone(),
+                template,
+                available_inputs,
+                db: self.resources.db.clone(),
+            });
+        }
     }
 
     fn poll_worker_results(&mut self) {
-        // Set net values in thread-local before Scheme execution
-        crate::bridge::set_thread_net_values(Some(&self.net_values));
-        if let Some(result) = self.worker.poll(&self.executor.scheme) {
+        while let Some(result) = self.actor_runtime.poll() {
             match result {
-                WorkResult::Preview { node_id, blocks } => {
-                    self.pending_nodes.remove(&node_id);
-                    if let Some(n) = self.graph.nodes.get_mut(&node_id) {
-                        n.render_blocks = blocks;
-                    }
-                }
-                WorkResult::Compute { node_id, result } => {
+                ActorResult::Computed { node_id, result, .. } => {
                     self.pending_nodes.remove(&node_id);
                     let label = self.graph.nodes.get(&node_id)
                         .map(|n| n.label.clone()).unwrap_or_default();
@@ -205,9 +190,21 @@ impl WasmCanvasApp {
                                 .or_insert_with(|| port.port_type.default_value());
                         }
                     }
+                    // Handle tick requests
+                    if let Some(ms) = result.tick_interval_ms {
+                        self.tick_nodes.insert(node_id, (ms, Instant::now()));
+                    } else {
+                        self.tick_nodes.remove(&node_id);
+                    }
+                    // Track actor nodes (those with on-message handlers)
+                    if result.has_message_handler {
+                        self.actor_nodes.insert(node_id);
+                    } else {
+                        self.actor_nodes.remove(&node_id);
+                    }
                     // Re-register outputs so downstream nodes can read them
                     if let Some(node) = self.graph.nodes.get(&node_id) {
-                        self.executor.scheme.register_node_library(node_id, &node.output_values);
+                        self.actor_runtime.engine().register_node_library(node_id, &node.output_values);
                     }
                     // Handle net-publish: send all node values to network
                     for channel in &result.net_publishes {
@@ -247,15 +244,40 @@ impl WasmCanvasApp {
                             }
                         }
                     }
-                    // Auto-recompute downstream nodes
-                    let descendants = self.graph.descendants_sorted(node_id);
-                    for did in descendants {
+                    // Handle OCapN sends
+                    for (peer_id, message) in result.ocapn_sends {
+                        self.debug_log.log("ocapn", format!(
+                            "send to {}...: {:?}",
+                            &peer_id[..12.min(peer_id.len())],
+                            message
+                        ));
+                        self.net_handle.send(NetCommand::OCapNSend {
+                            peer_id,
+                            message,
+                        });
+                    }
+                    // Handle actor recompute requests (from node-send)
+                    for target_id in result.recompute_requests {
+                        if !self.pending_nodes.contains(&target_id) {
+                            self.compute_node(target_id);
+                        }
+                    }
+                    // Reactive dataflow: dispatch only direct downstream nodes.
+                    // Cascade happens naturally — when each downstream finishes,
+                    // its own downstreams will be dispatched.
+                    let direct_downstream: Vec<NodeId> = self.graph.connections.iter()
+                        .filter(|c| c.from_node == node_id)
+                        .map(|c| c.to_node)
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
+                    for did in direct_downstream {
                         if !self.pending_nodes.contains(&did) {
                             self.compute_node(did);
                         }
                     }
                 }
-                WorkResult::Error { node_id, message } => {
+                ActorResult::Error { node_id, message } => {
                     self.debug_log.log("error", format!("#{}: {}", node_id, &message));
                     self.pending_nodes.remove(&node_id);
                     if let Some(n) = self.graph.nodes.get_mut(&node_id) {
@@ -264,7 +286,6 @@ impl WasmCanvasApp {
                 }
             }
         }
-        crate::bridge::set_thread_net_values(None);
     }
 
     fn poll_network(&mut self) {
@@ -274,9 +295,13 @@ impl WasmCanvasApp {
             match event {
                 NetEvent::PeerDiscovered(peer) => {
                     self.debug_log.log("net", format!("peer discovered: {}...", &peer[..12.min(peer.len())]));
+                    self.connected_peers.lock().unwrap().insert(peer.clone());
+                    self.session_manager.lock().unwrap().ensure_session(&peer);
                 }
                 NetEvent::PeerLost(peer) => {
                     self.debug_log.log("net", format!("peer lost: {}...", &peer[..12.min(peer.len())]));
+                    self.connected_peers.lock().unwrap().remove(&peer);
+                    self.session_manager.lock().unwrap().remove_session(&peer);
                     // Remove values from this peer
                     let mut store = self.net_values.lock().unwrap();
                     store.retain(|(p, _), _| *p != peer);
@@ -290,6 +315,92 @@ impl WasmCanvasApp {
                     let mut store = self.net_values.lock().unwrap();
                     store.insert((peer, channel), values);
                     need_recompute = true;
+                }
+                NetEvent::OCapNReceived { peer, message } => {
+                    self.debug_log.log("ocapn", format!(
+                        "recv from {}...",
+                        &peer[..12.min(peer.len())]
+                    ));
+                    // For OpDeliver, the network thread already handled delivery and response.
+                    // We still trigger recompute for nodes using ocapn-receive.
+                    if let crate::ocapn::types::OCapNMessage::OpDeliver { to_desc: _, args, .. } = &message {
+                        // Trigger recompute for ocapn-receive nodes
+                        if args.len() >= 2 {
+                            if let crate::ocapn::syrup::SyrupValue::Symbol(method) = &args[0] {
+                                if method == "deliver-to" {
+                                    let ocapn_nodes: Vec<NodeId> = self.graph.nodes.iter()
+                                        .filter(|(_, n)| n.template_name == "Script" && n.script_code.contains("ocapn-receive"))
+                                        .map(|(id, _)| *id).collect();
+                                    for nid in ocapn_nodes {
+                                        if !self.pending_nodes.contains(&nid) {
+                                            self.compute_node(nid);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let crate::ocapn::types::OCapNMessage::OpDeliverOnly { to_desc: _, args } = &message {
+                        // Convention: args = [Symbol("deliver-to"), Bytestring(swiss), ...]
+                        if args.len() >= 2 {
+                            if let (
+                                crate::ocapn::syrup::SyrupValue::Symbol(method),
+                                swiss_val,
+                            ) = (&args[0], &args[1]) {
+                                if method == "deliver-to" {
+                                    if let Some(swiss) = crate::ocapn::types::SwissNum::from_syrup(swiss_val) {
+                                        let remaining_args = &args[2..];
+                                        let mgr = self.session_manager.lock().unwrap();
+                                        match mgr.deliver_by_swiss(&swiss, remaining_args) {
+                                            Ok(result) => {
+                                                self.debug_log.log("ocapn", format!(
+                                                    "deliver ok: {:?}", result
+                                                ));
+                                                // Trigger recompute on nodes using ocapn-receive
+                                                drop(mgr);
+                                                let ocapn_nodes: Vec<NodeId> = self.graph.nodes.iter()
+                                                    .filter(|(_, n)| n.template_name == "Script" && n.script_code.contains("ocapn-receive"))
+                                                    .map(|(id, _)| *id).collect();
+                                                for nid in ocapn_nodes {
+                                                    if !self.pending_nodes.contains(&nid) {
+                                                        self.compute_node(nid);
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                self.debug_log.log("ocapn", format!(
+                                                    "deliver error: {}", e
+                                                ));
+                                            }
+                                        }
+                                    } else {
+                                        self.debug_log.log("ocapn", String::from("invalid swiss-num in deliver-to"));
+                                    }
+                                } else {
+                                    self.debug_log.log("ocapn", format!("unknown method: {}", method));
+                                }
+                            }
+                        }
+                    }
+                }
+                NetEvent::OCapNCallResult { request_id, value } => {
+                    self.debug_log.log("ocapn", format!(
+                        "call result {}: {:?}", request_id, value
+                    ));
+                    self.ocapn_call_results.lock().unwrap().insert(request_id, value);
+                    // Trigger recompute on nodes using ocapn-call-result
+                    let ocapn_nodes: Vec<NodeId> = self.graph.nodes.iter()
+                        .filter(|(_, n)| n.template_name == "Script" && n.script_code.contains("ocapn-call-result"))
+                        .map(|(id, _)| *id).collect();
+                    for nid in ocapn_nodes {
+                        if !self.pending_nodes.contains(&nid) {
+                            self.compute_node(nid);
+                        }
+                    }
+                }
+                NetEvent::LocalPeerId(peer_id) => {
+                    self.debug_log.log("net", format!("local peer: {}...", &peer_id[..12.min(peer_id.len())]));
+                    self.session_manager.lock().unwrap().set_local_peer_id(peer_id);
                 }
             }
         }
@@ -307,17 +418,34 @@ impl WasmCanvasApp {
         }
     }
 
+    fn poll_ticks(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let mut to_recompute = Vec::new();
+        for (node_id, (interval_ms, last_tick)) in &mut self.tick_nodes {
+            let elapsed = now.duration_since(*last_tick).as_millis() as u64;
+            if elapsed >= *interval_ms {
+                *last_tick = now;
+                to_recompute.push(*node_id);
+            }
+        }
+        for nid in to_recompute {
+            if !self.pending_nodes.contains(&nid) {
+                self.compute_node(nid);
+            }
+        }
+        if !self.tick_nodes.is_empty() {
+            ctx.request_repaint();
+        }
+    }
+
     fn handle_actions(&mut self, actions: Vec<PanelAction>) {
         for action in actions {
             match action {
-                PanelAction::RunGraph => {
-                    self.run_graph();
-                }
                 PanelAction::ComputeNode(id) => {
                     self.compute_node(id);
                 }
                 PanelAction::CancelCompute => {
-                    self.worker.cancel();
+                    self.actor_runtime.cancel_all();
                     self.pending_nodes.clear();
                 }
                 PanelAction::RecomputeSelected => {
@@ -327,13 +455,6 @@ impl WasmCanvasApp {
                         }
                         self.compute_node(node_id);
                     }
-                }
-                PanelAction::StepGraph => {
-                    // TODO: step mode
-                    self.run_graph();
-                }
-                PanelAction::ToggleAutoRun => {
-                    self.auto_run = !self.auto_run;
                 }
                 PanelAction::SaveGraph => {
                     self.save_graph();
@@ -346,13 +467,15 @@ impl WasmCanvasApp {
                         let template = template.clone();
                         let _id = self.graph.add_node(&template, pos);
                         self.undo_history.push(&self.graph);
-                        self.graph_dirty = true;
+    
                     }
                 }
                 PanelAction::DeleteNode(id) => {
                     self.graph.remove_node(id);
+                    self.actor_runtime.remove(id);
+                    self.actor_nodes.remove(&id);
                     self.undo_history.push(&self.graph);
-                    self.graph_dirty = true;
+
                     if self.panel_state.selected_node == Some(id) {
                         self.panel_state.selected_node = None;
                     }
@@ -363,7 +486,7 @@ impl WasmCanvasApp {
                     }
                     // Re-register node library with updated outputs and recompute
                     if let Some(node) = self.graph.nodes.get(&node_id) {
-                        self.executor.scheme.register_node_library(node_id, &node.output_values);
+                        self.actor_runtime.engine().register_node_library(node_id, &node.output_values);
                     }
                     self.compute_node(node_id);
                 }
@@ -382,9 +505,9 @@ impl WasmCanvasApp {
 
         if let Some(path) = path {
             let result = if path.extension().map_or(false, |e| e == "scm") {
-                persistence::save_graph_scm(&self.graph, &path, &self.executor.db)
+                persistence::save_graph_scm(&self.graph, &path, &self.resources.db)
             } else {
-                persistence::save_graph(&self.graph, &path, &self.executor.db)
+                persistence::save_graph(&self.graph, &path, &self.resources.db)
             };
             if let Err(e) = result {
                 log::error!("Failed to save graph: {}", e);
@@ -402,16 +525,15 @@ impl WasmCanvasApp {
 
         if let Some(path) = path {
             let result = if path.extension().map_or(false, |e| e == "scm") {
-                persistence::load_graph_scm(&path, &self.executor.db)
+                persistence::load_graph_scm(&path, &self.resources.db)
             } else {
-                persistence::load_graph(&path, &self.executor.db)
+                persistence::load_graph(&path, &self.resources.db)
             };
             match result {
                 Ok(graph) => {
                     self.graph = graph;
                     self.undo_history.push(&self.graph);
                     self.current_file = Some(path);
-                    self.run_events.clear();
                 }
                 Err(e) => {
                     log::error!("Failed to load graph: {}", e);
@@ -428,21 +550,19 @@ impl eframe::App for WasmCanvasApp {
             self.theme_applied = true;
         }
 
-        // Poll background worker results and network events
+        // Poll background worker results, network events, and ticks
         self.poll_worker_results();
         self.poll_network();
+        self.poll_ticks(ctx);
 
         // Keep repainting while work is pending
-        if !self.pending_nodes.is_empty() || self.worker.has_pending() {
+        if !self.pending_nodes.is_empty() || self.actor_runtime.has_pending() {
             ctx.request_repaint();
         }
 
         // Keyboard shortcuts
         let mut actions = Vec::new();
 
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::R)) {
-            actions.push(PanelAction::RunGraph);
-        }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z)) {
             if let Some(graph) = self.undo_history.undo() {
                 self.graph = graph;
@@ -456,21 +576,17 @@ impl eframe::App for WasmCanvasApp {
 
         // Toolbar
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            let toolbar_actions = panels::draw_toolbar(ui, self.auto_run);
+            let toolbar_actions = panels::draw_toolbar(ui);
             actions.extend(toolbar_actions);
         });
 
-        // Bottom panel - execution log or debug
-        if self.panel_state.show_log || self.panel_state.show_debug {
+        // Bottom panel - debug
+        if self.panel_state.show_debug {
             egui::TopBottomPanel::bottom("bottom_panel")
                 .resizable(true)
                 .default_height(150.0)
                 .show(ctx, |ui| {
-                    if self.panel_state.show_debug {
-                        panels::draw_debug_panel(ui, &self.executor.db, &mut self.debug_log);
-                    } else {
-                        panels::draw_execution_log(ui, &self.run_events);
-                    }
+                    panels::draw_debug_panel(ui, &self.resources.db, &mut self.debug_log);
                 });
         }
 
@@ -514,7 +630,7 @@ impl eframe::App for WasmCanvasApp {
                         &mut self.graph,
                         &self.registry,
                         &mut self.panel_state,
-                        &self.executor.db,
+                        &self.resources.db,
                         computing,
                         &mut self.debug_log,
                     );
@@ -541,12 +657,10 @@ impl eframe::App for WasmCanvasApp {
                 self.graph
                     .add_connection(from_node, from_port, to_node, to_port);
                 self.undo_history.push(&self.graph);
-                self.graph_dirty = true;
             }
 
             for node_id in canvas_response.delete_nodes {
                 self.graph.remove_node(node_id);
-                self.graph_dirty = true;
             }
 
             for (node_id, key, val) in canvas_response.widget_updates {
@@ -554,12 +668,9 @@ impl eframe::App for WasmCanvasApp {
                     node.widget_values.insert(key, val);
                 }
                 if let Some(node) = self.graph.nodes.get(&node_id) {
-                    self.executor.scheme.register_node_library(node_id, &node.output_values);
+                    self.actor_runtime.engine().register_node_library(node_id, &node.output_values);
                 }
                 self.compute_node(node_id);
-            }
-            if self.graph_dirty {
-                self.undo_history.push(&self.graph);
             }
 
             // Context menu for adding nodes
@@ -618,14 +729,10 @@ impl eframe::App for WasmCanvasApp {
 
         self.handle_actions(actions);
 
-        // Auto-run
-        if self.auto_run && self.graph_dirty {
-            self.run_graph();
-        }
     }
 
     fn on_exit(&mut self) {
-        if let Err(e) = persistence::save_db(&self.executor.db, &PathBuf::from("./db.json")) {
+        if let Err(e) = persistence::save_db(&self.resources.db, &PathBuf::from("./db.json")) {
             log::error!("Failed to auto-save DB: {}", e);
         }
     }
