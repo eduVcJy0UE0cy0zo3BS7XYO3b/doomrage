@@ -39,6 +39,8 @@ pub struct WasmCanvasApp {
     ocapn_slot_owners: crate::bridge::OCapNSlotOwners,
     /// Nodes that registered an on-message handler (reactive actors)
     actor_nodes: HashSet<NodeId>,
+    /// Nodes with open native windows: node_id → window title
+    node_windows: HashMap<NodeId, String>,
 }
 
 impl WasmCanvasApp {
@@ -132,6 +134,7 @@ impl WasmCanvasApp {
             node_mailboxes,
             ocapn_slot_owners,
             actor_nodes: HashSet::new(),
+            node_windows: HashMap::new(),
         }
     }
 
@@ -211,6 +214,12 @@ impl WasmCanvasApp {
                         self.actor_nodes.insert(node_id);
                     } else {
                         self.actor_nodes.remove(&node_id);
+                    }
+                    // Track node windows
+                    if let Some(title) = result.window_title {
+                        self.node_windows.insert(node_id, title);
+                    } else {
+                        self.node_windows.remove(&node_id);
                     }
                     // Re-register outputs so downstream nodes can read them
                     if let Some(node) = self.graph.nodes.get(&node_id) {
@@ -499,6 +508,7 @@ impl WasmCanvasApp {
                     self.graph.remove_node(id);
                     self.actor_runtime.remove(id);
                     self.actor_nodes.remove(&id);
+                    self.node_windows.remove(&id);
                     self.undo_history.push(&self.graph);
 
                     if self.panel_state.selected_node == Some(id) {
@@ -752,6 +762,78 @@ impl eframe::App for WasmCanvasApp {
         });
 
         self.handle_actions(actions);
+
+        // Render node windows as separate native viewports
+        let window_entries: Vec<(NodeId, String, Vec<crate::render::RenderBlock>, Vec<crate::bridge::WidgetDecl>, HashMap<String, Value>)> =
+            self.node_windows.iter()
+                .filter_map(|(&node_id, title)| {
+                    let node = self.graph.nodes.get(&node_id)?;
+                    Some((node_id, title.clone(), node.render_blocks.clone(), node.widget_decls.clone(), node.widget_values.clone()))
+                })
+                .collect();
+
+        let db = self.resources.db.clone();
+        let mut window_actions = Vec::new();
+        let mut windows_to_close = Vec::new();
+        for (node_id, title, blocks, widget_decls, widget_values) in &window_entries {
+            let node_id = *node_id;
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of(("node_window", node_id)),
+                egui::ViewportBuilder::default()
+                    .with_title(title)
+                    .with_inner_size([400.0, 300.0]),
+                |ctx, _class| {
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        windows_to_close.push(node_id);
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        // Render widget_decls (slider, checkbox)
+                        for wdecl in widget_decls {
+                            let current = widget_values.get(&wdecl.name)
+                                .and_then(|v| match v {
+                                    Value::F64(f) => Some(*f),
+                                    _ => None,
+                                })
+                                .unwrap_or(0.0);
+                            match wdecl.widget_type.as_str() {
+                                "slider" => {
+                                    let min = wdecl.params.first().copied().unwrap_or(0.0);
+                                    let max = wdecl.params.get(1).copied().unwrap_or(100.0);
+                                    let mut val = current;
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(&wdecl.name).color(theme::TEXT_DIM));
+                                        if ui.add(egui::Slider::new(&mut val, min..=max)).changed() {
+                                            window_actions.push(PanelAction::UpdateWidget(
+                                                node_id, wdecl.name.clone(), Value::F64(val),
+                                            ));
+                                        }
+                                    });
+                                }
+                                "checkbox" => {
+                                    let mut checked = current != 0.0;
+                                    if ui.checkbox(&mut checked, egui::RichText::new(&wdecl.name).color(theme::TEXT)).changed() {
+                                        window_actions.push(PanelAction::UpdateWidget(
+                                            node_id, wdecl.name.clone(),
+                                            Value::F64(if checked { 1.0 } else { 0.0 }),
+                                        ));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !widget_decls.is_empty() && !blocks.is_empty() {
+                            ui.separator();
+                        }
+                        // Render blocks (read-only: buttons/text-input still work via db)
+                        panels::draw_render_blocks(ui, blocks, &db, &mut self.debug_log);
+                    });
+                },
+            );
+        }
+        for id in windows_to_close {
+            self.node_windows.remove(&id);
+        }
+        self.handle_actions(window_actions);
 
     }
 

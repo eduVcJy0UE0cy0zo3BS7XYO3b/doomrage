@@ -97,6 +97,12 @@ pub fn take_recompute_requests() -> Vec<crate::types::NodeId> {
         .unwrap_or_default()
 }
 
+/// Take window title from actor context.
+pub fn take_window_title() -> Option<String> {
+    crate::actor::with_actor_ctx(|ctx| ctx.window_title.take())
+        .flatten()
+}
+
 /// Take the has_message_handler flag from actor context.
 pub fn take_has_message_handler() -> bool {
     crate::actor::with_actor_ctx(|ctx| {
@@ -1011,6 +1017,15 @@ fn bridge_actor_self_send(method: &Value, args_list: &Value) -> Result<Vec<Value
         ctx.recompute_requests.push(node_id);
     });
 
+    Ok(vec![Value::null()])
+}
+
+#[bridge(name = "actor-open-window", lib = "(canvas actor)")]
+fn bridge_open_window(title: &Value) -> Result<Vec<Value>, Exception> {
+    let title = value_to_string(title);
+    crate::actor::with_actor_ctx(|ctx| {
+        ctx.window_title = Some(title);
+    });
     Ok(vec![Value::null()])
 }
 

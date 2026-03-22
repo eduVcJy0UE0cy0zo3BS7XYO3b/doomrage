@@ -678,7 +678,7 @@ mod tests {
     fn test_parse_demo_scm() {
         let src = std::fs::read_to_string("demo.scm").unwrap();
         let graph = parse_scm(&src).unwrap();
-        assert_eq!(graph.nodes.len(), 5);
+        assert_eq!(graph.nodes.len(), 6);
         assert_eq!(graph.connections.len(), 4);
 
         let wave = &graph.nodes[&4];

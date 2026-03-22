@@ -38,6 +38,7 @@ pub struct ActorContext {
     pub tick_interval_ms: Option<u64>,
     pub recompute_requests: Vec<NodeId>,
     pub has_message_handler: bool,
+    pub window_title: Option<String>,
 }
 
 impl ActorContext {
@@ -57,6 +58,7 @@ impl ActorContext {
             tick_interval_ms: None,
             recompute_requests: Vec::new(),
             has_message_handler: false,
+            window_title: None,
         }
     }
 
@@ -68,6 +70,7 @@ impl ActorContext {
         self.tick_interval_ms = None;
         self.recompute_requests.clear();
         self.has_message_handler = false;
+        self.window_title = None;
     }
 
     /// Take all collected outputs, leaving empty defaults.
@@ -78,6 +81,7 @@ impl ActorContext {
             tick_interval_ms: self.tick_interval_ms.take(),
             recompute_requests: std::mem::take(&mut self.recompute_requests),
             has_message_handler: self.has_message_handler,
+            window_title: self.window_title.take(),
         }
     }
 
@@ -97,6 +101,7 @@ pub struct ActorOutputs {
     pub tick_interval_ms: Option<u64>,
     pub recompute_requests: Vec<NodeId>,
     pub has_message_handler: bool,
+    pub window_title: Option<String>,
 }
 
 // --- Thread-local singleton ---

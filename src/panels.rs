@@ -269,14 +269,14 @@ pub fn draw_inspector(
                         }
                         ui.add_space(4.0);
 
-                        if is_computing {
+                        if is_computing && node.render_blocks.is_empty() && node.widget_decls.is_empty() {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("Computing...").color(ACCENT));
                                 if ui.button(RichText::new("Cancel").color(Color32::from_rgb(0xff, 0x44, 0x44))).clicked() {
                                     actions.push(PanelAction::CancelCompute);
                                 }
                             });
-                        } else if node.render_blocks.is_empty() && node.widget_decls.is_empty() {
+                        } else if !is_computing && node.render_blocks.is_empty() && node.widget_decls.is_empty() {
                             ui.label(RichText::new("Press Compute to evaluate").color(TEXT_DIM));
                         } else {
                             // Draw new-style widgets from widget_decls
@@ -493,7 +493,7 @@ pub fn draw_execution_log(ui: &mut egui::Ui, events: &[RunEvent]) {
 }
 
 /// Returns true if db was mutated (needs recompute)
-fn draw_render_blocks(ui: &mut egui::Ui, blocks: &[RenderBlock], db: &Db, debug_log: &mut DebugLog) -> bool {
+pub fn draw_render_blocks(ui: &mut egui::Ui, blocks: &[RenderBlock], db: &Db, debug_log: &mut DebugLog) -> bool {
     let mut store_mutated = false;
     for (block_idx, block) in blocks.iter().enumerate() {
         let stable_id = format!("rb_{}_{}", block_idx, block_id_hint(block));

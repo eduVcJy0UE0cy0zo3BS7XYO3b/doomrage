@@ -89,6 +89,20 @@
   @(render swatch)
 )
 
+(node 6 "Script" "app window" (pos 300.0 350.0)
+
+  (open-window "My App")
+  (define n (slider "value" 0 100))
+
+  # My App
+
+  Value = @(->str n)
+
+  ---
+
+  Move the slider in the separate window!
+)
+
 ;;; --- connections ---
 
 (connection 1 (from 1 "gain") (to 2 "gain"))

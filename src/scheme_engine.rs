@@ -27,7 +27,7 @@ const CANVAS_RENDER_LIB: &str = r#"
           text bold italic code link hr table render
           plot-line plot-scatter plot-bar
           numbered-list bullet-list
-          button checkbox text-input slider editable-list
+          button checkbox text-input editable-list
           json-null
           canvas draw-line draw-rect draw-circle draw-polyline draw-text)
   (import (rnrs))
@@ -424,6 +424,7 @@ impl SchemeEngine {
             (define (receive) (actor-receive-msg))
             (define (mailbox-count) (actor-mailbox-count))
             (define (self-send method . args) (actor-self-send-msg method args))
+            (define (open-window title) (actor-open-window title))
             (define __actor-msg-handler #f)
             (define (on-message handler)
               (actor-register-handler)
@@ -685,6 +686,7 @@ impl SchemeEngine {
         let ocapn_sends = crate::bridge::take_ocapn_sends();
         let recompute_requests = crate::bridge::take_recompute_requests();
         let has_message_handler = crate::bridge::take_has_message_handler();
+        let window_title = crate::bridge::take_window_title();
 
         Ok((ScriptResult {
             output_values,
@@ -697,6 +699,7 @@ impl SchemeEngine {
             ocapn_sends,
             recompute_requests,
             has_message_handler,
+            window_title,
         }, env))
     }
 
@@ -738,6 +741,7 @@ impl SchemeEngine {
             ocapn_sends,
             recompute_requests,
             has_message_handler: true,
+            window_title: None,
         })
     }
 
@@ -795,6 +799,7 @@ impl SchemeEngine {
             ocapn_sends: Vec::new(),
             recompute_requests: Vec::new(),
             has_message_handler: false,
+            window_title: None,
         })
     }
 
@@ -812,6 +817,7 @@ pub struct ScriptResult {
     pub ocapn_sends: Vec<crate::bridge::OCapNSendEntry>,
     pub recompute_requests: Vec<crate::types::NodeId>,
     pub has_message_handler: bool,
+    pub window_title: Option<String>,
 }
 
 impl ScriptResult {
@@ -827,6 +833,7 @@ impl ScriptResult {
             ocapn_sends: Vec::new(),
             recompute_requests: Vec::new(),
             has_message_handler: false,
+            window_title: None,
         }
     }
 
