@@ -48,6 +48,8 @@ pub struct WasmCanvasApp {
     current_canvas: String,
     /// Cached list of canvas names
     canvas_list: Vec<String>,
+    /// Cached list of favorite node names
+    favorites: Vec<String>,
 }
 
 impl WasmCanvasApp {
@@ -161,6 +163,7 @@ impl WasmCanvasApp {
             resources.scheme.register_stub_libraries(&graph.nodes);
         }
 
+        let favorites = persistence::list_favorites(&resources.db);
         let mut undo_history = UndoHistory::new(10);
         undo_history.push(&graph);
 
@@ -210,6 +213,7 @@ impl WasmCanvasApp {
             explicit_compute: HashSet::new(),
             current_canvas,
             canvas_list,
+            favorites,
         }
     }
 
@@ -840,6 +844,34 @@ impl WasmCanvasApp {
                     }
                     self.compute_node_debounced(node_id);
                 }
+                PanelAction::AddToFavorites(node_id) => {
+                    if let Some(node) = self.graph.nodes.get(&node_id) {
+                        if let Err(e) = persistence::save_favorite(
+                            &node.label, &node.script_code, &node.widget_values, &self.resources.db
+                        ) {
+                            log::error!("Failed to save favorite: {}", e);
+                        }
+                        self.favorites = persistence::list_favorites(&self.resources.db);
+                    }
+                }
+                PanelAction::InsertFavorite(label) => {
+                    if let Some((script_code, widget_values)) = persistence::load_favorite(&label, &self.resources.db) {
+                        if let Some(template) = self.registry.templates.get("Script") {
+                            let template = template.clone();
+                            let id = self.graph.add_node(&template, [200.0, 200.0]);
+                            if let Some(node) = self.graph.nodes.get_mut(&id) {
+                                node.label = label;
+                                node.script_code = script_code;
+                                node.widget_values = widget_values;
+                            }
+                            self.undo_history.push(&self.graph);
+                        }
+                    }
+                }
+                PanelAction::RemoveFavorite(label) => {
+                    let _ = persistence::remove_favorite(&label, &self.resources.db);
+                    self.favorites = persistence::list_favorites(&self.resources.db);
+                }
                 PanelAction::NewCanvas(name) => {
                     // Save current canvas first
                     let _ = persistence::save_canvas_to_db(&self.current_canvas, &self.graph, &self.resources.db);
@@ -1018,7 +1050,7 @@ impl eframe::App for WasmCanvasApp {
                 .resizable(true)
                 .show(ctx, |ui| {
                     let lib_actions =
-                        panels::draw_library(ui, &self.registry, &mut self.panel_state);
+                        panels::draw_library(ui, &self.registry, &mut self.panel_state, &self.favorites);
                     actions.extend(lib_actions);
                 });
         }

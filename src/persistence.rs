@@ -217,6 +217,50 @@ fn parse_node_row(row: &serde_json::Value) -> Option<Node> {
     })
 }
 
+// --- Favorites ---
+
+/// Save a node as a favorite (by label). Stores script_code + widget_values.
+pub fn save_favorite(label: &str, script_code: &str, widget_values: &HashMap<String, crate::types::Value>, db: &Db) -> Result<()> {
+    let lbl = Db::escape_surql(label);
+    let code = Db::escape_surql(script_code);
+    let wv_json = serde_json::to_string(widget_values)?;
+    db.run(&format!("DELETE favorites WHERE label = '{}'", lbl))?;
+    db.run(&format!(
+        "CREATE favorites SET label = '{}', script_code = '{}', widget_values_json = '{}'",
+        lbl, code, Db::escape_surql(&wv_json)
+    ))?;
+    Ok(())
+}
+
+/// List all favorite names.
+pub fn list_favorites(db: &Db) -> Vec<String> {
+    db.query("SELECT label FROM favorites ORDER BY label")
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| row.get("label").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect()
+}
+
+/// Load a favorite by label.
+pub fn load_favorite(label: &str, db: &Db) -> Option<(String, HashMap<String, crate::types::Value>)> {
+    let lbl = Db::escape_surql(label);
+    let rows = db.query(&format!("SELECT * FROM favorites WHERE label = '{}'", lbl)).ok()?;
+    let row = rows.first()?;
+    let script_code = row.get("script_code").and_then(|v| v.as_str())?.to_string();
+    let widget_values: HashMap<String, crate::types::Value> = row.get("widget_values_json")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    Some((script_code, widget_values))
+}
+
+/// Remove a favorite by label.
+pub fn remove_favorite(label: &str, db: &Db) -> Result<()> {
+    let lbl = Db::escape_surql(label);
+    db.run(&format!("DELETE favorites WHERE label = '{}'", lbl))?;
+    Ok(())
+}
+
 // --- SCM format support ---
 
 /// Load a graph from .scm format

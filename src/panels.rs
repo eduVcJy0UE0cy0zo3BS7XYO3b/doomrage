@@ -49,6 +49,10 @@ pub enum PanelAction {
     UpdateWidget(NodeId, String, Value),
     /// Send a message to a node's actor mailbox
     SendMessage(NodeId, Vec<String>),
+    /// Favorites
+    AddToFavorites(NodeId),
+    InsertFavorite(String),
+    RemoveFavorite(String),
     /// Canvas management
     NewCanvas(String),
     SwitchCanvas(String),
@@ -136,6 +140,7 @@ pub fn draw_library(
     ui: &mut egui::Ui,
     registry: &NodeRegistry,
     panel: &mut PanelState,
+    favorites: &[String],
 ) -> Vec<PanelAction> {
     let mut actions = Vec::new();
 
@@ -157,6 +162,32 @@ pub fn draw_library(
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // Favorites section
+                if !favorites.is_empty() {
+                    let fav_filtered: Vec<_> = favorites.iter()
+                        .filter(|name| search.is_empty() || name.to_lowercase().contains(&search))
+                        .collect();
+                    if !fav_filtered.is_empty() {
+                        ui.label(RichText::new("Favorites").color(ACCENT).small());
+                        ui.add_space(2.0);
+                        for name in &fav_filtered {
+                            ui.horizontal(|ui| {
+                                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), Sense::hover());
+                                ui.painter().rect_filled(rect, CornerRadius::same(2), Color32::from_rgb(0xff, 0xaa, 0x00));
+                                let label_resp = ui.label(RichText::new(name.as_str()).color(TEXT));
+                                if label_resp.double_clicked() {
+                                    actions.push(PanelAction::InsertFavorite(name.to_string()));
+                                }
+                                // Right-click to remove
+                                if label_resp.secondary_clicked() {
+                                    actions.push(PanelAction::RemoveFavorite(name.to_string()));
+                                }
+                            });
+                        }
+                        ui.add_space(4.0);
+                    }
+                }
+
                 for (category, templates) in registry.grouped_templates() {
                     let filtered: Vec<_> = templates
                         .iter()
@@ -491,12 +522,19 @@ pub fn draw_inspector(
         }
 
         ui.add_space(8.0);
-        if ui
-            .button(RichText::new("Delete Node").color(Color32::from_rgb(0xff, 0x44, 0x44)))
-            .clicked()
-        {
-            actions.push(PanelAction::DeleteNode(node_id));
-        }
+        ui.horizontal(|ui| {
+            if !node.phantom {
+                if ui.button(RichText::new("Favorite").color(Color32::from_rgb(0xff, 0xaa, 0x00))).clicked() {
+                    actions.push(PanelAction::AddToFavorites(node_id));
+                }
+            }
+            if ui
+                .button(RichText::new("Delete").color(Color32::from_rgb(0xff, 0x44, 0x44)))
+                .clicked()
+            {
+                actions.push(PanelAction::DeleteNode(node_id));
+            }
+        });
     });
 
     actions
