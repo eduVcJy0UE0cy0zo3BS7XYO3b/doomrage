@@ -142,10 +142,7 @@ pub fn load_canvas_from_db(canvas_name: &str, db: &Db) -> Result<Option<Graph>> 
         }
     }
 
-    if graph.nodes.is_empty() {
-        return Ok(None);
-    }
-
+    // graph_meta exists → canvas exists (even if empty)
     log::info!("Loaded canvas '{}' from DB: {} nodes", canvas_name, graph.nodes.len());
     Ok(Some(graph))
 }
