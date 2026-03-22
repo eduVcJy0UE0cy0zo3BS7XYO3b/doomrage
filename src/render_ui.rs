@@ -231,13 +231,14 @@ pub fn paint_render_blocks(
                 // Canvas blocks are rendered in the inspector panel
                 y += *height as f32 * zoom;
             }
-            // Layout/composition blocks: skip on canvas preview
+            // Layout/composition/interactive blocks: skip on canvas preview
             RenderBlock::Row(_)
             | RenderBlock::Frame(_)
             | RenderBlock::NodeView { .. }
             | RenderBlock::NodeBlocks { .. }
             | RenderBlock::NodeWidgets { .. }
-            | RenderBlock::NodeWidget { .. } => {
+            | RenderBlock::NodeWidget { .. }
+            | RenderBlock::Interactive { .. } => {
                 y += line_height;
             }
         }

@@ -37,6 +37,11 @@ pub enum RenderBlock {
     NodeBlocks { label: String },
     NodeWidgets { label: String },
     NodeWidget { label: String, widget_name: String },
+    /// Generic event wrapper: children are rendered, events are dispatched on interaction
+    Interactive {
+        events: Vec<(String, Vec<String>)>,  // (event_type, message_parts)
+        children: Vec<RenderBlock>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

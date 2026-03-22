@@ -531,6 +531,23 @@ impl WasmCanvasApp {
                         self.panel_state.selected_node = None;
                     }
                 }
+                PanelAction::SendMessage(node_id, message_parts) => {
+                    // Convert message parts to SyrupValues and push to mailbox
+                    let msg: Vec<crate::ocapn::syrup::SyrupValue> = message_parts.iter()
+                        .map(|s| {
+                            if let Ok(n) = s.parse::<f64>() {
+                                crate::ocapn::syrup::SyrupValue::Float64(n)
+                            } else {
+                                crate::ocapn::syrup::SyrupValue::Symbol(s.clone())
+                            }
+                        })
+                        .collect();
+                    self.node_mailboxes.lock().unwrap()
+                        .entry(node_id).or_default().push_back(msg);
+                    if !self.pending_nodes.contains(&node_id) {
+                        self.compute_node(node_id);
+                    }
+                }
                 PanelAction::UpdateWidget(node_id, key, val) => {
                     if let Some(node) = self.graph.nodes.get_mut(&node_id) {
                         node.widget_values.insert(key, val);
@@ -841,7 +858,7 @@ impl eframe::App for WasmCanvasApp {
                             ui.separator();
                         }
                         // Render blocks (read-only: buttons/text-input still work via db)
-                        panels::draw_render_blocks_with_graph(ui, blocks, &db, &mut self.debug_log, Some(&self.graph));
+                        panels::draw_render_blocks_interactive(ui, blocks, &db, &mut self.debug_log, Some(&self.graph), Some(node_id), &mut window_actions);
                     });
                 },
             );

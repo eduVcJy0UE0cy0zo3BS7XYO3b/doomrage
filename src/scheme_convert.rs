@@ -255,6 +255,33 @@ pub(crate) fn try_parse_render_from_value(val: &Value) -> Option<Vec<RenderBlock
                 widget_name: value_display(&args[1]),
             }])
         }
+        "render-interactive" => {
+            // args[0] = list of events: ((event_type message) ...)
+            // args[1] = list of children
+            let event_list = collect_list(&args[0]);
+            let events: Vec<(String, Vec<String>)> = event_list.iter().map(|ev| {
+                let parts = collect_list(ev);
+                let event_type = parts.first().map(|v| value_display(v)).unwrap_or_default();
+                // message can be a symbol or a list
+                let message = if parts.len() > 1 {
+                    match parts[1].clone().unpack() {
+                        UnpackedValue::Pair(_) => {
+                            collect_list(&parts[1]).iter().map(|v| value_display(v)).collect()
+                        }
+                        _ => vec![value_display(&parts[1])],
+                    }
+                } else {
+                    Vec::new()
+                };
+                (event_type, message)
+            }).collect();
+            let child_list = collect_list(&args[1]);
+            let children = child_list.iter()
+                .filter_map(try_parse_render_from_value)
+                .flatten()
+                .collect();
+            Some(vec![RenderBlock::Interactive { events, children }])
+        }
         "render-canvas" => {
             let width = args.get(0).and_then(|v| v.cast_to_scheme_type::<f64>()).unwrap_or(200.0);
             let height = args.get(1).and_then(|v| v.cast_to_scheme_type::<f64>()).unwrap_or(150.0);

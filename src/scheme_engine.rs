@@ -30,7 +30,8 @@ const CANVAS_RENDER_LIB: &str = r#"
           button checkbox text-input editable-list
           json-null
           canvas draw-line draw-rect draw-circle draw-polyline draw-text
-          row group node-view node-blocks node-widgets node-widget)
+          row group node-view node-blocks node-widgets node-widget
+          interactive on)
   (import (rnrs))
 
   ;; Sentinel for uncomputed values
@@ -125,6 +126,17 @@ const CANVAS_RENDER_LIB: &str = r#"
   (define (node-blocks label) (list 'render-node-blocks label))
   (define (node-widgets label) (list 'render-node-widgets label))
   (define (node-widget label name) (list 'render-node-widget label name))
+
+  ;; Event handling
+  (define (on event-type message) (list 'event (symbol->string event-type) message))
+  (define (interactive . args)
+    (let loop ((rest args) (events '()) (children '()))
+      (if (null? rest)
+        (list 'render-interactive events (reverse children))
+        (let ((item (car rest)))
+          (if (and (pair? item) (eq? (car item) 'event))
+            (loop (cdr rest) (cons (cdr item) events) children)
+            (loop (cdr rest) events (cons item children)))))))
 )
 "#;
 

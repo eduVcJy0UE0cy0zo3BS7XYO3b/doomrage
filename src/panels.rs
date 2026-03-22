@@ -45,6 +45,8 @@ pub enum PanelAction {
     LoadGraph,
     DeleteNode(NodeId),
     UpdateWidget(NodeId, String, Value),
+    /// Send a message to a node's actor mailbox
+    SendMessage(NodeId, Vec<String>),
 }
 
 pub fn draw_toolbar(ui: &mut egui::Ui) -> Vec<PanelAction> {
@@ -494,16 +496,46 @@ pub fn draw_execution_log(ui: &mut egui::Ui, events: &[RunEvent]) {
 
 /// Returns true if db was mutated (needs recompute)
 pub fn draw_render_blocks(ui: &mut egui::Ui, blocks: &[RenderBlock], db: &Db, debug_log: &mut DebugLog) -> bool {
-    draw_render_blocks_with_graph(ui, blocks, db, debug_log, None)
+    let mut actions = Vec::new();
+    let result = draw_render_blocks_full(ui, blocks, db, debug_log, None, None, &mut actions);
+    result
 }
 
 /// Draw render blocks, optionally resolving node-view/node-blocks via graph.
+/// Returns actions for event handling.
 pub fn draw_render_blocks_with_graph(
     ui: &mut egui::Ui,
     blocks: &[RenderBlock],
     db: &Db,
     debug_log: &mut DebugLog,
     graph: Option<&Graph>,
+) -> bool {
+    let mut actions = Vec::new();
+    draw_render_blocks_full(ui, blocks, db, debug_log, graph, None, &mut actions)
+}
+
+/// Draw render blocks with full context: graph for composition, node_id for events.
+/// Collected actions are appended to `actions_out`.
+pub fn draw_render_blocks_interactive(
+    ui: &mut egui::Ui,
+    blocks: &[RenderBlock],
+    db: &Db,
+    debug_log: &mut DebugLog,
+    graph: Option<&Graph>,
+    node_id: Option<NodeId>,
+    actions_out: &mut Vec<PanelAction>,
+) -> bool {
+    draw_render_blocks_full(ui, blocks, db, debug_log, graph, node_id, actions_out)
+}
+
+fn draw_render_blocks_full(
+    ui: &mut egui::Ui,
+    blocks: &[RenderBlock],
+    db: &Db,
+    debug_log: &mut DebugLog,
+    graph: Option<&Graph>,
+    node_id: Option<NodeId>,
+    actions_out: &mut Vec<PanelAction>,
 ) -> bool {
     let mut store_mutated = false;
     for (block_idx, block) in blocks.iter().enumerate() {
@@ -568,7 +600,7 @@ pub fn draw_render_blocks_with_graph(
                 draw_plot(ui, plot_data);
             }
             RenderBlock::Group(inner) => {
-                if draw_render_blocks_with_graph(ui, inner, db, debug_log, graph) {
+                if draw_render_blocks_full(ui, inner, db, debug_log, graph, node_id, actions_out) {
                     store_mutated = true;
                 }
             }
@@ -706,7 +738,7 @@ pub fn draw_render_blocks_with_graph(
                             ui.separator();
                         }
                         ui.vertical(|ui| {
-                            if draw_render_blocks_with_graph(ui, col_blocks, db, debug_log, graph) {
+                            if draw_render_blocks_full(ui, col_blocks, db, debug_log, graph, node_id, actions_out) {
                                 store_mutated = true;
                             }
                         });
@@ -719,7 +751,7 @@ pub fn draw_render_blocks_with_graph(
                     .corner_radius(CornerRadius::same(4))
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
-                        if draw_render_blocks_with_graph(ui, inner, db, debug_log, graph) {
+                        if draw_render_blocks_full(ui, inner, db, debug_log, graph, node_id, actions_out) {
                             store_mutated = true;
                         }
                     });
@@ -730,7 +762,7 @@ pub fn draw_render_blocks_with_graph(
                     if !node.widget_decls.is_empty() && !node.render_blocks.is_empty() {
                         ui.separator();
                     }
-                    if draw_render_blocks_with_graph(ui, &node.render_blocks, db, debug_log, graph) {
+                    if draw_render_blocks_full(ui, &node.render_blocks, db, debug_log, graph, node_id, actions_out) {
                         store_mutated = true;
                     }
                 } else {
@@ -739,7 +771,7 @@ pub fn draw_render_blocks_with_graph(
             }
             RenderBlock::NodeBlocks { label } => {
                 if let Some(node) = graph.and_then(|g| find_node_by_label(g, label)) {
-                    if draw_render_blocks_with_graph(ui, &node.render_blocks, db, debug_log, graph) {
+                    if draw_render_blocks_full(ui, &node.render_blocks, db, debug_log, graph, node_id, actions_out) {
                         store_mutated = true;
                     }
                 } else {
@@ -758,6 +790,29 @@ pub fn draw_render_blocks_with_graph(
                     draw_single_node_widget(ui, node, widget_name, &mut store_mutated);
                 } else {
                     ui.label(RichText::new(format!("node '{}' not found", label)).color(TEXT_DIM).italics());
+                }
+            }
+            RenderBlock::Interactive { events, children } => {
+                let response = ui.scope(|ui| {
+                    draw_render_blocks_full(ui, children, db, debug_log, graph, node_id, actions_out);
+                }).response.interact(Sense::click());
+                if response.clicked() {
+                    if let Some(nid) = node_id {
+                        for (event_type, message) in events {
+                            if event_type == "click" {
+                                actions_out.push(PanelAction::SendMessage(nid, message.clone()));
+                            }
+                        }
+                    }
+                }
+                if response.hovered() {
+                    if let Some(nid) = node_id {
+                        for (event_type, message) in events {
+                            if event_type == "hover" {
+                                actions_out.push(PanelAction::SendMessage(nid, message.clone()));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -845,6 +900,7 @@ fn block_id_hint(block: &RenderBlock) -> String {
         RenderBlock::NodeBlocks { label, .. } => format!("nb_{}", label),
         RenderBlock::NodeWidgets { label, .. } => format!("nw_{}", label),
         RenderBlock::NodeWidget { label, widget_name, .. } => format!("nwi_{}_{}", label, widget_name),
+        RenderBlock::Interactive { .. } => "interactive".to_string(),
         _ => "x".to_string(),
     }
 }

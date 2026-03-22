@@ -91,13 +91,27 @@
 
 (node 6 "Script" "synth app" (pos 300.0 350.0)
 
+  (define counter 0)
+
+  (on-message (lambda (msg)
+    (case (car msg)
+      ('increment (set! counter (+ counter 1)))
+      ('decrement (set! counter (- counter 1))))))
+
   (open-window "Synth")
 
   (row
     (group
       (bold "Controls")
       (node-widgets 'controls)
-      (hr))
+      (hr)
+      (interactive
+        (on 'click '(increment))
+        (bold "[+] Increment"))
+      (interactive
+        (on 'click '(decrement))
+        (bold "[-] Decrement"))
+      (text (string-append "Counter: " (number->string counter))))
     (group
       (bold "Oscilloscope")
       (node-blocks 'wave)))
