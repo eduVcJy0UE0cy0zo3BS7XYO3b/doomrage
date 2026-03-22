@@ -938,6 +938,8 @@ impl WasmCanvasApp {
                             self.undo_history.push(&self.graph);
                             self.panel_state.selected_node = None;
                         }
+                        // Persist to disk immediately
+                        let _ = persistence::save_db(&self.resources.db, &PathBuf::from("./db.json"));
                     }
                 }
                 PanelAction::ExportScm => {
@@ -982,6 +984,8 @@ impl WasmCanvasApp {
         if let Err(e) = persistence::save_canvas_to_db(&self.current_canvas, &self.graph, &self.resources.db) {
             log::error!("Failed to save canvas to DB: {}", e);
         }
+        // Persist to disk immediately
+        let _ = persistence::save_db(&self.resources.db, &PathBuf::from("./db.json"));
     }
 }
 
