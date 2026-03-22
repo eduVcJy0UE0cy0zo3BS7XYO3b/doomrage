@@ -316,7 +316,7 @@ pub fn draw_inspector(
                             if !node.widget_decls.is_empty() && !node.render_blocks.is_empty() {
                                 ui.separator();
                             }
-                            if draw_render_blocks(ui, &node.render_blocks, db, debug_log) {
+                            if draw_render_blocks_interactive(ui, &node.render_blocks, db, debug_log, None, Some(node_id), &mut actions) {
                                 actions.push(PanelAction::RecomputeSelected);
                             }
                         }
@@ -793,25 +793,22 @@ fn draw_render_blocks_full(
                 }
             }
             RenderBlock::Interactive { events, children } => {
-                let response = ui.scope(|ui| {
+                let scope_resp = ui.scope(|ui| {
                     draw_render_blocks_full(ui, children, db, debug_log, graph, node_id, actions_out);
-                }).response.interact(Sense::click());
-                if response.clicked() {
-                    if let Some(nid) = node_id {
+                });
+                let rect = scope_resp.response.rect;
+                let id = ui.id().with(("interactive_event", block_idx));
+                let response = ui.interact(rect, id, Sense::click());
+                if let Some(nid) = node_id {
+                    if response.clicked() {
                         for (event_type, message) in events {
                             if event_type == "click" {
                                 actions_out.push(PanelAction::SendMessage(nid, message.clone()));
                             }
                         }
                     }
-                }
-                if response.hovered() {
-                    if let Some(nid) = node_id {
-                        for (event_type, message) in events {
-                            if event_type == "hover" {
-                                actions_out.push(PanelAction::SendMessage(nid, message.clone()));
-                            }
-                        }
+                    if response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                 }
             }
