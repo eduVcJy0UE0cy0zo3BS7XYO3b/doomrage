@@ -789,23 +789,23 @@ impl WasmCanvasApp {
                 PanelAction::SwitchCanvas(name) => {
                     // Save current canvas
                     let _ = persistence::save_canvas_to_db(&self.current_canvas, &self.graph, &self.resources.db);
-                    // Load target canvas
-                    match persistence::load_canvas_from_db(&name, &self.resources.db) {
-                        Ok(Some(g)) => {
-                            self.graph = g;
-                            self.current_canvas = name;
-                            // Re-init ports and libraries
-                            self.init_graph_libraries();
-                            self.undo_history = UndoHistory::new(10);
-                            self.undo_history.push(&self.graph);
-                            self.panel_state.selected_node = None;
-                            self.pending_nodes.clear();
-                            self.actor_runtime.cancel_all();
+                    // Load target canvas (None = empty canvas, that's OK)
+                    let g = match persistence::load_canvas_from_db(&name, &self.resources.db) {
+                        Ok(Some(g)) => g,
+                        Ok(None) => Graph::new(),
+                        Err(e) => {
+                            log::error!("Failed to load canvas '{}': {}", name, e);
+                            Graph::new()
                         }
-                        _ => {
-                            log::error!("Failed to load canvas '{}'", name);
-                        }
-                    }
+                    };
+                    self.graph = g;
+                    self.current_canvas = name;
+                    self.init_graph_libraries();
+                    self.undo_history = UndoHistory::new(10);
+                    self.undo_history.push(&self.graph);
+                    self.panel_state.selected_node = None;
+                    self.pending_nodes.clear();
+                    self.actor_runtime.cancel_all();
                 }
                 PanelAction::DeleteCanvas(name) => {
                     if self.canvas_list.len() > 1 {
