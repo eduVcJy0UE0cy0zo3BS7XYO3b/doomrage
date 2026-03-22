@@ -251,7 +251,7 @@ impl WasmCanvasApp {
         }
         self.resources.scheme.register_stub_libraries(&self.graph.nodes);
 
-        // Resolve cross-canvas imports: load values from other canvases
+        // Resolve cross-canvas imports
         let mut cross_imports: Vec<(String, String)> = Vec::new();
         for node in self.graph.nodes.values() {
             if let Some(header) = crate::scheme_engine::parse_module_header(&node.script_code) {
@@ -263,57 +263,58 @@ impl WasmCanvasApp {
             }
         }
         for (canvas_name, module_name) in &cross_imports {
-            // Load the other canvas from DB, find the node with this module name
-            if let Ok(Some(other_graph)) = persistence::load_canvas_from_db(canvas_name, &self.resources.db) {
-                for (_, other_node) in &other_graph.nodes {
-                    if let Some(header) = crate::scheme_engine::parse_module_header(&other_node.script_code) {
-                        if header.name == *module_name {
-                            // Register cross-canvas library with output_values
-                            // Use widget_values as initial values (output_values are runtime-only)
-                            let mut values = other_node.widget_values.clone();
-                            for (k, v) in &other_node.output_values {
-                                values.insert(k.clone(), v.clone());
-                            }
-                            // If no values yet, use 0.0 stubs for exports
-                            if values.is_empty() {
-                                for exp in &header.exports {
-                                    values.insert(exp.clone(), Value::F64(0.0));
-                                }
-                            }
-                            self.resources.scheme.register_cross_canvas_library(
-                                canvas_name, module_name, &values,
-                            );
-                            // Also create a phantom node for visibility
-                            let phantom_label = format!("{}:{}", canvas_name, module_name);
-                            let already_exists = self.graph.nodes.values().any(|n| n.phantom && n.label == phantom_label);
-                            if !already_exists {
-                                let id = self.graph.next_node_id;
-                                self.graph.next_node_id += 1;
-                                let phantom_count = self.graph.nodes.values().filter(|n| n.phantom).count();
-                                let node = Node {
-                                    id,
-                                    template_name: "Script".to_string(),
-                                    label: phantom_label,
-                                    pos: [900.0, 50.0 + phantom_count as f32 * 200.0],
-                                    input_values: HashMap::new(),
-                                    output_values: values.clone(),
-                                    script_code: String::new(),
-                                    script_inputs: Vec::new(),
-                                    script_outputs: header.exports.iter()
-                                        .map(|k| PortDef { name: k.clone(), port_type: PortType::F64 })
-                                        .collect(),
-                                    widget_decls: Vec::new(),
-                                    widget_values: HashMap::new(),
-                                    error: None,
-                                    last_exec_us: None,
-                                    render_blocks: Vec::new(),
-                                    phantom: true,
-                                    remote_peer: Some(format!("canvas:{}", canvas_name)),
-                                };
-                                self.graph.nodes.insert(id, node);
-                            }
-                            break;
+            self.ensure_cross_canvas_library(canvas_name, module_name);
+        }
+    }
+
+    /// Ensure a cross-canvas library is registered. Loads from DB if needed.
+    fn ensure_cross_canvas_library(&mut self, canvas_name: &str, module_name: &str) {
+        if let Ok(Some(other_graph)) = persistence::load_canvas_from_db(canvas_name, &self.resources.db) {
+            for (_, other_node) in &other_graph.nodes {
+                if let Some(header) = crate::scheme_engine::parse_module_header(&other_node.script_code) {
+                    if header.name == *module_name {
+                        let mut values = other_node.widget_values.clone();
+                        for (k, v) in &other_node.output_values {
+                            values.insert(k.clone(), v.clone());
                         }
+                        if values.is_empty() {
+                            for exp in &header.exports {
+                                values.insert(exp.clone(), Value::F64(0.0));
+                            }
+                        }
+                        self.resources.scheme.register_cross_canvas_library(
+                            canvas_name, module_name, &values,
+                        );
+                        // Create phantom node if not exists
+                        let phantom_label = format!("{}:{}", canvas_name, module_name);
+                        let already_exists = self.graph.nodes.values().any(|n| n.phantom && n.label == phantom_label);
+                        if !already_exists {
+                            let id = self.graph.next_node_id;
+                            self.graph.next_node_id += 1;
+                            let phantom_count = self.graph.nodes.values().filter(|n| n.phantom).count();
+                            let node = Node {
+                                id,
+                                template_name: "Script".to_string(),
+                                label: phantom_label,
+                                pos: [900.0, 50.0 + phantom_count as f32 * 200.0],
+                                input_values: HashMap::new(),
+                                output_values: values.clone(),
+                                script_code: String::new(),
+                                script_inputs: Vec::new(),
+                                script_outputs: header.exports.iter()
+                                    .map(|k| PortDef { name: k.clone(), port_type: PortType::F64 })
+                                    .collect(),
+                                widget_decls: Vec::new(),
+                                widget_values: HashMap::new(),
+                                error: None,
+                                last_exec_us: None,
+                                render_blocks: Vec::new(),
+                                phantom: true,
+                                remote_peer: Some(format!("canvas:{}", canvas_name)),
+                            };
+                            self.graph.nodes.insert(id, node);
+                        }
+                        break;
                     }
                 }
             }
@@ -323,6 +324,14 @@ impl WasmCanvasApp {
     fn compute_node(&mut self, node_id: NodeId) {
         // Skip phantom nodes — they have no code to execute
         if self.graph.nodes.get(&node_id).map_or(false, |n| n.phantom) { return; }
+        // Register any cross-canvas imports this node needs
+        if let Some(node) = self.graph.nodes.get(&node_id) {
+            if let Some(header) = crate::scheme_engine::parse_module_header(&node.script_code) {
+                for (canvas_name, module_name) in &header.cross_imports {
+                    self.ensure_cross_canvas_library(canvas_name, module_name);
+                }
+            }
+        }
         if let Some((node, template, inputs)) = self.resolve_node(node_id) {
             self.pending_nodes.insert(node_id);
             self.actor_runtime.compute(node_id, node, template, inputs, self.resources.db.clone());
