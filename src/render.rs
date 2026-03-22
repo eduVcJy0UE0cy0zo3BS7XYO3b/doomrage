@@ -30,6 +30,13 @@ pub enum RenderBlock {
     Slider { key: String, min: f64, max: f64 },
     EditableList { key: String },
     Canvas { width: f64, height: f64, commands: Vec<DrawCmd> },
+    // Layout & composition
+    Row(Vec<Vec<RenderBlock>>),
+    Frame(Vec<RenderBlock>),
+    NodeView { label: String },
+    NodeBlocks { label: String },
+    NodeWidgets { label: String },
+    NodeWidget { label: String, widget_name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -154,6 +154,8 @@ struct ActorMsg {
     db: Db,
     immediate: bool,
     fast_message_path: bool,
+    /// Labels of connected source nodes (for auto-import)
+    connected_modules: Vec<String>,
 }
 
 /// Result from processing an actor message.
@@ -290,8 +292,9 @@ impl ActorRuntime {
         template: Option<NodeTemplate>,
         available_inputs: HashMap<String, Value>,
         db: Db,
+        connected_modules: Vec<String>,
     ) {
-        self.enqueue(node_id, node, template, available_inputs, db, true);
+        self.enqueue(node_id, node, template, available_inputs, db, true, connected_modules);
     }
 
     /// Compute a node with debounce (for slider/widget user interaction).
@@ -302,8 +305,9 @@ impl ActorRuntime {
         template: Option<NodeTemplate>,
         available_inputs: HashMap<String, Value>,
         db: Db,
+        connected_modules: Vec<String>,
     ) {
-        self.enqueue(node_id, node, template, available_inputs, db, false);
+        self.enqueue(node_id, node, template, available_inputs, db, false, connected_modules);
     }
 
     fn enqueue(
@@ -314,13 +318,14 @@ impl ActorRuntime {
         available_inputs: HashMap<String, Value>,
         db: Db,
         immediate: bool,
+        connected_modules: Vec<String>,
     ) {
         // Detect fast message path internally
         let fast_message_path = self.should_fast_path(node_id, &node);
 
         let msg = ActorMsg {
             node, template, available_inputs, db,
-            immediate, fast_message_path,
+            immediate, fast_message_path, connected_modules,
         };
 
         let state = self.node_states.entry(node_id).or_insert(NodeState {
@@ -538,6 +543,7 @@ fn execute_on_thread(
             let result = with_actor_context(&mut ctx, || {
                 engine.execute_script_cached(
                     cached_env, &msg.available_inputs, Some(&msg.db), code,
+                    &msg.connected_modules,
                 )
             });
 

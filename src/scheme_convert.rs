@@ -223,6 +223,38 @@ pub(crate) fn try_parse_render_from_value(val: &Value) -> Option<Vec<RenderBlock
                 key: value_display(&args[0]),
             }])
         }
+        "render-row" => {
+            let items = collect_list(&args[0]);
+            let columns: Vec<Vec<RenderBlock>> = items
+                .iter()
+                .map(|col| try_parse_render_from_value(col).unwrap_or_default())
+                .collect();
+            Some(vec![RenderBlock::Row(columns)])
+        }
+        "render-frame" => {
+            let items = collect_list(&args[0]);
+            let blocks = items
+                .iter()
+                .filter_map(try_parse_render_from_value)
+                .flatten()
+                .collect();
+            Some(vec![RenderBlock::Frame(blocks)])
+        }
+        "render-node-view" => {
+            Some(vec![RenderBlock::NodeView { label: value_display(&args[0]) }])
+        }
+        "render-node-blocks" => {
+            Some(vec![RenderBlock::NodeBlocks { label: value_display(&args[0]) }])
+        }
+        "render-node-widgets" => {
+            Some(vec![RenderBlock::NodeWidgets { label: value_display(&args[0]) }])
+        }
+        "render-node-widget" => {
+            Some(vec![RenderBlock::NodeWidget {
+                label: value_display(&args[0]),
+                widget_name: value_display(&args[1]),
+            }])
+        }
         "render-canvas" => {
             let width = args.get(0).and_then(|v| v.cast_to_scheme_type::<f64>()).unwrap_or(200.0);
             let height = args.get(1).and_then(|v| v.cast_to_scheme_type::<f64>()).unwrap_or(150.0);

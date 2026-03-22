@@ -29,7 +29,8 @@ const CANVAS_RENDER_LIB: &str = r#"
           numbered-list bullet-list
           button checkbox text-input editable-list
           json-null
-          canvas draw-line draw-rect draw-circle draw-polyline draw-text)
+          canvas draw-line draw-rect draw-circle draw-polyline draw-text
+          row group node-view node-blocks node-widgets node-widget)
   (import (rnrs))
 
   ;; Sentinel for uncomputed values
@@ -116,6 +117,14 @@ const CANVAS_RENDER_LIB: &str = r#"
   (define (draw-circle x y r fill) (list 'circle x y r fill))
   (define (draw-polyline pts color width) (list 'polyline pts color width))
   (define (draw-text x y txt color size) (list 'text x y txt color size))
+
+  ;; Layout & composition
+  (define (row . items) (list 'render-row items))
+  (define (group . items) (list 'render-frame items))
+  (define (node-view label) (list 'render-node-view label))
+  (define (node-blocks label) (list 'render-node-blocks label))
+  (define (node-widgets label) (list 'render-node-widgets label))
+  (define (node-widget label name) (list 'render-node-widget label name))
 )
 "#;
 
@@ -508,6 +517,15 @@ impl SchemeEngine {
         node_id: crate::types::NodeId,
         outputs: &HashMap<String, crate::types::Value>,
     ) {
+        self.register_node_library_named(node_id, None, outputs);
+    }
+
+    pub fn register_node_library_named(
+        &self,
+        node_id: crate::types::NodeId,
+        label: Option<&str>,
+        outputs: &HashMap<String, crate::types::Value>,
+    ) {
         if outputs.is_empty() {
             return;
         }
@@ -518,15 +536,30 @@ impl SchemeEngine {
             .map(|(name, val)| format!("(define {} {})", name, val.to_scheme_literal()))
             .collect();
 
+        let export_str = exports.join(" ");
+        let define_str = defines.join(" ");
+
+        // Register by numeric id
         let lib_str = format!(
             "(library (node n{}) (export {}) (import (rnrs)) {})",
-            node_id,
-            exports.join(" "),
-            defines.join(" ")
+            node_id, export_str, define_str
         );
-
         if let Err(e) = self.runtime.def_lib(&lib_str) {
             log::warn!("Failed to register node {} library: {}", node_id, e);
+        }
+
+        // Also register by label (sanitized: spaces → hyphens)
+        if let Some(label) = label {
+            let safe_label = label.replace(' ', "-");
+            if !safe_label.is_empty() {
+                let label_lib = format!(
+                    "(library (node {}) (export {}) (import (rnrs)) {})",
+                    safe_label, export_str, define_str
+                );
+                if let Err(e) = self.runtime.def_lib(&label_lib) {
+                    log::warn!("Failed to register node label '{}' library: {}", label, e);
+                }
+            }
         }
     }
 
@@ -623,7 +656,7 @@ impl SchemeEngine {
         db: Option<&crate::db::Db>,
         code: &str,
     ) -> Result<ScriptResult> {
-        let (result, _env) = self.execute_script_cached(None, available_inputs, db, code)?;
+        let (result, _env) = self.execute_script_cached(None, available_inputs, db, code, &[])?;
         Ok(result)
     }
 
@@ -636,8 +669,18 @@ impl SchemeEngine {
         available_inputs: &HashMap<String, crate::types::Value>,
         db: Option<&crate::db::Db>,
         code: &str,
+        connected_modules: &[String],
     ) -> Result<(ScriptResult, TopLevelEnvironment)> {
         let env = cached_env.unwrap_or_else(|| self.make_env());
+
+        // Auto-import connected node modules
+        for module_label in connected_modules {
+            let import_stmt = format!("(import (node {}))", module_label);
+            // Gracefully skip if module not registered yet (source not computed)
+            if let Err(e) = env.eval(true, &import_stmt) {
+                log::debug!("Auto-import (node {}) skipped: {}", module_label, e);
+            }
+        }
 
         let stripped = self.preprocess_code(&env, code)?;
 

@@ -316,6 +316,7 @@ mod tests {
             Some(builtin_registry().templates["Script"].clone()),
             inputs,
             db.clone(),
+            Vec::new(),
         );
     }
 

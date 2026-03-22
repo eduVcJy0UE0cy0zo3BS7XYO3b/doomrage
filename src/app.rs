@@ -140,15 +140,17 @@ impl WasmCanvasApp {
 
     fn compute_node(&mut self, node_id: NodeId) {
         if let Some((node, template, inputs)) = self.resolve_node(node_id) {
+            let modules = self.connected_source_labels(node_id);
             self.pending_nodes.insert(node_id);
-            self.actor_runtime.compute(node_id, node, template, inputs, self.resources.db.clone());
+            self.actor_runtime.compute(node_id, node, template, inputs, self.resources.db.clone(), modules);
         }
     }
 
     fn compute_node_debounced(&mut self, node_id: NodeId) {
         if let Some((node, template, inputs)) = self.resolve_node(node_id) {
+            let modules = self.connected_source_labels(node_id);
             self.pending_nodes.insert(node_id);
-            self.actor_runtime.compute_debounced(node_id, node, template, inputs, self.resources.db.clone());
+            self.actor_runtime.compute_debounced(node_id, node, template, inputs, self.resources.db.clone(), modules);
         }
     }
 
@@ -160,6 +162,20 @@ impl WasmCanvasApp {
             available_inputs.entry(k.clone()).or_insert_with(|| v.clone());
         }
         Some((node.clone(), template, available_inputs))
+    }
+
+    /// Get labels of source nodes connected to this node (deduplicated).
+    fn connected_source_labels(&self, node_id: NodeId) -> Vec<String> {
+        let mut labels = Vec::new();
+        let mut seen = HashSet::new();
+        for conn in &self.graph.connections {
+            if conn.to_node == node_id && seen.insert(conn.from_node) {
+                if let Some(src) = self.graph.nodes.get(&conn.from_node) {
+                    labels.push(src.label.replace(' ', "-"));
+                }
+            }
+        }
+        labels
     }
 
     fn poll_worker_results(&mut self) {
@@ -223,7 +239,7 @@ impl WasmCanvasApp {
                     }
                     // Re-register outputs so downstream nodes can read them
                     if let Some(node) = self.graph.nodes.get(&node_id) {
-                        self.actor_runtime.engine().register_node_library(node_id, &node.output_values);
+                        self.actor_runtime.engine().register_node_library_named(node_id, Some(&node.label), &node.output_values);
                     }
                     // Handle net-publish: send all node values to network
                     for channel in &result.net_publishes {
@@ -520,7 +536,7 @@ impl WasmCanvasApp {
                         node.widget_values.insert(key, val);
                     }
                     if let Some(node) = self.graph.nodes.get(&node_id) {
-                        self.actor_runtime.engine().register_node_library(node_id, &node.output_values);
+                        self.actor_runtime.engine().register_node_library_named(node_id, Some(&node.label), &node.output_values);
                     }
                     self.compute_node_debounced(node_id);
                 }
@@ -702,7 +718,7 @@ impl eframe::App for WasmCanvasApp {
                     node.widget_values.insert(key, val);
                 }
                 if let Some(node) = self.graph.nodes.get(&node_id) {
-                    self.actor_runtime.engine().register_node_library(node_id, &node.output_values);
+                    self.actor_runtime.engine().register_node_library_named(node_id, Some(&node.label), &node.output_values);
                 }
                 self.compute_node_debounced(node_id);
             }
@@ -825,7 +841,7 @@ impl eframe::App for WasmCanvasApp {
                             ui.separator();
                         }
                         // Render blocks (read-only: buttons/text-input still work via db)
-                        panels::draw_render_blocks(ui, blocks, &db, &mut self.debug_log);
+                        panels::draw_render_blocks_with_graph(ui, blocks, &db, &mut self.debug_log, Some(&self.graph));
                     });
                 },
             );

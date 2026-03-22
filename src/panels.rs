@@ -494,6 +494,17 @@ pub fn draw_execution_log(ui: &mut egui::Ui, events: &[RunEvent]) {
 
 /// Returns true if db was mutated (needs recompute)
 pub fn draw_render_blocks(ui: &mut egui::Ui, blocks: &[RenderBlock], db: &Db, debug_log: &mut DebugLog) -> bool {
+    draw_render_blocks_with_graph(ui, blocks, db, debug_log, None)
+}
+
+/// Draw render blocks, optionally resolving node-view/node-blocks via graph.
+pub fn draw_render_blocks_with_graph(
+    ui: &mut egui::Ui,
+    blocks: &[RenderBlock],
+    db: &Db,
+    debug_log: &mut DebugLog,
+    graph: Option<&Graph>,
+) -> bool {
     let mut store_mutated = false;
     for (block_idx, block) in blocks.iter().enumerate() {
         let stable_id = format!("rb_{}_{}", block_idx, block_id_hint(block));
@@ -557,7 +568,7 @@ pub fn draw_render_blocks(ui: &mut egui::Ui, blocks: &[RenderBlock], db: &Db, de
                 draw_plot(ui, plot_data);
             }
             RenderBlock::Group(inner) => {
-                if draw_render_blocks(ui, inner, db, debug_log) {
+                if draw_render_blocks_with_graph(ui, inner, db, debug_log, graph) {
                     store_mutated = true;
                 }
             }
@@ -688,6 +699,67 @@ pub fn draw_render_blocks(ui: &mut egui::Ui, blocks: &[RenderBlock], db: &Db, de
                     );
                 }
             }
+            RenderBlock::Row(columns) => {
+                ui.horizontal_top(|ui| {
+                    for (col_idx, col_blocks) in columns.iter().enumerate() {
+                        if col_idx > 0 {
+                            ui.separator();
+                        }
+                        ui.vertical(|ui| {
+                            if draw_render_blocks_with_graph(ui, col_blocks, db, debug_log, graph) {
+                                store_mutated = true;
+                            }
+                        });
+                    }
+                });
+            }
+            RenderBlock::Frame(inner) => {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(0xf5, 0xf5, 0xf0))
+                    .corner_radius(CornerRadius::same(4))
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        if draw_render_blocks_with_graph(ui, inner, db, debug_log, graph) {
+                            store_mutated = true;
+                        }
+                    });
+            }
+            RenderBlock::NodeView { label } => {
+                if let Some(node) = graph.and_then(|g| find_node_by_label(g, label)) {
+                    draw_node_widgets(ui, node, graph.unwrap(), &mut store_mutated, db, debug_log);
+                    if !node.widget_decls.is_empty() && !node.render_blocks.is_empty() {
+                        ui.separator();
+                    }
+                    if draw_render_blocks_with_graph(ui, &node.render_blocks, db, debug_log, graph) {
+                        store_mutated = true;
+                    }
+                } else {
+                    ui.label(RichText::new(format!("node '{}' not found", label)).color(TEXT_DIM).italics());
+                }
+            }
+            RenderBlock::NodeBlocks { label } => {
+                if let Some(node) = graph.and_then(|g| find_node_by_label(g, label)) {
+                    if draw_render_blocks_with_graph(ui, &node.render_blocks, db, debug_log, graph) {
+                        store_mutated = true;
+                    }
+                } else {
+                    ui.label(RichText::new(format!("node '{}' not found", label)).color(TEXT_DIM).italics());
+                }
+            }
+            RenderBlock::NodeWidgets { label } => {
+                if let Some(node) = graph.and_then(|g| find_node_by_label(g, label)) {
+                    draw_node_widgets(ui, node, graph.unwrap(), &mut store_mutated, db, debug_log);
+                } else {
+                    ui.label(RichText::new(format!("node '{}' not found", label)).color(TEXT_DIM).italics());
+                }
+            }
+            RenderBlock::NodeWidget { label, widget_name } => {
+                if let Some(node) = graph.and_then(|g| find_node_by_label(g, label)) {
+                    draw_single_node_widget(ui, node, widget_name, &mut store_mutated);
+                } else {
+                    ui.label(RichText::new(format!("node '{}' not found", label)).color(TEXT_DIM).italics());
+                }
+            }
         }
         }); // push_id
     }
@@ -695,6 +767,57 @@ pub fn draw_render_blocks(ui: &mut egui::Ui, blocks: &[RenderBlock], db: &Db, de
 }
 
 /// If value is a kv key, resolve to current value; otherwise return as-is
+fn find_node_by_label<'a>(graph: &'a Graph, label: &str) -> Option<&'a Node> {
+    // Try exact match first, then match with spaces→hyphens
+    graph.nodes.values().find(|n| n.label == label)
+        .or_else(|| graph.nodes.values().find(|n| n.label.replace(' ', "-") == label))
+}
+
+fn draw_node_widgets(
+    ui: &mut egui::Ui,
+    node: &Node,
+    _graph: &Graph,
+    store_mutated: &mut bool,
+    _db: &Db,
+    _debug_log: &mut DebugLog,
+) {
+    for wdecl in &node.widget_decls {
+        draw_single_node_widget(ui, node, &wdecl.name, store_mutated);
+    }
+}
+
+fn draw_single_node_widget(
+    ui: &mut egui::Ui,
+    node: &Node,
+    widget_name: &str,
+    _store_mutated: &mut bool,
+) {
+    if let Some(wdecl) = node.widget_decls.iter().find(|w| w.name == widget_name) {
+        let current = node.widget_values.get(&wdecl.name)
+            .map(|v| v.as_f64())
+            .unwrap_or(wdecl.params.first().copied().unwrap_or(0.0));
+        match wdecl.widget_type.as_str() {
+            "slider" => {
+                let min = wdecl.params.first().copied().unwrap_or(0.0);
+                let max = wdecl.params.get(1).copied().unwrap_or(100.0);
+                let mut val = current;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&wdecl.name).color(TEXT_DIM));
+                    ui.add(egui::Slider::new(&mut val, min..=max));
+                });
+                // Note: read-only display — widget interaction goes through inspector/window
+            }
+            "checkbox" => {
+                let mut checked = current != 0.0;
+                ui.checkbox(&mut checked, RichText::new(&wdecl.name).color(TEXT));
+            }
+            _ => {}
+        }
+    } else {
+        ui.label(RichText::new(format!("widget '{}' not found", widget_name)).color(TEXT_DIM).italics());
+    }
+}
+
 fn resolve_store_ref(value: &str, db: &Db) -> String {
     if let Some(val) = db.kv_get(value) {
         if let Some(s) = val.as_str() {
@@ -716,6 +839,12 @@ fn block_id_hint(block: &RenderBlock) -> String {
         RenderBlock::Bold(t) => format!("b_{}", &t[..t.len().min(8)]),
         RenderBlock::Text(t) => format!("t_{}", &t[..t.len().min(8)]),
         RenderBlock::Canvas { .. } => "canvas".to_string(),
+        RenderBlock::Row(_) => "row".to_string(),
+        RenderBlock::Frame(_) => "frame".to_string(),
+        RenderBlock::NodeView { label, .. } => format!("nv_{}", label),
+        RenderBlock::NodeBlocks { label, .. } => format!("nb_{}", label),
+        RenderBlock::NodeWidgets { label, .. } => format!("nw_{}", label),
+        RenderBlock::NodeWidget { label, widget_name, .. } => format!("nwi_{}_{}", label, widget_name),
         _ => "x".to_string(),
     }
 }
