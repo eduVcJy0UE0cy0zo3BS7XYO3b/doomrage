@@ -203,6 +203,7 @@ impl WasmCanvasApp {
         actor_runtime.set_wasm_runner(resources.wasm.clone());
         actor_runtime.set_slot_owners(ocapn_slot_owners.clone());
         actor_runtime.set_egui_ctx(cc.egui_ctx.clone());
+        actor_runtime.set_current_canvas(current_canvas.clone());
 
         Self {
             graph,
@@ -354,17 +355,28 @@ impl WasmCanvasApp {
         }
     }
 
-    fn compute_node(&mut self, node_id: NodeId) {
-        // Skip phantom nodes — they have no code to execute
-        if self.graph.nodes.get(&node_id).map_or(false, |n| n.phantom) { return; }
-        // Register any cross-canvas imports this node needs
-        if let Some(node) = self.graph.nodes.get(&node_id) {
-            if let Some(header) = crate::scheme_engine::parse_module_header(&node.script_code) {
+    /// Ensure all cross-canvas libraries a node needs are registered.
+    fn prepare_cross_canvas(&mut self, node_id: NodeId) {
+        let code = self.graph.nodes.get(&node_id)
+            .or_else(|| self.all_graphs.values().find_map(|g| g.nodes.get(&node_id)))
+            .map(|n| n.script_code.clone());
+        if let Some(code) = code {
+            if let Some(header) = crate::scheme_engine::parse_module_header(&code) {
                 for (canvas_name, module_name) in &header.cross_imports {
+                    // Skip self-referencing (node imports from its own canvas)
+                    if *canvas_name == self.current_canvas {
+                        continue;
+                    }
                     self.ensure_cross_canvas_library(canvas_name, module_name);
                 }
             }
         }
+    }
+
+    fn compute_node(&mut self, node_id: NodeId) {
+        // Skip phantom nodes — they have no code to execute
+        if self.graph.nodes.get(&node_id).map_or(false, |n| n.phantom) { return; }
+        self.prepare_cross_canvas(node_id);
         if let Some((node, template, inputs)) = self.resolve_node(node_id) {
             self.pending_nodes.insert(node_id);
             self.actor_runtime.compute(node_id, node, template, inputs, self.resources.db.clone());
@@ -373,6 +385,7 @@ impl WasmCanvasApp {
 
     fn compute_node_debounced(&mut self, node_id: NodeId) {
         if self.graph.nodes.get(&node_id).map_or(false, |n| n.phantom) { return; }
+        self.prepare_cross_canvas(node_id);
         if let Some((node, template, inputs)) = self.resolve_node(node_id) {
             self.pending_nodes.insert(node_id);
             self.actor_runtime.compute_debounced(node_id, node, template, inputs, self.resources.db.clone());
@@ -1011,6 +1024,7 @@ impl WasmCanvasApp {
                     // Switch to target graph
                     self.graph = self.all_graphs.get(&name).cloned().unwrap_or_else(Graph::new);
                     self.current_canvas = name;
+                    self.actor_runtime.set_current_canvas(self.current_canvas.clone());
                     self.init_graph_libraries();
                     self.panel_state.selected_node = None;
                     // Don't cancel actor runtime or clear env cache — keep everything running

@@ -499,6 +499,10 @@ pub fn extract_imports(code: &str) -> Vec<String> {
 /// Strip `(define-module ...)` form from code, returning the body.
 /// Also returns import statements to prepend.
 pub fn strip_module_header(code: &str) -> (String, Vec<String>) {
+    strip_module_header_with_canvas(code, None)
+}
+
+pub fn strip_module_header_with_canvas(code: &str, current_canvas: Option<&str>) -> (String, Vec<String>) {
     if let Some(header) = parse_module_header(code) {
         let dm_start = code.find("(define-module").unwrap();
         let dm_end = find_matching_paren(code, dm_start).unwrap();
@@ -510,8 +514,13 @@ pub fn strip_module_header(code: &str) -> (String, Vec<String>) {
             .map(|label| format!("(import (node {}))", label))
             .collect();
         // Cross-canvas imports: (import (canvas-name module-name))
+        // If canvas == current canvas, treat as local import
         for (canvas, module) in &header.cross_imports {
-            imports.push(format!("(import ({} {}))", canvas, module));
+            if current_canvas.map_or(false, |cc| cc == canvas) {
+                imports.push(format!("(import (node {}))", module));
+            } else {
+                imports.push(format!("(import ({} {}))", canvas, module));
+            }
         }
         (body.trim_start_matches('\n').to_string(), imports)
     } else {
@@ -916,7 +925,8 @@ impl SchemeEngine {
 
         // Strip define-module, prepend imports as R6RS (import ...) statements
         let eval_code = if module_header.is_some() {
-            let (body, import_stmts) = strip_module_header(code);
+            let current_canvas = crate::actor::with_actor_ctx(|ctx| ctx.current_canvas.clone()).flatten();
+            let (body, import_stmts) = strip_module_header_with_canvas(code, current_canvas.as_deref());
             let mut full = String::new();
             for stmt in &import_stmts {
                 full.push_str(stmt);
