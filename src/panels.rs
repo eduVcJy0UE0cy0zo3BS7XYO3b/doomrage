@@ -68,7 +68,7 @@ pub fn draw_toolbar(
     ui.horizontal(|ui| {
         ui.visuals_mut().override_text_color = Some(TEXT);
 
-        // Canvas selector
+        // Canvas selector dropdown (only for switching)
         egui::ComboBox::from_id_salt("canvas_selector")
             .selected_text(RichText::new(current_canvas).color(ACCENT).strong())
             .width(140.0)
@@ -84,22 +84,21 @@ pub fn draw_toolbar(
                         actions.push(PanelAction::SwitchCanvas(name.clone()));
                     }
                 }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let response = ui.add(
-                        egui::TextEdit::singleline(new_canvas_name)
-                            .hint_text("new canvas...")
-                            .desired_width(100.0),
-                    );
-                    let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if (ui.button(RichText::new("+").color(ACCENT)).clicked() || enter)
-                        && !new_canvas_name.trim().is_empty()
-                    {
-                        actions.push(PanelAction::NewCanvas(new_canvas_name.trim().to_string()));
-                        *new_canvas_name = String::new();
-                    }
-                });
             });
+
+        // New canvas: inline text field + button (outside ComboBox)
+        let response = ui.add(
+            egui::TextEdit::singleline(new_canvas_name)
+                .hint_text("new canvas...")
+                .desired_width(90.0),
+        );
+        let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if (ui.button(RichText::new("+").color(ACCENT)).clicked() || enter)
+            && !new_canvas_name.trim().is_empty()
+        {
+            actions.push(PanelAction::NewCanvas(new_canvas_name.trim().to_string()));
+            *new_canvas_name = String::new();
+        }
 
         ui.separator();
 
