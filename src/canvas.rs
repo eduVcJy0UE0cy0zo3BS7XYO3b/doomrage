@@ -111,8 +111,9 @@ pub fn draw_canvas(
     // Draw grid
     draw_grid(&painter, canvas_rect, offset, zoom);
 
-    // Draw wires
-    for conn in &graph.connections {
+    // Draw dependency wires (derived from imports in code)
+    let derived = graph.derived_connections();
+    for conn in &derived {
         if let (Some(from_node), Some(to_node)) = (
             graph.nodes.get(&conn.from_node),
             graph.nodes.get(&conn.to_node),
@@ -120,33 +121,24 @@ pub fn draw_canvas(
             let from_template = registry.templates.get(&from_node.template_name);
             let to_template = registry.templates.get(&to_node.template_name);
 
-            let from_pos = port_screen_pos(
-                from_node,
-                from_template,
-                &conn.from_port,
-                true,
-                canvas_rect,
-                offset,
-                zoom,
-            );
-            let to_pos = port_screen_pos(
-                to_node,
-                to_template,
-                &conn.to_port,
-                false,
-                canvas_rect,
-                offset,
-                zoom,
-            );
+            let (fp, tp) = match (&conn.from_port, &conn.to_port) {
+                (Some(fp), Some(tp)) => (fp.as_str(), tp.as_str()),
+                _ => continue, // skip non-port connections
+            };
+            let from_pos = match port_screen_pos(from_node, from_template, fp, true, canvas_rect, offset, zoom) {
+                Some(p) => p,
+                None => continue,
+            };
+            let to_pos = match port_screen_pos(to_node, to_template, tp, false, canvas_rect, offset, zoom) {
+                Some(p) => p,
+                None => continue,
+            };
+            let color = from_node.script_outputs.iter()
+                .find(|p| p.name == fp)
+                .map(|p| p.port_type.color())
+                .unwrap_or(PortType::F64.color());
 
-            if let (Some(from_pos), Some(to_pos)) = (from_pos, to_pos) {
-                let port_type = from_template
-                    .and_then(|t| t.outputs.iter().find(|p| p.name == conn.from_port))
-                    .map(|p| p.port_type)
-                    .unwrap_or(PortType::F64);
-
-                draw_wire(&painter, from_pos, to_pos, port_type.color(), false);
-            }
+            draw_wire(&painter, from_pos, to_pos, color, false);
         }
     }
 

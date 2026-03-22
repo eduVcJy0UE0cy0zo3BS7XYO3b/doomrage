@@ -167,6 +167,8 @@ pub enum ActorResult {
         env: TopLevelEnvironment,
         /// Hash of code that produced this env.
         code_hash: u64,
+        /// Cached preprocessed code for fast re-eval.
+        preprocessed: Option<String>,
     },
     Error {
         node_id: NodeId,
@@ -198,6 +200,8 @@ struct SharedResources {
 struct CachedEnv {
     code_hash: u64,
     env: TopLevelEnvironment,
+    /// Cached preprocessed code (skip Scribble on re-eval)
+    preprocessed: Option<String>,
 }
 
 /// Default debounce delay for user-triggered recomputes (slider, widget).
@@ -349,6 +353,7 @@ impl ActorRuntime {
     }
 
     /// Check if a node qualifies for fast message-handler path.
+    /// Fast path: drain messages + re-eval with cached preprocessed code.
     fn should_fast_path(&self, node_id: NodeId, node: &crate::types::Node) -> bool {
         if !self.handler_nodes.contains(&node_id) {
             return false;
@@ -412,10 +417,11 @@ impl ActorRuntime {
                 };
 
                 // Cache env and track handler nodes
-                if let ActorResult::Computed { node_id, ref env, code_hash, ref result, .. } = result {
+                if let ActorResult::Computed { node_id, ref env, code_hash, ref result, ref preprocessed, .. } = result {
                     self.env_cache.insert(node_id, CachedEnv {
                         code_hash,
                         env: env.clone(),
+                        preprocessed: preprocessed.clone(),
                     });
                     if result.has_message_handler {
                         self.handler_nodes.insert(node_id);
@@ -453,9 +459,10 @@ impl ActorRuntime {
     /// Actually spawn eval on a worker thread.
     fn spawn_eval(&mut self, node_id: NodeId, pending: PendingCompute) {
         let code_hash = hash_code(&pending.msg.node.script_code);
-        let cached_env = self.env_cache.remove(&node_id)
-            .filter(|c| c.code_hash == code_hash)
-            .map(|c| c.env);
+        let cached = self.env_cache.remove(&node_id)
+            .filter(|c| c.code_hash == code_hash);
+        let cached_env = cached.as_ref().map(|c| c.env.clone());
+        let cached_preprocessed = cached.and_then(|c| c.preprocessed);
 
         let state = self.node_states.entry(node_id).or_insert(NodeState {
             in_flight: false,
@@ -468,7 +475,7 @@ impl ActorRuntime {
         let tx = self.result_tx.clone();
 
         self.pool.spawn(move || {
-            let result = execute_on_thread(engine, node_id, pending.msg, &shared, cached_env);
+            let result = execute_on_thread(engine, node_id, pending.msg, &shared, cached_env, cached_preprocessed);
             let _ = tx.send(result);
             if let Some(ctx) = shared.egui_ctx.as_ref() {
                 ctx.request_repaint();
@@ -484,10 +491,11 @@ fn execute_on_thread(
     msg: ActorMsg,
     shared: &SharedResources,
     cached_env: Option<TopLevelEnvironment>,
+    cached_preprocessed: Option<String>,
 ) -> ActorResult {
     let builtin = msg.template.as_ref().and_then(|t| t.builtin);
 
-    // Fast message path: only drain messages via handler, skip full re-eval
+    // Fast message path: drain messages, then re-eval with cached preprocessed code
     if msg.fast_message_path {
         if let Some(env) = cached_env {
             let mut ctx = ActorContext::new(node_id);
@@ -501,18 +509,41 @@ fn execute_on_thread(
 
             let ch = hash_code(&msg.node.script_code);
 
-            let result = with_actor_context(&mut ctx, || {
+            // Drain messages first
+            let drain_result = with_actor_context(&mut ctx, || {
                 engine.execute_message_handler(&env, &msg.available_inputs, Some(&msg.db))
             });
 
-            return match result {
-                Ok(script_result) => ActorResult::Computed {
-                    node_id,
-                    result: script_result,
-                    env,
-                    code_hash: ch,
-                },
-                Err(e) => ActorResult::Error { node_id, message: e.to_string() },
+            if let Err(e) = drain_result {
+                return ActorResult::Error { node_id, message: e.to_string() };
+            }
+
+            // Re-eval with cached preprocessed code for fresh render blocks
+            if let Some(ref preprocessed) = cached_preprocessed {
+                ctx.reset_outputs();
+                let result = with_actor_context(&mut ctx, || {
+                    engine.eval_preprocessed(&env, &msg.available_inputs, Some(&msg.db), preprocessed)
+                });
+                return match result {
+                    Ok(script_result) => ActorResult::Computed {
+                        node_id,
+                        result: script_result,
+                        env,
+                        code_hash: ch,
+                        preprocessed: cached_preprocessed,
+                    },
+                    Err(e) => ActorResult::Error { node_id, message: e.to_string() },
+                };
+            }
+
+            // No cached preprocessed code — return drain-only result
+            let drain_result = drain_result.unwrap();
+            return ActorResult::Computed {
+                node_id,
+                result: drain_result,
+                env,
+                code_hash: ch,
+                preprocessed: None,
             };
         }
     }
@@ -526,6 +557,7 @@ fn execute_on_thread(
                     result: ScriptResult::empty(),
                     env: cached_env.unwrap_or_else(|| engine.make_env()),
                     code_hash: hash_code(code),
+                    preprocessed: None,
                 };
             }
 
@@ -548,11 +580,12 @@ fn execute_on_thread(
             });
 
             match result {
-                Ok((script_result, env)) => ActorResult::Computed {
+                Ok((script_result, env, preprocessed)) => ActorResult::Computed {
                     node_id,
                     result: script_result,
                     env,
                     code_hash: ch,
+                    preprocessed: Some(preprocessed),
                 },
                 Err(e) => ActorResult::Error { node_id, message: e.to_string() },
             }
@@ -564,6 +597,7 @@ fn execute_on_thread(
                 result: ScriptResult::with_outputs(output_values),
                 env: cached_env.unwrap_or_else(|| engine.make_env()),
                 code_hash: 0,
+                preprocessed: None,
             }
         }
         Some(BuiltinKind::Output) => {
@@ -573,6 +607,7 @@ fn execute_on_thread(
                 result: ScriptResult::with_outputs(output_values),
                 env: cached_env.unwrap_or_else(|| engine.make_env()),
                 code_hash: 0,
+                preprocessed: None,
             }
         }
         None => {
@@ -585,6 +620,7 @@ fn execute_on_thread(
                             result: ScriptResult::with_outputs(output_values),
                             env: cached_env.unwrap_or_else(|| engine.make_env()),
                             code_hash: 0,
+                            preprocessed: None,
                         },
                         Err(e) => ActorResult::Error { node_id, message: e.to_string() },
                     }

@@ -7,43 +7,49 @@
 
 (node 1 "Script" "controls" (pos 50.0 50.0)
 
+  (define-module (node controls)
+    (export gain freq))
+
   (define gain (widget "gain" 'slider 0.0 100.0))
   (define freq (widget "freq" 'slider 1.0 20.0))
 
-  # Controls
-
-  Gain = @(->str gain), Freq = @(->str freq)
+  (render
+    (bold "Controls")
+    (text (string-append "Gain = " (->str gain) ", Freq = " (->str freq))))
 )
 
 (node 2 "Script" "gateway out" (pos 300.0 50.0)
 
-  (define gain (input 'gain 'f64))
-  (define freq (input 'freq 'f64))
+  (define-module (node gateway-out)
+    (use-module (node controls)))
+
   (net-publish "controls")
 
-  # Gateway Out
-
-  Publishing gain=@(->str gain), freq=@(->str freq)
+  (render
+    (bold "Gateway Out")
+    (text (string-append "Publishing gain=" (->str gain) ", freq=" (->str freq))))
 )
 
 (node 3 "Script" "gateway in" (pos 550.0 50.0)
 
-  (define gain (output 'gain 'f64))
-  (define freq (output 'freq 'f64))
-  (set! gain (net-value "controls" "gain" 50.0))
-  (set! freq (net-value "controls" "freq" 5.0))
+  (define-module (node gateway-in)
+    (export gain freq))
 
-  # Gateway In
+  (define gain (net-value "controls" "gain" 50.0))
+  (define freq (net-value "controls" "freq" 5.0))
 
-  Receiving gain=@(->str gain), freq=@(->str freq)
+  (render
+    (bold "Gateway In")
+    (text (string-append "Receiving gain=" (->str gain) ", freq=" (->str freq))))
 )
 
 (node 4 "Script" "wave" (pos 800.0 50.0)
 
-  (define gain-raw (input 'gain 'f64))
-  (define freq-raw (input 'freq 'f64))
-  (define gain (if (compute? gain-raw) 50.0 gain-raw))
-  (define freq (if (compute? freq-raw) 5.0 freq-raw))
+  (define-module (node wave)
+    (use-module (node gateway-in)))
+
+  (define g (if (compute? gain) 50.0 gain))
+  (define f (if (compute? freq) 5.0 freq))
 
   (define pi 3.14159265)
   (define w 300.0)
@@ -54,7 +60,7 @@
   (define (wave-points i acc)
     (if (= i n) acc
       (let* ((x (* (/ i n) w))
-             (y (+ mid (* gain (sin (* freq (/ i n) pi 4.0))))))
+             (y (+ mid (* g (sin (* f (/ i n) pi 4.0))))))
         (wave-points (+ i 1) (cons (list x y) acc)))))
 
   (define pts (reverse (wave-points 0 '())))
@@ -66,9 +72,8 @@
       (draw-polyline pts "#2266cc" 2)
       (draw-text 4 4 "oscilloscope" "#666666" 12)))
 
-  @(render osc)
-
-  Peak = @(->str gain), Freq = @(->str freq)
+  (render osc
+    (text (string-append "Peak = " (->str g) ", Freq = " (->str f))))
 )
 
 (node 5 "Script" "colors" (pos 50.0 350.0)
@@ -84,26 +89,30 @@
       (draw-text 100 50 "blue"   "#3498db" 11)
       (draw-text 150 50 "orange" "#f39c12" 11)))
 
-  # Color Swatch
-
-  @(render swatch)
+  (render
+    (bold "Color Swatch")
+    swatch)
 )
 
 (node 6 "Script" "synth app" (pos 300.0 350.0)
 
-  (define counter 0)
+  (define-module (node synth-app)
+    (use-module (node controls))
+    (use-module (node wave)))
+
+  (define counter (state 'counter 0))
 
   (on-message (lambda (msg)
     (case (car msg)
-      ('increment (set! counter (+ counter 1)))
-      ('decrement (set! counter (- counter 1))))))
+      ('increment (set-state! 'counter (+ counter 1)))
+      ('decrement (set-state! 'counter (- counter 1))))))
 
   (open-window "Synth")
 
   (row
     (group
       (bold "Controls")
-      (node-widgets 'controls)
+      (node-widgets controls)
       (hr)
       (interactive
         (on 'click '(increment))
@@ -114,12 +123,5 @@
       (text (string-append "Counter: " (number->string counter))))
     (group
       (bold "Oscilloscope")
-      (node-blocks 'wave)))
+      (node-blocks wave)))
 )
-
-;;; --- connections ---
-
-(connection 1 (from 1 "gain") (to 2 "gain"))
-(connection 2 (from 1 "freq") (to 2 "freq"))
-(connection 3 (from 3 "gain") (to 4 "gain"))
-(connection 4 (from 3 "freq") (to 4 "freq"))

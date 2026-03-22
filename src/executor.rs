@@ -234,7 +234,7 @@ mod tests {
         }
     }
 
-    fn make_graph(nodes: Vec<Node>, connections: Vec<(NodeId, &str, NodeId, &str)>) -> Graph {
+    fn make_graph(nodes: Vec<Node>) -> Graph {
         let mut graph = Graph::new();
         for node in nodes {
             let id = node.id;
@@ -242,9 +242,6 @@ mod tests {
             if id >= graph.next_node_id {
                 graph.next_node_id = id + 1;
             }
-        }
-        for (from_node, from_port, to_node, to_port) in connections {
-            graph.add_connection(from_node, from_port.to_string(), to_node, to_port.to_string());
         }
         graph
     }

@@ -161,10 +161,16 @@ fn read_token(src: &str, pos: usize) -> (&str, usize) {
     (&src[start..i], i)
 }
 
+/// Parsed legacy connection for backward compat conversion.
+struct LegacyConnection {
+    from_node: u64,
+    to_node: u64,
+}
+
 fn parse_scm(src: &str) -> Result<Graph> {
     let mut graph = Graph::new();
     let mut max_node_id: u64 = 0;
-    let mut max_conn_id: u64 = 0;
+    let mut legacy_connections: Vec<LegacyConnection> = Vec::new();
 
     // Find all top-level ( ... ) forms
     let bytes = src.as_bytes();
@@ -199,9 +205,13 @@ fn parse_scm(src: &str) -> Result<Graph> {
                 graph.nodes.insert(node.id, node);
             }
             "connection" => {
-                let conn = parse_connection_form(form)?;
-                if conn.id > max_conn_id { max_conn_id = conn.id; }
-                graph.connections.push(conn);
+                // Backward compat: parse legacy connections, convert to imports
+                if let Ok(conn) = parse_connection_form(form) {
+                    legacy_connections.push(LegacyConnection {
+                        from_node: conn.from_node,
+                        to_node: conn.to_node,
+                    });
+                }
             }
             _ => {
                 log::warn!("Unknown top-level form: {}", tag);
@@ -212,7 +222,18 @@ fn parse_scm(src: &str) -> Result<Graph> {
     }
 
     graph.next_node_id = max_node_id + 1;
-    graph.next_conn_id = max_conn_id + 1;
+
+    // Convert legacy connections to imports in target node script_code
+    for lc in &legacy_connections {
+        if let Some(source_label) = graph.nodes.get(&lc.from_node).map(|n| n.label.replace(' ', "-")) {
+            if let Some(target_node) = graph.nodes.get_mut(&lc.to_node) {
+                let import_line = format!("(import (node {}))", source_label);
+                if !target_node.script_code.contains(&import_line) {
+                    target_node.script_code = format!("{}\n{}", import_line, target_node.script_code);
+                }
+            }
+        }
+    }
 
     Ok(graph)
 }
@@ -395,28 +416,27 @@ fn skip_ws_preserve_newlines(src: &str, pos: usize) -> usize {
     i
 }
 
-/// Parse (connection ID (from NODE "port") (to NODE "port"))
+/// Parse legacy (connection ID (from NODE "port") (to NODE "port"))
 fn parse_connection_form(form: &str) -> Result<Connection> {
     let mut p = skip_ws(form, 1); // skip '('
     let (_, p2) = read_token(form, p); // skip "connection"
     p = skip_ws(form, p2);
 
-    let (id_str, p2) = read_token(form, p);
-    let id: u64 = id_str.parse().map_err(|_| anyhow::anyhow!("Bad connection id: {}", id_str))?;
+    let (_id_str, p2) = read_token(form, p); // skip ID
     p = skip_ws(form, p2);
 
     // (from NODE "port")
     let from_end = find_sexp_end(form, p)
-        .ok_or_else(|| anyhow::anyhow!("Bad from in connection {}", id))?;
-    let (from_node, from_port) = parse_endpoint(&form[p..=from_end])?;
+        .ok_or_else(|| anyhow::anyhow!("Bad from in connection"))?;
+    let (from_node, _from_port) = parse_endpoint(&form[p..=from_end])?;
     p = skip_ws(form, from_end + 1);
 
     // (to NODE "port")
     let to_end = find_sexp_end(form, p)
-        .ok_or_else(|| anyhow::anyhow!("Bad to in connection {}", id))?;
-    let (to_node, to_port) = parse_endpoint(&form[p..=to_end])?;
+        .ok_or_else(|| anyhow::anyhow!("Bad to in connection"))?;
+    let (to_node, _to_port) = parse_endpoint(&form[p..=to_end])?;
 
-    Ok(Connection { id, from_node, from_port, to_node, to_port })
+    Ok(Connection { from_node, to_node, from_port: None, to_port: None })
 }
 
 /// Parse (from/to NODE "port") → (node_id, port_name)
@@ -491,16 +511,6 @@ fn serialize_scm(graph: &Graph) -> String {
         }
 
         out.push_str(")\n");
-    }
-
-    if !graph.connections.is_empty() {
-        out.push_str("\n;;; --- connections ---\n\n");
-        for conn in &graph.connections {
-            out.push_str(&format!(
-                "(connection {} (from {} {:?}) (to {} {:?}))\n",
-                conn.id, conn.from_node, conn.from_port, conn.to_node, conn.to_port
-            ));
-        }
     }
 
     out
@@ -594,7 +604,6 @@ mod tests {
 "#;
         let graph = parse_scm(src).unwrap();
         assert_eq!(graph.nodes.len(), 2);
-        assert_eq!(graph.connections.len(), 1);
         assert_eq!(graph.viewport_offset, [10.0, 20.0]);
         assert!((graph.viewport_zoom - 1.5).abs() < 0.01);
 
@@ -621,16 +630,10 @@ mod tests {
 
         let node2 = &graph.nodes[&2];
         assert_eq!(node2.template_name, "Script");
-        assert!(node2.input_values.is_empty());
-
-        let conn = &graph.connections[0];
-        assert_eq!(conn.from_node, 1);
-        assert_eq!(conn.from_port, "out");
-        assert_eq!(conn.to_node, 2);
-        assert_eq!(conn.to_port, "in");
+        // Legacy connection should have been converted to import in node2's code
+        assert!(node2.script_code.contains("(import (node hello))"));
 
         assert_eq!(graph.next_node_id, 3);
-        assert_eq!(graph.next_conn_id, 2);
     }
 
     #[test]
@@ -679,7 +682,6 @@ mod tests {
         let src = std::fs::read_to_string("demo.scm").unwrap();
         let graph = parse_scm(&src).unwrap();
         assert_eq!(graph.nodes.len(), 6);
-        assert_eq!(graph.connections.len(), 4);
 
         let wave = &graph.nodes[&4];
         assert_eq!(wave.label, "wave");

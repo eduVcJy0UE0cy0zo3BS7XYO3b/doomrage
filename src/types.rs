@@ -1,3 +1,4 @@
+use crate::scheme_engine::extract_imports;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -140,7 +141,6 @@ pub enum BuiltinKind {
 }
 
 pub type NodeId = u64;
-pub type ConnectionId = u64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
@@ -188,21 +188,19 @@ impl Node {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Dependency edge: port-level (Some port names) or node-level (None).
+#[derive(Debug, Clone)]
 pub struct Connection {
-    pub id: ConnectionId,
     pub from_node: NodeId,
-    pub from_port: String,
     pub to_node: NodeId,
-    pub to_port: String,
+    pub from_port: Option<String>,
+    pub to_port: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Graph {
     pub nodes: HashMap<NodeId, Node>,
-    pub connections: Vec<Connection>,
     pub next_node_id: NodeId,
-    pub next_conn_id: ConnectionId,
     pub viewport_offset: [f32; 2],
     pub viewport_zoom: f32,
 }
@@ -211,9 +209,7 @@ impl Graph {
     pub fn new() -> Self {
         Self {
             nodes: HashMap::new(),
-            connections: Vec::new(),
             next_node_id: 1,
-            next_conn_id: 1,
             viewport_offset: [0.0, 0.0],
             viewport_zoom: 1.0,
         }
@@ -256,83 +252,107 @@ impl Graph {
 
     pub fn remove_node(&mut self, id: NodeId) {
         self.nodes.remove(&id);
-        self.connections.retain(|c| c.from_node != id && c.to_node != id);
     }
 
-    pub fn add_connection(
-        &mut self,
-        from_node: NodeId,
-        from_port: String,
-        to_node: NodeId,
-        to_port: String,
-    ) -> ConnectionId {
-        // Remove existing connection to same input
-        self.connections
-            .retain(|c| !(c.to_node == to_node && c.to_port == to_port));
-
-        let id = self.next_conn_id;
-        self.next_conn_id += 1;
-        self.connections.push(Connection {
-            id,
-            from_node,
-            from_port,
-            to_node,
-            to_port,
-        });
-        id
+    /// Find node ID by sanitized label (spaces → hyphens).
+    pub fn find_node_by_import_label(&self, import_label: &str) -> Option<NodeId> {
+        self.nodes.iter().find_map(|(&id, n)| {
+            if n.label.replace(' ', "-") == import_label {
+                Some(id)
+            } else {
+                None
+            }
+        })
     }
 
-    pub fn remove_connection(&mut self, id: ConnectionId) {
-        self.connections.retain(|c| c.id != id);
+    /// Build import-based dependency edges: (source_id, target_id) for each import.
+    fn import_edges(&self) -> Vec<(NodeId, NodeId)> {
+        let mut edges = Vec::new();
+        for (&target_id, target_node) in &self.nodes {
+            for import_label in extract_imports(&target_node.script_code) {
+                if let Some(source_id) = self.find_node_by_import_label(&import_label) {
+                    edges.push((source_id, target_id));
+                }
+            }
+        }
+        edges
     }
 
-    pub fn input_connection(&self, node_id: NodeId, port: &str) -> Option<&Connection> {
-        self.connections
-            .iter()
-            .find(|c| c.to_node == node_id && c.to_port == port)
+    /// Derive connections on-the-fly from imports in script code.
+    /// Only port-level arrows (matching export→import port names).
+    /// No arrow if no ports match (UI-only dependency stays in code).
+    pub fn derived_connections(&self) -> Vec<Connection> {
+        let mut conns = Vec::new();
+        for (source_id, target_id) in self.import_edges() {
+            if let (Some(src), Some(tgt)) = (self.nodes.get(&source_id), self.nodes.get(&target_id)) {
+                for out_port in &src.script_outputs {
+                    for in_port in &tgt.script_inputs {
+                        if out_port.name == in_port.name {
+                            conns.push(Connection {
+                                from_node: source_id,
+                                to_node: target_id,
+                                from_port: Some(out_port.name.clone()),
+                                to_port: Some(in_port.name.clone()),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        conns
     }
 
-    /// Resolve ALL connections to a node without requiring eff_inputs.
-    /// Starts from node's input_values, overrides with connected upstream outputs.
+    /// Resolve available inputs for a node.
+    /// Includes widget_values + all upstream output values from imported nodes.
     pub fn resolve_all_input_values(&self, node_id: NodeId) -> HashMap<String, Value> {
         let node = match self.nodes.get(&node_id) {
             Some(n) => n,
             None => return HashMap::new(),
         };
+
         let mut vals = node.input_values.clone();
-        for conn in &self.connections {
-            if conn.to_node == node_id {
-                if let Some(src) = self.nodes.get(&conn.from_node) {
-                    if let Some(val) = src.output_values.get(&conn.from_port) {
-                        vals.insert(conn.to_port.clone(), val.clone());
+
+        // Add upstream output values from imported nodes
+        for import_label in extract_imports(&node.script_code) {
+            if let Some(source_id) = self.find_node_by_import_label(&import_label) {
+                if let Some(src) = self.nodes.get(&source_id) {
+                    for (out_name, out_val) in &src.output_values {
+                        vals.insert(out_name.clone(), out_val.clone());
                     }
                 }
             }
         }
+
+        // Widget values override
+        for (k, v) in &node.widget_values {
+            vals.insert(k.clone(), v.clone());
+        }
+
         vals
     }
 
-    /// Resolve input values for a node: start from node's input_values,
-    /// override with connected upstream outputs.
-    pub fn resolve_input_values(&self, node_id: NodeId, eff_inputs: &[PortDef]) -> HashMap<String, Value> {
+    /// Check if a node has a connected input for a given port name.
+    pub fn is_port_connected(&self, node_id: NodeId, port_name: &str) -> bool {
         let node = match self.nodes.get(&node_id) {
             Some(n) => n,
-            None => return HashMap::new(),
+            None => return false,
         };
-        let mut vals = node.input_values.clone();
-        for port in eff_inputs {
-            if let Some(conn) = self.input_connection(node_id, &port.name) {
-                if let Some(src) = self.nodes.get(&conn.from_node) {
-                    if let Some(val) = src.output_values.get(&conn.from_port) {
-                        vals.insert(port.name.clone(), val.clone());
+        for import_label in extract_imports(&node.script_code) {
+            if let Some(source_id) = self.find_node_by_import_label(&import_label) {
+                if let Some(src) = self.nodes.get(&source_id) {
+                    if src.output_values.contains_key(port_name)
+                        || src.script_outputs.iter().any(|p| p.name == port_name)
+                    {
+                        return true;
                     }
                 }
             }
         }
-        vals
+        false
     }
 
     pub fn topological_sort(&self) -> Result<Vec<NodeId>, Vec<NodeId>> {
+        let edges = self.import_edges();
         let mut in_degree: HashMap<NodeId, usize> = HashMap::new();
         let mut adjacency: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
 
@@ -341,12 +361,9 @@ impl Graph {
             adjacency.entry(*id).or_default();
         }
 
-        for conn in &self.connections {
-            *in_degree.entry(conn.to_node).or_insert(0) += 1;
-            adjacency
-                .entry(conn.from_node)
-                .or_default()
-                .push(conn.to_node);
+        for (from, to) in &edges {
+            *in_degree.entry(*to).or_insert(0) += 1;
+            adjacency.entry(*from).or_default().push(*to);
         }
 
         let mut queue: Vec<NodeId> = in_degree
@@ -385,21 +402,19 @@ impl Graph {
     }
 
     /// Find all ancestor nodes (transitive upstream) of the given node, including itself.
-    /// Returns them in topological order.
     pub fn ancestors_sorted(&self, target: NodeId) -> Vec<NodeId> {
+        let edges = self.import_edges();
         let mut needed: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
         let mut stack = vec![target];
         while let Some(id) = stack.pop() {
             if needed.insert(id) {
-                for conn in &self.connections {
-                    if conn.to_node == id {
-                        stack.push(conn.from_node);
+                for (from, to) in &edges {
+                    if *to == id {
+                        stack.push(*from);
                     }
                 }
             }
         }
-
-        // Topological sort of just the needed subset
         match self.topological_sort() {
             Ok(order) => order.into_iter().filter(|id| needed.contains(id)).collect(),
             Err(_) => needed.into_iter().collect(),
@@ -407,23 +422,37 @@ impl Graph {
     }
 
     /// Find all descendant nodes (transitive downstream) of the given node, excluding itself.
-    /// Returns them in topological order.
     pub fn descendants_sorted(&self, source: NodeId) -> Vec<NodeId> {
+        let edges = self.import_edges();
         let mut needed: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
         let mut stack = vec![source];
         while let Some(id) = stack.pop() {
-            for conn in &self.connections {
-                if conn.from_node == id && needed.insert(conn.to_node) {
-                    stack.push(conn.to_node);
+            for (from, to) in &edges {
+                if *from == id && needed.insert(*to) {
+                    stack.push(*to);
                 }
             }
         }
         needed.remove(&source);
-
         match self.topological_sort() {
             Ok(order) => order.into_iter().filter(|id| needed.contains(id)).collect(),
             Err(_) => needed.into_iter().collect(),
         }
+    }
+
+    /// Find direct downstream node IDs that import the given node.
+    pub fn direct_downstream(&self, source_id: NodeId) -> Vec<NodeId> {
+        let source_label = match self.nodes.get(&source_id) {
+            Some(n) => n.label.replace(' ', "-"),
+            None => return Vec::new(),
+        };
+        let mut result = Vec::new();
+        for (&id, node) in &self.nodes {
+            if id != source_id && extract_imports(&node.script_code).contains(&source_label) {
+                result.push(id);
+            }
+        }
+        result
     }
 }
 

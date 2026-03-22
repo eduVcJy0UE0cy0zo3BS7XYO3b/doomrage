@@ -30,7 +30,7 @@ const CANVAS_RENDER_LIB: &str = r#"
           button checkbox text-input editable-list
           json-null
           canvas draw-line draw-rect draw-circle draw-polyline draw-text
-          row group node-view node-blocks node-widgets node-widget
+          row group node-blocks node-widgets
           interactive on)
   (import (rnrs))
 
@@ -122,10 +122,8 @@ const CANVAS_RENDER_LIB: &str = r#"
   ;; Layout & composition
   (define (row . items) (list 'render-row items))
   (define (group . items) (list 'render-frame items))
-  (define (node-view label) (list 'render-node-view label))
   (define (node-blocks label) (list 'render-node-blocks label))
   (define (node-widgets label) (list 'render-node-widgets label))
-  (define (node-widget label name) (list 'render-node-widget label name))
 
   ;; Event handling
   (define (on event-type message) (list 'event (symbol->string event-type) message))
@@ -372,6 +370,138 @@ const CANVAS_SCRIBBLE_LIB: &str = r###"
 )
 "###;
 
+/// Extract `(import (node X))` labels from script code textually, without eval.
+/// Module header parsed from `(define-module ...)` in node script code.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleHeader {
+    pub name: String,
+    pub exports: Vec<String>,
+    pub imports: Vec<String>,
+}
+
+/// Parse `(define-module ...)` header from script code textually.
+/// Returns None if no define-module found.
+///
+/// Format:
+/// ```scheme
+/// (define-module (node controls)
+///   (export gain freq)
+///   (use-module (node wave))
+///   (use-module (node gateway-in)))
+/// ```
+pub fn parse_module_header(code: &str) -> Option<ModuleHeader> {
+    let dm_start = code.find("(define-module")?;
+    // Find the matching closing paren for the define-module form
+    let dm_end = find_matching_paren(code, dm_start)?;
+    let form = &code[dm_start..=dm_end];
+
+    let mut header = ModuleHeader::default();
+
+    // Parse (node X) → name
+    if let Some(pos) = form.find("(node ") {
+        let after = pos + 6;
+        if let Some(end) = form[after..].find(')') {
+            header.name = form[after..after + end].trim().to_string();
+        }
+    }
+
+    // Parse (export sym1 sym2 ...)
+    if let Some(pos) = form.find("(export ") {
+        let after = pos + 8;
+        if let Some(end) = form[after..].find(')') {
+            let syms = &form[after..after + end];
+            header.exports = syms.split_whitespace().map(|s| s.to_string()).collect();
+        }
+    }
+
+    // Parse (use-module (node X)) — may appear multiple times
+    let pat = "(use-module (node ";
+    let mut start = 0;
+    while let Some(pos) = form[start..].find(pat) {
+        let abs = start + pos + pat.len();
+        if let Some(end) = form[abs..].find("))") {
+            let label = form[abs..abs + end].trim();
+            if !label.is_empty() {
+                header.imports.push(label.to_string());
+            }
+        }
+        start = abs;
+    }
+
+    Some(header)
+}
+
+/// Find the closing paren matching the opening paren at `start`.
+fn find_matching_paren(code: &str, start: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    let mut depth = 0i32;
+    let mut i = start;
+    let mut in_string = false;
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' { i += 2; continue; }
+            if bytes[i] == b'"' { in_string = false; }
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'"' => { in_string = true; i += 1; }
+            b';' => { while i < bytes.len() && bytes[i] != b'\n' { i += 1; } }
+            b'(' => { depth += 1; i += 1; }
+            b')' => {
+                depth -= 1;
+                if depth == 0 { return Some(i); }
+                i += 1;
+            }
+            _ => { i += 1; }
+        }
+    }
+    None
+}
+
+/// Extract import labels from code. Supports both:
+/// - `(define-module ... (use-module (node X)))` headers
+/// - Legacy `(import (node X))` in body
+pub fn extract_imports(code: &str) -> Vec<String> {
+    if let Some(header) = parse_module_header(code) {
+        return header.imports;
+    }
+    // Fallback: legacy (import (node X)) pattern
+    let mut labels = Vec::new();
+    let pat = "(import (node ";
+    let mut start = 0;
+    while let Some(pos) = code[start..].find(pat) {
+        let abs = start + pos + pat.len();
+        if let Some(end) = code[abs..].find("))") {
+            let label = code[abs..abs + end].trim();
+            if !label.is_empty() {
+                labels.push(label.to_string());
+            }
+        }
+        start = abs;
+    }
+    labels
+}
+
+/// Strip `(define-module ...)` form from code, returning the body.
+/// Also returns import statements to prepend.
+pub fn strip_module_header(code: &str) -> (String, Vec<String>) {
+    if let Some(header) = parse_module_header(code) {
+        let dm_start = code.find("(define-module").unwrap();
+        let dm_end = find_matching_paren(code, dm_start).unwrap();
+        let before = &code[..dm_start];
+        let after = &code[dm_end + 1..];
+        let body = format!("{}{}", before.trim_end(), after);
+        // Generate (import (node X)) statements from use-module
+        let imports: Vec<String> = header.imports.iter()
+            .map(|label| format!("(import (node {}))", label))
+            .collect();
+        (body.trim_start_matches('\n').to_string(), imports)
+    } else {
+        (code.to_string(), Vec::new())
+    }
+}
+
 pub struct SchemeEngine {
     pub runtime: Runtime,
     env: TopLevelEnvironment,
@@ -446,6 +576,15 @@ impl SchemeEngine {
             (define (mailbox-count) (actor-mailbox-count))
             (define (self-send method . args) (actor-self-send-msg method args))
             (define (open-window title) (actor-open-window title))
+            (define (__state-key name)
+              (string-append "__s:" (number->string (node-id)) ":" (symbol->string name)))
+            (define (state name default)
+              (let ((key (__state-key name)))
+                (let ((v (store-get key)))
+                  (if (equal? v "") default v))))
+            (define (set-state! name value)
+              (store-set! (__state-key name) value)
+              value)
             (define __actor-msg-handler #f)
             (define (on-message handler)
               (actor-register-handler)
@@ -490,6 +629,27 @@ impl SchemeEngine {
         "#)
             .map_err(|e| anyhow::anyhow!("Failed to define port wrappers in REPL env: {}", e))?;
         Ok(env)
+    }
+
+    /// Register stub libraries for all nodes with define-module headers.
+    /// All exports get `<compute>` sentinel values. This ensures (import (node X))
+    /// never fails, even before first compute.
+    pub fn register_stub_libraries(&self, nodes: &std::collections::HashMap<crate::types::NodeId, crate::types::Node>) {
+        for (node_id, node) in nodes {
+            if let Some(header) = parse_module_header(&node.script_code) {
+                if header.exports.is_empty() && header.name.is_empty() {
+                    continue;
+                }
+                // Use existing output_values if available, otherwise 0.0 defaults
+                let mut stub_outputs = std::collections::HashMap::new();
+                for export_name in &header.exports {
+                    let val = node.output_values.get(export_name).cloned()
+                        .unwrap_or(crate::types::Value::F64(0.0));
+                    stub_outputs.insert(export_name.clone(), val);
+                }
+                self.register_node_library_named(*node_id, Some(&header.name), &stub_outputs);
+            }
+        }
     }
 
     /// Eval code in a given REPL env (persistent across calls).
@@ -564,9 +724,28 @@ impl SchemeEngine {
         if let Some(label) = label {
             let safe_label = label.replace(' ', "-");
             if !safe_label.is_empty() {
+                // Add self-reference: (import (node controls)) gives binding `controls` = "controls"
+                let self_ref_export = if exports.contains(&safe_label) {
+                    String::new() // avoid conflict with output of same name
+                } else {
+                    format!(" {}", safe_label)
+                };
+                let self_ref_define = if exports.contains(&safe_label) {
+                    String::new()
+                } else {
+                    format!(" (define {} \"{}\")", safe_label, safe_label)
+                };
+                // Export <label>-widgets and <label>-blocks as render block values
+                let widgets_name = format!("{}-widgets", safe_label);
+                let blocks_name = format!("{}-blocks", safe_label);
+                let extra_exports = format!(" {} {}", widgets_name, blocks_name);
+                let extra_defines = format!(
+                    " (define {} (list 'render-node-widgets \"{}\")) (define {} (list 'render-node-blocks \"{}\"))",
+                    widgets_name, safe_label, blocks_name, safe_label
+                );
                 let label_lib = format!(
-                    "(library (node {}) (export {}) (import (rnrs)) {})",
-                    safe_label, export_str, define_str
+                    "(library (node {}) (export {}{}{}) (import (rnrs)) {}{}{})",
+                    safe_label, export_str, self_ref_export, extra_exports, define_str, self_ref_define, extra_defines
                 );
                 if let Err(e) = self.runtime.def_lib(&label_lib) {
                     log::warn!("Failed to register node label '{}' library: {}", label, e);
@@ -645,10 +824,26 @@ impl SchemeEngine {
                 continue;
             }
             let is_import = trimmed.starts_with("(import ");
-            let r = env
-                .eval(is_import, trimmed)
-                .map_err(|e| anyhow::anyhow!("Eval failed: {}", e))?;
-            results.extend(r);
+            let is_node_import = is_import && trimmed.contains("(node ");
+            match env.eval(is_import, trimmed) {
+                Ok(r) => results.extend(r),
+                Err(e) if is_node_import => {
+                    // Gracefully skip node imports if module not registered yet.
+                    // Define fallback bindings for label, label-widgets, label-blocks.
+                    log::debug!("Node import skipped: {}", e);
+                    if let Some(label) = trimmed
+                        .strip_prefix("(import (node ")
+                        .and_then(|s| s.strip_suffix("))"))
+                    {
+                        let label = label.trim();
+                        let _ = env.eval(false, &format!(
+                            "(define {} \"{}\") (define {}-widgets (list 'render-node-widgets \"{}\")) (define {}-blocks (list 'render-node-blocks \"{}\"))",
+                            label, label, label, label, label, label
+                        ));
+                    }
+                }
+                Err(e) => return Err(anyhow::anyhow!("Eval failed: {}", e)),
+            }
         }
         Ok(results)
     }
@@ -668,7 +863,7 @@ impl SchemeEngine {
         db: Option<&crate::db::Db>,
         code: &str,
     ) -> Result<ScriptResult> {
-        let (result, _env) = self.execute_script_cached(None, available_inputs, db, code, &[])?;
+        let (result, _env, _preprocessed) = self.execute_script_cached(None, available_inputs, db, code, &[])?;
         Ok(result)
     }
 
@@ -682,25 +877,40 @@ impl SchemeEngine {
         db: Option<&crate::db::Db>,
         code: &str,
         connected_modules: &[String],
-    ) -> Result<(ScriptResult, TopLevelEnvironment)> {
-        let env = cached_env.unwrap_or_else(|| self.make_env());
+    ) -> Result<(ScriptResult, TopLevelEnvironment, String)> {
+        let _ = connected_modules;
 
-        // Auto-import connected node modules
-        for module_label in connected_modules {
-            let import_stmt = format!("(import (node {}))", module_label);
-            // Gracefully skip if module not registered yet (source not computed)
-            if let Err(e) = env.eval(true, &import_stmt) {
-                log::debug!("Auto-import (node {}) skipped: {}", module_label, e);
+        // Parse module header if present
+        let module_header = parse_module_header(code);
+
+        // Nodes with module imports need fresh env each time —
+        // R6RS library imports are static, so cached env has stale bindings.
+        let has_imports = module_header.as_ref().map_or(false, |h| !h.imports.is_empty());
+        let env = if has_imports {
+            self.make_env()
+        } else {
+            cached_env.unwrap_or_else(|| self.make_env())
+        };
+
+        // Strip define-module, prepend imports as R6RS (import ...) statements
+        let eval_code = if module_header.is_some() {
+            let (body, import_stmts) = strip_module_header(code);
+            let mut full = String::new();
+            for stmt in &import_stmts {
+                full.push_str(stmt);
+                full.push('\n');
             }
-        }
-
-        let stripped = self.preprocess_code(&env, code)?;
+            full.push_str(&body);
+            full
+        } else {
+            code.to_string()
+        };
 
         // Eval with port context, each top-level form separately
         let (eval_result, port_registry) = crate::bridge::with_port_context(
             Some(available_inputs),
             || {
-                let eval_fn = || Self::eval_forms(&env, &stripped);
+                let eval_fn = || Self::eval_forms(&env, &eval_code);
                 if let Some(db) = db {
                     crate::bridge::with_db_context(db, eval_fn)
                 } else {
@@ -717,11 +927,31 @@ impl SchemeEngine {
             }
         }
 
-        let (declared_inputs, declared_outputs, widget_decls) =
-            (port_registry.inputs, port_registry.outputs, port_registry.widgets);
+        // Determine output names: from module header exports, or legacy PortRegistry
+        let (declared_inputs, declared_outputs, widget_decls);
+        let output_names: Vec<String>;
+        if let Some(ref header) = module_header {
+            declared_inputs = Vec::new();
+            // Exports from header — widgets also register outputs via bridge
+            let mut exports = header.exports.clone();
+            // Add widget-declared outputs not already in exports
+            for (name, _) in &port_registry.outputs {
+                if !exports.contains(name) {
+                    exports.push(name.clone());
+                }
+            }
+            declared_outputs = exports.iter().map(|n| (n.clone(), "f64".to_string())).collect();
+            output_names = exports;
+            widget_decls = port_registry.widgets;
+        } else {
+            // Legacy: use PortRegistry
+            declared_inputs = port_registry.inputs;
+            declared_outputs = port_registry.outputs.clone();
+            output_names = port_registry.outputs.iter().map(|(name, _)| name.clone()).collect();
+            widget_decls = port_registry.widgets;
+        };
 
         // Collect output values by name from environment
-        let output_names: Vec<String> = declared_outputs.iter().map(|(name, _)| name.clone()).collect();
         let mut output_values = HashMap::new();
         for name in &output_names {
             if let Ok(vals) = env.eval(false, name) {
@@ -755,7 +985,70 @@ impl SchemeEngine {
             recompute_requests,
             has_message_handler,
             window_title,
-        }, env))
+        }, env, eval_code))
+    }
+
+    /// Re-eval using already preprocessed code (skip Scribble preprocessing).
+    pub fn eval_preprocessed(
+        &self,
+        env: &TopLevelEnvironment,
+        available_inputs: &HashMap<String, crate::types::Value>,
+        db: Option<&crate::db::Db>,
+        preprocessed: &str,
+    ) -> Result<ScriptResult> {
+        let (eval_result, port_registry) = crate::bridge::with_port_context(
+            Some(available_inputs),
+            || {
+                let eval_fn = || Self::eval_forms(env, preprocessed);
+                if let Some(db) = db {
+                    crate::bridge::with_db_context(db, eval_fn)
+                } else {
+                    eval_fn()
+                }
+            },
+        );
+        let results = eval_result?;
+
+        let mut render_blocks = Vec::new();
+        for val in &results {
+            if let Some(blocks) = try_parse_render_from_value(val) {
+                render_blocks.extend(blocks);
+            }
+        }
+
+        let (declared_inputs, declared_outputs, widget_decls) =
+            (port_registry.inputs, port_registry.outputs, port_registry.widgets);
+
+        let mut output_values = HashMap::new();
+        let output_names: Vec<String> = declared_outputs.iter().map(|(name, _)| name.clone()).collect();
+        for name in &output_names {
+            if let Ok(vals) = env.eval(false, name) {
+                if let Some(val) = vals.first() {
+                    output_values.insert(name.clone(), scheme_value_to_types_value(val));
+                }
+            }
+        }
+
+        let net_publishes = crate::bridge::take_net_publishes();
+        let tick_interval_ms = crate::bridge::take_tick_interval();
+        let ocapn_sends = crate::bridge::take_ocapn_sends();
+        let recompute_requests = crate::bridge::take_recompute_requests();
+        let has_message_handler = crate::bridge::take_has_message_handler();
+        let window_title = crate::bridge::take_window_title();
+
+        Ok(ScriptResult {
+            output_values,
+            render_blocks,
+            declared_inputs,
+            declared_outputs,
+            widget_decls,
+            net_publishes,
+            tick_interval_ms,
+            ocapn_sends,
+            recompute_requests,
+            has_message_handler,
+            window_title,
+        })
     }
 
     /// Fast path: drain messages via handler in an existing env, without full re-eval.
@@ -808,8 +1101,6 @@ impl SchemeEngine {
     ) -> Result<ScriptResult> {
         let env = self.make_env();
 
-        let stripped = self.preprocess_code(&env, code)?;
-
         env.eval(true, "(import (canvas preview))")
             .map_err(|e| anyhow::anyhow!("Preview import failed: {}", e))?;
         env.eval(false, r#"
@@ -826,7 +1117,7 @@ impl SchemeEngine {
         let (eval_result, _port_registry) = crate::bridge::with_port_context(
             None,
             || {
-                let eval_fn = || Self::eval_forms(&env, &stripped);
+                let eval_fn = || Self::eval_forms(&env, code);
                 if let Some(db) = db {
                     crate::bridge::with_db_context(db, eval_fn)
                 } else {
@@ -905,6 +1196,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_parse_module_header() {
+        let code = r#"
+(define-module (node controls)
+  (export gain freq))
+
+(define gain 50.0)
+"#;
+        let header = parse_module_header(code).unwrap();
+        assert_eq!(header.name, "controls");
+        assert_eq!(header.exports, vec!["gain", "freq"]);
+        assert!(header.imports.is_empty());
+
+        let code2 = r#"
+(define-module (node wave)
+  (use-module (node controls))
+  (use-module (node gateway-in))
+  (export osc))
+"#;
+        let header2 = parse_module_header(code2).unwrap();
+        assert_eq!(header2.name, "wave");
+        assert_eq!(header2.exports, vec!["osc"]);
+        assert_eq!(header2.imports, vec!["controls", "gateway-in"]);
+
+        // No define-module
+        assert!(parse_module_header("(define x 1)").is_none());
+    }
+
+    #[test]
+    fn test_strip_module_header() {
+        let code = "(define-module (node test)\n  (use-module (node foo))\n  (export bar))\n\n(define bar 42)";
+        let (body, imports) = strip_module_header(code);
+        assert!(!body.contains("define-module"));
+        assert!(body.contains("(define bar 42)"));
+        assert_eq!(imports, vec!["(import (node foo))"]);
+    }
+
+    #[test]
+    fn test_extract_imports() {
+        let code = r#"
+(import (node controls))
+(define gain (input 'gain 'f64))
+(import (node gateway-in))
+"#;
+        let imports = extract_imports(code);
+        assert_eq!(imports, vec!["controls", "gateway-in"]);
+
+        assert!(extract_imports("(define x 1)").is_empty());
+        assert_eq!(extract_imports("(import (node foo-bar))"), vec!["foo-bar"]);
+    }
+
+    #[test]
     fn test_scribble_preprocess() {
         let engine = SchemeEngine::new().unwrap();
         let env = engine.make_env();
@@ -975,11 +1317,11 @@ The result is @result.
         let engine = SchemeEngine::new().unwrap();
         let db = crate::db::Db::new().unwrap();
         db.kv_set("gain", serde_json::json!(2.0));
-        // define from store-get, then reference in Scribble render block
+        // define from store-get, then reference in render call
         let result = engine.execute_script(
             &HashMap::new(),
             Some(&db),
-            "(define gain (store-get \"gain\"))\n\n# Result\n\nGain is @gain.",
+            "(define gain (store-get \"gain\"))\n(render (text (string-append \"Gain is \" (->str gain))))",
         ).unwrap();
         assert!(!result.render_blocks.is_empty());
         let has_gain = result.render_blocks.iter().any(|b|
@@ -1281,9 +1623,9 @@ The result is @result.
     }
 
     #[test]
-    fn test_scribble_to_render_pipeline() {
+    fn test_scheme_render_pipeline() {
         let engine = SchemeEngine::new().unwrap();
-        let code = "(define x (input 'x 'f64))\n(define result (output 'result 'f64))\n(set! result (* x 2))\n\n# Title\n\nResult is @result.";
+        let code = "(define x (input 'x 'f64))\n(define result (output 'result 'f64))\n(set! result (* x 2))\n(render (bold \"Title\") (text (string-append \"Result is \" (->str result))))";
         let result = engine.execute_script(
             &inputs(&[("x", 5.0)]),
             None,

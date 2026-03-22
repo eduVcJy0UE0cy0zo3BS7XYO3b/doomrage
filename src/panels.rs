@@ -161,6 +161,7 @@ pub fn draw_inspector(
     db: &Db,
     is_computing: bool,
     debug_log: &mut DebugLog,
+    window_title: Option<&str>,
 ) -> Vec<PanelAction> {
     let mut actions = Vec::new();
 
@@ -238,7 +239,7 @@ pub fn draw_inspector(
                         ui.add_space(4.0);
                         ui.label(RichText::new("Inputs").color(TEXT_DIM));
                         for port in &template.inputs {
-                            let connected = graph.input_connection(node_id, &port.name).is_some();
+                            let connected = graph.is_port_connected(node_id, &port.name);
                             if connected {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(&port.name).color(TEXT_DIM));
@@ -313,11 +314,27 @@ pub fn draw_inspector(
                                     _ => {}
                                 }
                             }
-                            if !node.widget_decls.is_empty() && !node.render_blocks.is_empty() {
-                                ui.separator();
-                            }
-                            if draw_render_blocks_interactive(ui, &node.render_blocks, db, debug_log, None, Some(node_id), &mut actions) {
-                                actions.push(PanelAction::RecomputeSelected);
+                            if let Some(title) = window_title {
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("⬜").color(ACCENT));
+                                    ui.label(RichText::new(format!("Window: {}", title)).color(TEXT));
+                                });
+                            } else if has_composition_blocks(&node.render_blocks) {
+                                // Blocks contain composition (row, node-blocks, etc.)
+                                // meant for a window, not the inspector
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("Window closed").color(TEXT_DIM).italics());
+                                if ui.button(RichText::new("  Reopen  ").color(ACCENT)).clicked() {
+                                    actions.push(PanelAction::ComputeNode(node_id));
+                                }
+                            } else {
+                                if !node.widget_decls.is_empty() && !node.render_blocks.is_empty() {
+                                    ui.separator();
+                                }
+                                if draw_render_blocks_interactive(ui, &node.render_blocks, db, debug_log, None, Some(node_id), &mut actions) {
+                                    actions.push(PanelAction::RecomputeSelected);
+                                }
                             }
                         }
                     }
@@ -328,7 +345,7 @@ pub fn draw_inspector(
                 ui.label(RichText::new("Inputs").color(TEXT_DIM));
 
                 for port in &template.inputs {
-                    let connected = graph.input_connection(node_id, &port.name).is_some();
+                    let connected = graph.is_port_connected(node_id, &port.name);
                     if connected {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(&port.name).color(TEXT_DIM));
@@ -780,14 +797,14 @@ fn draw_render_blocks_full(
             }
             RenderBlock::NodeWidgets { label } => {
                 if let Some(node) = graph.and_then(|g| find_node_by_label(g, label)) {
-                    draw_node_widgets(ui, node, graph.unwrap(), &mut store_mutated, db, debug_log);
+                    draw_node_widgets_interactive(ui, node, &mut store_mutated, actions_out);
                 } else {
                     ui.label(RichText::new(format!("node '{}' not found", label)).color(TEXT_DIM).italics());
                 }
             }
             RenderBlock::NodeWidget { label, widget_name } => {
                 if let Some(node) = graph.and_then(|g| find_node_by_label(g, label)) {
-                    draw_single_node_widget(ui, node, widget_name, &mut store_mutated);
+                    draw_single_node_widget_interactive(ui, node, widget_name, &mut store_mutated, actions_out);
                 } else {
                     ui.label(RichText::new(format!("node '{}' not found", label)).color(TEXT_DIM).italics());
                 }
@@ -819,6 +836,19 @@ fn draw_render_blocks_full(
 }
 
 /// If value is a kv key, resolve to current value; otherwise return as-is
+fn has_composition_blocks(blocks: &[RenderBlock]) -> bool {
+    blocks.iter().any(|b| matches!(b,
+        RenderBlock::NodeView { .. }
+        | RenderBlock::NodeBlocks { .. }
+        | RenderBlock::NodeWidgets { .. }
+        | RenderBlock::NodeWidget { .. }
+        | RenderBlock::Row(_)
+    ) || match b {
+        RenderBlock::Group(inner) | RenderBlock::Frame(inner) => has_composition_blocks(inner),
+        _ => false,
+    })
+}
+
 fn find_node_by_label<'a>(graph: &'a Graph, label: &str) -> Option<&'a Node> {
     // Try exact match first, then match with spaces→hyphens
     graph.nodes.values().find(|n| n.label == label)
@@ -833,8 +863,17 @@ fn draw_node_widgets(
     _db: &Db,
     _debug_log: &mut DebugLog,
 ) {
+    draw_node_widgets_interactive(ui, node, store_mutated, &mut Vec::new());
+}
+
+fn draw_node_widgets_interactive(
+    ui: &mut egui::Ui,
+    node: &Node,
+    store_mutated: &mut bool,
+    actions_out: &mut Vec<PanelAction>,
+) {
     for wdecl in &node.widget_decls {
-        draw_single_node_widget(ui, node, &wdecl.name, store_mutated);
+        draw_single_node_widget_interactive(ui, node, &wdecl.name, store_mutated, actions_out);
     }
 }
 
@@ -842,7 +881,17 @@ fn draw_single_node_widget(
     ui: &mut egui::Ui,
     node: &Node,
     widget_name: &str,
+    store_mutated: &mut bool,
+) {
+    draw_single_node_widget_interactive(ui, node, widget_name, store_mutated, &mut Vec::new());
+}
+
+fn draw_single_node_widget_interactive(
+    ui: &mut egui::Ui,
+    node: &Node,
+    widget_name: &str,
     _store_mutated: &mut bool,
+    actions_out: &mut Vec<PanelAction>,
 ) {
     if let Some(wdecl) = node.widget_decls.iter().find(|w| w.name == widget_name) {
         let current = node.widget_values.get(&wdecl.name)
@@ -855,13 +904,21 @@ fn draw_single_node_widget(
                 let mut val = current;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&wdecl.name).color(TEXT_DIM));
-                    ui.add(egui::Slider::new(&mut val, min..=max));
+                    if ui.add(egui::Slider::new(&mut val, min..=max)).changed() {
+                        actions_out.push(PanelAction::UpdateWidget(
+                            node.id, wdecl.name.clone(), Value::F64(val),
+                        ));
+                    }
                 });
-                // Note: read-only display — widget interaction goes through inspector/window
             }
             "checkbox" => {
                 let mut checked = current != 0.0;
-                ui.checkbox(&mut checked, RichText::new(&wdecl.name).color(TEXT));
+                if ui.checkbox(&mut checked, RichText::new(&wdecl.name).color(TEXT)).changed() {
+                    actions_out.push(PanelAction::UpdateWidget(
+                        node.id, wdecl.name.clone(),
+                        Value::F64(if checked { 1.0 } else { 0.0 }),
+                    ));
+                }
             }
             _ => {}
         }

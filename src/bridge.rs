@@ -375,11 +375,19 @@ fn bridge_connect(
     to: &Value, to_port: &Value,
 ) -> Result<Vec<Value>, Exception> {
     let from_id = from.cast_to_scheme_type::<f64>().unwrap_or(0.0) as NodeId;
-    let from_port_name = value_to_string(from_port);
+    let _from_port_name = value_to_string(from_port);
     let to_id = to.cast_to_scheme_type::<f64>().unwrap_or(0.0) as NodeId;
-    let to_port_name = value_to_string(to_port);
+    let _to_port_name = value_to_string(to_port);
     with_graph(|graph, _| {
-        graph.add_connection(from_id, from_port_name, to_id, to_port_name);
+        // Insert (import (node <label>)) into target node's script_code
+        if let Some(source_label) = graph.nodes.get(&from_id).map(|n| n.label.replace(' ', "-")) {
+            if let Some(target_node) = graph.nodes.get_mut(&to_id) {
+                let import_line = format!("(import (node {}))", source_label);
+                if !target_node.script_code.contains(&import_line) {
+                    target_node.script_code = format!("{}\n{}", import_line, target_node.script_code);
+                }
+            }
+        }
     })?;
     Ok(vec![Value::null()])
 }
@@ -631,7 +639,7 @@ fn syrup_value_to_scheme(sv: &SyrupValue) -> Value {
         SyrupValue::Integer(i) => Value::from(*i as f64),
         SyrupValue::String(s) => Value::from(s.clone()),
         SyrupValue::Bool(b) => Value::from(*b),
-        SyrupValue::Symbol(s) => Value::from(s.clone()),
+        SyrupValue::Symbol(s) => Value::from(scheme_rs::symbols::Symbol::intern(s)),
         _ => Value::from(format!("{:?}", sv)),
     }
 }
