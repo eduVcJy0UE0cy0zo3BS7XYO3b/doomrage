@@ -141,6 +141,50 @@ impl WasmCanvasApp {
             }
         }
 
+        // Ensure globally unique node IDs across all canvases
+        {
+            let mut global_max: u64 = 0;
+            // Find max ID across all graphs
+            for g in all_graphs.values() {
+                for &id in g.nodes.keys() {
+                    if id > global_max { global_max = id; }
+                }
+            }
+            // Collect all used IDs
+            let mut used_ids: HashSet<u64> = HashSet::new();
+            let mut first = true;
+            for name in &canvas_list {
+                if let Some(g) = all_graphs.get_mut(name) {
+                    let mut remap: Vec<(u64, u64)> = Vec::new();
+                    for &id in g.nodes.keys() {
+                        if first {
+                            used_ids.insert(id);
+                        } else if used_ids.contains(&id) {
+                            // Conflict: assign new ID
+                            global_max += 1;
+                            remap.push((id, global_max));
+                            used_ids.insert(global_max);
+                        } else {
+                            used_ids.insert(id);
+                        }
+                    }
+                    for (old_id, new_id) in &remap {
+                        if let Some(mut node) = g.nodes.remove(old_id) {
+                            node.id = *new_id;
+                            g.nodes.insert(*new_id, node);
+                            log::info!("Remapped node #{} → #{} on canvas '{}'", old_id, new_id, name);
+                        }
+                    }
+                    g.next_node_id = g.nodes.keys().max().copied().unwrap_or(0) + 1;
+                }
+                first = false;
+            }
+            // Update graph from all_graphs (it might have been remapped)
+            if let Some(g) = all_graphs.get(&current_canvas) {
+                graph = g.clone();
+            }
+        }
+
         // Initialize ports and libraries from define-module headers (before compute)
         {
             // 1. Set script_outputs from (export ...) in define-module
@@ -1010,10 +1054,16 @@ impl WasmCanvasApp {
                 PanelAction::NewCanvas(name) => {
                     // Save current graph
                     self.all_graphs.insert(self.current_canvas.clone(), self.graph.clone());
-                    // Create new empty canvas
-                    self.graph = Graph::new();
+                    // Create new empty canvas with globally unique IDs
+                    let global_max = self.all_graphs.values()
+                        .flat_map(|g| g.nodes.keys())
+                        .max().copied().unwrap_or(0);
+                    let mut new_graph = Graph::new();
+                    new_graph.next_node_id = global_max + 1;
+                    self.graph = new_graph.clone();
                     self.current_canvas = name.clone();
-                    self.all_graphs.insert(name.clone(), Graph::new());
+                    self.actor_runtime.set_current_canvas(self.current_canvas.clone());
+                    self.all_graphs.insert(name.clone(), new_graph);
                     let _ = persistence::save_canvas_to_db(&self.current_canvas, &self.graph, &self.resources.db);
                     self.canvas_list = persistence::list_canvases(&self.resources.db);
                     self.panel_state.selected_node = None;
