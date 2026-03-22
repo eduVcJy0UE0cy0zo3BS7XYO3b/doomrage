@@ -603,46 +603,83 @@ impl WasmCanvasApp {
                         }
                     }
                     // Cross-canvas propagation: update phantom nodes on other canvases
-                    if let Some(node) = self.graph.nodes.get(&node_id) {
-                        if let Some(header) = crate::scheme_engine::parse_module_header(&node.script_code) {
+                    // Find the node and its home canvas (might not be current canvas)
+                    let node_info: Option<(String, String, HashMap<String, Value>)> = {
+                        // Check current graph first
+                        self.graph.nodes.get(&node_id)
+                            .map(|n| (self.current_canvas.clone(), n.script_code.clone(), {
+                                let mut v = n.output_values.clone();
+                                for (k, val) in &n.widget_values { v.insert(k.clone(), val.clone()); }
+                                v
+                            }))
+                            .or_else(|| {
+                                // Check other canvases
+                                self.all_graphs.iter().find_map(|(cname, g)| {
+                                    g.nodes.get(&node_id).map(|n| (cname.clone(), n.script_code.clone(), {
+                                        let mut v = n.output_values.clone();
+                                        for (k, val) in &n.widget_values { v.insert(k.clone(), val.clone()); }
+                                        v
+                                    }))
+                                })
+                            })
+                    };
+                    if let Some((source_canvas, code, values)) = node_info {
+                        if let Some(header) = crate::scheme_engine::parse_module_header(&code) {
                             if !header.exports.is_empty() && !header.name.is_empty() {
                                 let module_name = header.name.clone();
-                                let mut values = node.output_values.clone();
-                                for (k, v) in &node.widget_values {
-                                    values.insert(k.clone(), v.clone());
+                                // Update phantom nodes on all canvases (including current)
+                                let phantom_label = format!("{}:{}", source_canvas, module_name);
+                                for (_, pnode) in self.graph.nodes.iter_mut() {
+                                    if pnode.phantom && pnode.label == phantom_label {
+                                        pnode.output_values = values.clone();
+                                    }
                                 }
-                                // Update phantom nodes on all other canvases
                                 for (_, other_graph) in &mut self.all_graphs {
-                                    let phantom_label = format!("{}:{}", self.current_canvas, module_name);
                                     for (_, pnode) in other_graph.nodes.iter_mut() {
                                         if pnode.phantom && pnode.label == phantom_label {
                                             pnode.output_values = values.clone();
                                         }
                                     }
-                                    // Recompute nodes that import this cross-canvas module
-                                    let importers: Vec<NodeId> = other_graph.nodes.iter()
-                                        .filter(|(_, n)| !n.phantom && {
-                                            crate::scheme_engine::parse_module_header(&n.script_code)
-                                                .map_or(false, |h| h.cross_imports.iter().any(|(c, m)| *c == self.current_canvas && *m == module_name))
-                                        })
-                                        .map(|(&id, _)| id)
-                                        .collect();
-                                    for did in importers {
-                                        if !self.pending_nodes.contains(&did) {
-                                            // Compute on the other canvas
-                                            if let Some(n) = other_graph.nodes.get(&did) {
+                                }
+                                // Recompute downstream importers on all canvases
+                                let mut to_compute: Vec<(Node, Option<NodeTemplate>, HashMap<String, Value>)> = Vec::new();
+                                // Check current graph
+                                let importers: Vec<NodeId> = self.graph.nodes.iter()
+                                    .filter(|(_, n)| !n.phantom && crate::scheme_engine::parse_module_header(&n.script_code)
+                                        .map_or(false, |h| h.cross_imports.iter().any(|(c, m)| *c == source_canvas && *m == module_name)))
+                                    .map(|(&id, _)| id).collect();
+                                for did in &importers {
+                                    if !self.pending_nodes.contains(did) {
+                                        if let Some(n) = self.graph.nodes.get(did) {
+                                            let template = self.registry.templates.get(&n.template_name).cloned();
+                                            let inputs = self.graph.resolve_all_input_values(*did);
+                                            to_compute.push((n.clone(), template, inputs));
+                                        }
+                                    }
+                                }
+                                // Check other canvases
+                                for (_, other_graph) in &self.all_graphs {
+                                    let oimporters: Vec<NodeId> = other_graph.nodes.iter()
+                                        .filter(|(_, n)| !n.phantom && crate::scheme_engine::parse_module_header(&n.script_code)
+                                            .map_or(false, |h| h.cross_imports.iter().any(|(c, m)| *c == source_canvas && *m == module_name)))
+                                        .map(|(&id, _)| id).collect();
+                                    for did in &oimporters {
+                                        if !self.pending_nodes.contains(did) {
+                                            if let Some(n) = other_graph.nodes.get(did) {
                                                 let template = self.registry.templates.get(&n.template_name).cloned();
-                                                let inputs = other_graph.resolve_all_input_values(did);
-                                                let n_clone = n.clone();
-                                                self.pending_nodes.insert(did);
-                                                self.actor_runtime.compute(did, n_clone, template, inputs, self.resources.db.clone());
+                                                let inputs = other_graph.resolve_all_input_values(*did);
+                                                to_compute.push((n.clone(), template, inputs));
                                             }
                                         }
                                     }
                                 }
-                                // Also register updated library
+                                for (n_clone, template, inputs) in to_compute {
+                                    self.pending_nodes.insert(n_clone.id);
+                                    self.actor_runtime.compute(n_clone.id, n_clone, template, inputs, self.resources.db.clone());
+                                }
+                                // Register updated cross-canvas library
                                 self.resources.scheme.register_cross_canvas_library(
-                                    &self.current_canvas, &module_name, &values,
+                                    &source_canvas, &module_name, &values,
                                 );
                             }
                         }
