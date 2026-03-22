@@ -56,24 +56,27 @@ pub fn load_db(db: &Db, path: &Path) -> Result<()> {
     Ok(())
 }
 
-// --- DB graph persistence ---
+// --- DB graph persistence (multi-canvas) ---
 
-/// Save graph into the DB (graph_meta + graph_nodes tables).
-pub fn save_graph_to_db(graph: &Graph, db: &Db) -> Result<()> {
-    // Clear existing graph data
-    db.run("DELETE graph_meta")?;
-    db.run("DELETE graph_nodes")?;
+const DEFAULT_CANVAS: &str = "default";
+
+/// Save graph into the DB under a canvas name.
+pub fn save_canvas_to_db(canvas_name: &str, graph: &Graph, db: &Db) -> Result<()> {
+    let cn = Db::escape_surql(canvas_name);
+
+    // Clear existing data for this canvas
+    db.run(&format!("DELETE graph_meta WHERE canvas = '{}'", cn))?;
+    db.run(&format!("DELETE graph_nodes WHERE canvas = '{}'", cn))?;
 
     // Save metadata
     db.run(&format!(
-        "CREATE graph_meta SET viewport_offset_x = {}, viewport_offset_y = {}, viewport_zoom = {}, next_node_id = {}",
-        graph.viewport_offset[0], graph.viewport_offset[1], graph.viewport_zoom, graph.next_node_id
+        "CREATE graph_meta SET canvas = '{}', viewport_offset_x = {}, viewport_offset_y = {}, viewport_zoom = {}, next_node_id = {}",
+        cn, graph.viewport_offset[0], graph.viewport_offset[1], graph.viewport_zoom, graph.next_node_id
     ))?;
 
-    // Save each non-phantom node using record ID = node:N
+    // Save each non-phantom node
     for (_, node) in &graph.nodes {
         if node.phantom { continue; }
-        // Serialize values as JSON strings to avoid SurrealDB key issues
         let input_values_json = serde_json::to_string(&node.input_values)?;
         let widget_values_json = serde_json::to_string(&node.widget_values)?;
         let script_code_escaped = Db::escape_surql(&node.script_code);
@@ -81,7 +84,8 @@ pub fn save_graph_to_db(graph: &Graph, db: &Db) -> Result<()> {
         let template_escaped = Db::escape_surql(&node.template_name);
 
         db.run(&format!(
-            "CREATE graph_nodes:{} SET \
+            "CREATE graph_nodes SET \
+             canvas = '{}', \
              node_id = {}, \
              template_name = '{}', \
              label = '{}', \
@@ -90,7 +94,7 @@ pub fn save_graph_to_db(graph: &Graph, db: &Db) -> Result<()> {
              script_code = '{}', \
              input_values_json = '{}', \
              widget_values_json = '{}'",
-            node.id,
+            cn,
             node.id,
             template_escaped,
             label_escaped,
@@ -102,13 +106,18 @@ pub fn save_graph_to_db(graph: &Graph, db: &Db) -> Result<()> {
         ))?;
     }
 
-    log::info!("Saved graph to DB: {} nodes", graph.nodes.values().filter(|n| !n.phantom).count());
+    log::info!("Saved canvas '{}' to DB: {} nodes", canvas_name,
+        graph.nodes.values().filter(|n| !n.phantom).count());
     Ok(())
 }
 
-/// Load graph from the DB. Returns None if no graph data found.
-pub fn load_graph_from_db(db: &Db) -> Result<Option<Graph>> {
-    let meta_rows = db.query("SELECT * FROM graph_meta")?;
+/// Load graph from the DB by canvas name. Returns None if not found.
+pub fn load_canvas_from_db(canvas_name: &str, db: &Db) -> Result<Option<Graph>> {
+    let cn = Db::escape_surql(canvas_name);
+
+    let meta_rows = db.query(&format!(
+        "SELECT * FROM graph_meta WHERE canvas = '{}'", cn
+    ))?;
     let meta = match meta_rows.first() {
         Some(m) => m,
         None => return Ok(None),
@@ -124,59 +133,91 @@ pub fn load_graph_from_db(db: &Db) -> Result<Option<Graph>> {
     graph.next_node_id = meta.get("next_node_id")
         .and_then(|v| v.as_u64()).unwrap_or(1);
 
-    let node_rows = db.query("SELECT * FROM graph_nodes")?;
+    let node_rows = db.query(&format!(
+        "SELECT * FROM graph_nodes WHERE canvas = '{}'", cn
+    ))?;
     for row in &node_rows {
-        let node_id = match row.get("node_id").and_then(|v| v.as_u64()) {
-            Some(id) => id,
-            None => continue,
-        };
-        let template_name = row.get("template_name")
-            .and_then(|v| v.as_str()).unwrap_or("Script").to_string();
-        let label = row.get("label")
-            .and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let pos_x = row.get("pos_x")
-            .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-        let pos_y = row.get("pos_y")
-            .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-        let script_code = row.get("script_code")
-            .and_then(|v| v.as_str()).unwrap_or("").to_string();
-
-        let input_values: HashMap<String, crate::types::Value> = row.get("input_values_json")
-            .and_then(|v| v.as_str())
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-        let widget_values: HashMap<String, crate::types::Value> = row.get("widget_values_json")
-            .and_then(|v| v.as_str())
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-
-        let node = Node {
-            id: node_id,
-            template_name,
-            label,
-            pos: [pos_x, pos_y],
-            input_values,
-            output_values: HashMap::new(),
-            script_code,
-            script_inputs: Vec::new(),
-            script_outputs: Vec::new(),
-            widget_decls: Vec::new(),
-            widget_values,
-            error: None,
-            last_exec_us: None,
-            render_blocks: Vec::new(),
-            phantom: false,
-            remote_peer: None,
-        };
-        graph.nodes.insert(node_id, node);
+        if let Some(node) = parse_node_row(row) {
+            graph.nodes.insert(node.id, node);
+        }
     }
 
     if graph.nodes.is_empty() {
         return Ok(None);
     }
 
-    log::info!("Loaded graph from DB: {} nodes", graph.nodes.len());
+    log::info!("Loaded canvas '{}' from DB: {} nodes", canvas_name, graph.nodes.len());
     Ok(Some(graph))
+}
+
+/// List all canvas names in the DB.
+pub fn list_canvases(db: &Db) -> Vec<String> {
+    db.query("SELECT canvas FROM graph_meta")
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| row.get("canvas").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect()
+}
+
+/// Delete a canvas from the DB.
+pub fn delete_canvas(canvas_name: &str, db: &Db) -> Result<()> {
+    let cn = Db::escape_surql(canvas_name);
+    db.run(&format!("DELETE graph_meta WHERE canvas = '{}'", cn))?;
+    db.run(&format!("DELETE graph_nodes WHERE canvas = '{}'", cn))?;
+    log::info!("Deleted canvas '{}' from DB", canvas_name);
+    Ok(())
+}
+
+/// Backward-compat wrappers
+pub fn save_graph_to_db(graph: &Graph, db: &Db) -> Result<()> {
+    save_canvas_to_db(DEFAULT_CANVAS, graph, db)
+}
+
+pub fn load_graph_from_db(db: &Db) -> Result<Option<Graph>> {
+    load_canvas_from_db(DEFAULT_CANVAS, db)
+}
+
+/// Parse a single node row from DB query result.
+fn parse_node_row(row: &serde_json::Value) -> Option<Node> {
+    let node_id = row.get("node_id").and_then(|v| v.as_u64())?;
+    let template_name = row.get("template_name")
+        .and_then(|v| v.as_str()).unwrap_or("Script").to_string();
+    let label = row.get("label")
+        .and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let pos_x = row.get("pos_x")
+        .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    let pos_y = row.get("pos_y")
+        .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    let script_code = row.get("script_code")
+        .and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    let input_values: HashMap<String, crate::types::Value> = row.get("input_values_json")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let widget_values: HashMap<String, crate::types::Value> = row.get("widget_values_json")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    Some(Node {
+        id: node_id,
+        template_name,
+        label,
+        pos: [pos_x, pos_y],
+        input_values,
+        output_values: HashMap::new(),
+        script_code,
+        script_inputs: Vec::new(),
+        script_outputs: Vec::new(),
+        widget_decls: Vec::new(),
+        widget_values,
+        error: None,
+        last_exec_us: None,
+        render_blocks: Vec::new(),
+        phantom: false,
+        remote_peer: None,
+    })
 }
 
 // --- SCM format support ---
@@ -967,5 +1008,54 @@ mod tests {
         let n = &loaded.nodes[&1];
         assert_eq!(n.label, "node with 'quotes'");
         assert!(n.script_code.contains("hello 'world'"));
+    }
+
+    #[test]
+    fn test_multi_canvas() {
+        let db = crate::db::Db::new().unwrap();
+
+        // Create two canvases
+        let mut g1 = Graph::new();
+        g1.nodes.insert(1, Node {
+            id: 1, template_name: "Script".to_string(), label: "alpha".to_string(),
+            pos: [0.0, 0.0], input_values: HashMap::new(), output_values: HashMap::new(),
+            script_code: "(define a 1)".to_string(), script_inputs: Vec::new(),
+            script_outputs: Vec::new(), widget_decls: Vec::new(), widget_values: HashMap::new(),
+            error: None, last_exec_us: None, render_blocks: Vec::new(),
+            phantom: false, remote_peer: None,
+        });
+        g1.next_node_id = 2;
+
+        let mut g2 = Graph::new();
+        g2.nodes.insert(1, Node {
+            id: 1, template_name: "Script".to_string(), label: "beta".to_string(),
+            pos: [100.0, 100.0], input_values: HashMap::new(), output_values: HashMap::new(),
+            script_code: "(define b 2)".to_string(), script_inputs: Vec::new(),
+            script_outputs: Vec::new(), widget_decls: Vec::new(), widget_values: HashMap::new(),
+            error: None, last_exec_us: None, render_blocks: Vec::new(),
+            phantom: false, remote_peer: None,
+        });
+        g2.next_node_id = 2;
+
+        save_canvas_to_db("project-a", &g1, &db).unwrap();
+        save_canvas_to_db("project-b", &g2, &db).unwrap();
+
+        // List canvases
+        let mut names = list_canvases(&db);
+        names.sort();
+        assert_eq!(names, vec!["project-a", "project-b"]);
+
+        // Load each independently
+        let la = load_canvas_from_db("project-a", &db).unwrap().unwrap();
+        assert_eq!(la.nodes[&1].label, "alpha");
+
+        let lb = load_canvas_from_db("project-b", &db).unwrap().unwrap();
+        assert_eq!(lb.nodes[&1].label, "beta");
+
+        // Delete one
+        delete_canvas("project-a", &db).unwrap();
+        let names = list_canvases(&db);
+        assert_eq!(names, vec!["project-b"]);
+        assert!(load_canvas_from_db("project-a", &db).unwrap().is_none());
     }
 }

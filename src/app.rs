@@ -23,7 +23,6 @@ pub struct WasmCanvasApp {
     canvas_state: CanvasState,
     panel_state: PanelState,
     undo_history: UndoHistory,
-    current_file: Option<PathBuf>,
     theme_applied: bool,
     pending_nodes: HashSet<NodeId>,
     debug_log: DebugLog,
@@ -45,6 +44,10 @@ pub struct WasmCanvasApp {
     closed_windows: HashSet<NodeId>,
     /// Nodes the user explicitly triggered Compute on (for open-window gating)
     explicit_compute: HashSet<NodeId>,
+    /// Current canvas name
+    current_canvas: String,
+    /// Cached list of canvas names
+    canvas_list: Vec<String>,
 }
 
 impl WasmCanvasApp {
@@ -63,10 +66,18 @@ impl WasmCanvasApp {
             log::warn!("Failed to restore DB: {}", e);
         }
 
+        // Load canvas list and current canvas
+        let mut canvas_list = persistence::list_canvases(&resources.db);
+        let current_canvas = if canvas_list.is_empty() {
+            "default".to_string()
+        } else {
+            canvas_list[0].clone()
+        };
+
         // Load graph: DB first, then fallback to .scm/.json import
-        let mut graph = match persistence::load_graph_from_db(&resources.db) {
+        let mut graph = match persistence::load_canvas_from_db(&current_canvas, &resources.db) {
             Ok(Some(g)) => {
-                log::info!("Loaded graph from DB");
+                log::info!("Loaded canvas '{}' from DB", current_canvas);
                 g
             }
             _ => {
@@ -77,8 +88,7 @@ impl WasmCanvasApp {
                     match persistence::load_graph_scm(&scm_path, &resources.db) {
                         Ok(g) => {
                             log::info!("Imported graph from demo.scm into DB");
-                            // Save imported graph to DB immediately
-                            if let Err(e) = persistence::save_graph_to_db(&g, &resources.db) {
+                            if let Err(e) = persistence::save_canvas_to_db(&current_canvas, &g, &resources.db) {
                                 log::warn!("Failed to save imported graph to DB: {}", e);
                             }
                             g
@@ -92,7 +102,7 @@ impl WasmCanvasApp {
                     match persistence::load_graph(&json_path, &resources.db) {
                         Ok(g) => {
                             log::info!("Imported graph from demo.json into DB");
-                            if let Err(e) = persistence::save_graph_to_db(&g, &resources.db) {
+                            if let Err(e) = persistence::save_canvas_to_db(&current_canvas, &g, &resources.db) {
                                 log::warn!("Failed to save imported graph to DB: {}", e);
                             }
                             g
@@ -107,6 +117,12 @@ impl WasmCanvasApp {
                 }
             }
         };
+        // Refresh canvas list after potential import
+        canvas_list = persistence::list_canvases(&resources.db);
+        if !canvas_list.contains(&current_canvas) {
+            canvas_list.push(current_canvas.clone());
+        }
+
         // Initialize ports and libraries from define-module headers (before compute)
         {
             // 1. Set script_outputs from (export ...) in define-module
@@ -176,7 +192,6 @@ impl WasmCanvasApp {
             canvas_state: CanvasState::new(),
             panel_state: PanelState::new(),
             undo_history,
-            current_file: None,
             theme_applied: false,
             pending_nodes: HashSet::new(),
             debug_log: DebugLog::new(),
@@ -193,7 +208,44 @@ impl WasmCanvasApp {
             node_windows: HashMap::new(),
             closed_windows: HashSet::new(),
             explicit_compute: HashSet::new(),
+            current_canvas,
+            canvas_list,
         }
+    }
+
+    /// Re-initialize ports and libraries from define-module headers after loading a graph.
+    fn init_graph_libraries(&mut self) {
+        for node in self.graph.nodes.values_mut() {
+            if let Some(header) = crate::scheme_engine::parse_module_header(&node.script_code) {
+                node.script_outputs = header.exports.iter()
+                    .map(|name| PortDef { name: name.clone(), port_type: PortType::F64 })
+                    .collect();
+            }
+        }
+        let input_map: HashMap<NodeId, Vec<PortDef>> = self.graph.nodes.iter()
+            .filter_map(|(&id, node)| {
+                let header = crate::scheme_engine::parse_module_header(&node.script_code)?;
+                let mut inputs = Vec::new();
+                for import_label in &header.imports {
+                    if let Some(src_id) = self.graph.find_node_by_import_label(import_label) {
+                        if let Some(src) = self.graph.nodes.get(&src_id) {
+                            for port in &src.script_outputs {
+                                if !inputs.iter().any(|p: &PortDef| p.name == port.name) {
+                                    inputs.push(port.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                if inputs.is_empty() { None } else { Some((id, inputs)) }
+            })
+            .collect();
+        for (id, inputs) in input_map {
+            if let Some(node) = self.graph.nodes.get_mut(&id) {
+                node.script_inputs = inputs;
+            }
+        }
+        self.resources.scheme.register_stub_libraries(&self.graph.nodes);
     }
 
     fn compute_node(&mut self, node_id: NodeId) {
@@ -672,7 +724,7 @@ impl WasmCanvasApp {
                     self.save_graph();
                 }
                 PanelAction::LoadGraph => {
-                    self.load_graph();
+                    // Legacy: handled by ImportScm now
                 }
                 PanelAction::AddNode(name, pos) => {
                     if let Some(template) = self.registry.templates.get(&name) {
@@ -720,65 +772,106 @@ impl WasmCanvasApp {
                     }
                     self.compute_node_debounced(node_id);
                 }
+                PanelAction::NewCanvas(name) => {
+                    // Save current canvas first
+                    let _ = persistence::save_canvas_to_db(&self.current_canvas, &self.graph, &self.resources.db);
+                    // Switch to new empty canvas
+                    self.graph = Graph::new();
+                    self.current_canvas = name.clone();
+                    let _ = persistence::save_canvas_to_db(&self.current_canvas, &self.graph, &self.resources.db);
+                    self.canvas_list = persistence::list_canvases(&self.resources.db);
+                    self.undo_history = UndoHistory::new(10);
+                    self.undo_history.push(&self.graph);
+                    self.panel_state.selected_node = None;
+                    self.pending_nodes.clear();
+                    self.actor_runtime.cancel_all();
+                }
+                PanelAction::SwitchCanvas(name) => {
+                    // Save current canvas
+                    let _ = persistence::save_canvas_to_db(&self.current_canvas, &self.graph, &self.resources.db);
+                    // Load target canvas
+                    match persistence::load_canvas_from_db(&name, &self.resources.db) {
+                        Ok(Some(g)) => {
+                            self.graph = g;
+                            self.current_canvas = name;
+                            // Re-init ports and libraries
+                            self.init_graph_libraries();
+                            self.undo_history = UndoHistory::new(10);
+                            self.undo_history.push(&self.graph);
+                            self.panel_state.selected_node = None;
+                            self.pending_nodes.clear();
+                            self.actor_runtime.cancel_all();
+                        }
+                        _ => {
+                            log::error!("Failed to load canvas '{}'", name);
+                        }
+                    }
+                }
+                PanelAction::DeleteCanvas(name) => {
+                    if self.canvas_list.len() > 1 {
+                        let _ = persistence::delete_canvas(&name, &self.resources.db);
+                        self.canvas_list = persistence::list_canvases(&self.resources.db);
+                        // Switch to first remaining canvas
+                        if self.current_canvas == name {
+                            let next = self.canvas_list.first().cloned().unwrap_or_else(|| "default".to_string());
+                            match persistence::load_canvas_from_db(&next, &self.resources.db) {
+                                Ok(Some(g)) => {
+                                    self.graph = g;
+                                    self.current_canvas = next;
+                                    self.init_graph_libraries();
+                                }
+                                _ => {
+                                    self.graph = Graph::new();
+                                    self.current_canvas = next;
+                                }
+                            }
+                            self.undo_history = UndoHistory::new(10);
+                            self.undo_history.push(&self.graph);
+                            self.panel_state.selected_node = None;
+                        }
+                    }
+                }
+                PanelAction::ExportScm => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_title("Export .scm")
+                        .add_filter("Scheme", &["scm"])
+                        .save_file()
+                    {
+                        if let Err(e) = persistence::save_graph_scm(&self.graph, &path, &self.resources.db) {
+                            log::error!("Failed to export: {}", e);
+                        }
+                    }
+                }
+                PanelAction::ImportScm => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_title("Import .scm")
+                        .add_filter("Graph files", &["scm", "json"])
+                        .pick_file()
+                    {
+                        let result = if path.extension().map_or(false, |e| e == "scm") {
+                            persistence::load_graph_scm(&path, &self.resources.db)
+                        } else {
+                            persistence::load_graph(&path, &self.resources.db)
+                        };
+                        match result {
+                            Ok(g) => {
+                                self.graph = g;
+                                let _ = persistence::save_canvas_to_db(&self.current_canvas, &self.graph, &self.resources.db);
+                                self.init_graph_libraries();
+                                self.undo_history = UndoHistory::new(10);
+                                self.undo_history.push(&self.graph);
+                            }
+                            Err(e) => log::error!("Failed to import: {}", e),
+                        }
+                    }
+                }
             }
         }
     }
 
     fn save_graph(&mut self) {
-        // Always save to DB
-        if let Err(e) = persistence::save_graph_to_db(&self.graph, &self.resources.db) {
-            log::error!("Failed to save graph to DB: {}", e);
-        }
-        // Also export to file if user wants
-        let path = self.current_file.clone().or_else(|| {
-            rfd::FileDialog::new()
-                .set_title("Export Graph")
-                .add_filter("Scheme", &["scm"])
-                .add_filter("JSON", &["json"])
-                .save_file()
-        });
-
-        if let Some(path) = path {
-            let result = if path.extension().map_or(false, |e| e == "scm") {
-                persistence::save_graph_scm(&self.graph, &path, &self.resources.db)
-            } else {
-                persistence::save_graph(&self.graph, &path, &self.resources.db)
-            };
-            if let Err(e) = result {
-                log::error!("Failed to export graph: {}", e);
-            } else {
-                self.current_file = Some(path);
-            }
-        }
-    }
-
-    fn load_graph(&mut self) {
-        // Import from file → DB
-        let path = rfd::FileDialog::new()
-            .set_title("Import Graph")
-            .add_filter("Graph files", &["scm", "json"])
-            .pick_file();
-
-        if let Some(path) = path {
-            let result = if path.extension().map_or(false, |e| e == "scm") {
-                persistence::load_graph_scm(&path, &self.resources.db)
-            } else {
-                persistence::load_graph(&path, &self.resources.db)
-            };
-            match result {
-                Ok(graph) => {
-                    self.graph = graph;
-                    // Save imported graph to DB
-                    if let Err(e) = persistence::save_graph_to_db(&self.graph, &self.resources.db) {
-                        log::error!("Failed to save imported graph to DB: {}", e);
-                    }
-                    self.undo_history.push(&self.graph);
-                    self.current_file = Some(path);
-                }
-                Err(e) => {
-                    log::error!("Failed to import graph: {}", e);
-                }
-            }
+        if let Err(e) = persistence::save_canvas_to_db(&self.current_canvas, &self.graph, &self.resources.db) {
+            log::error!("Failed to save canvas to DB: {}", e);
         }
     }
 }
@@ -816,7 +909,12 @@ impl eframe::App for WasmCanvasApp {
 
         // Toolbar
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            let toolbar_actions = panels::draw_toolbar(ui);
+            let toolbar_actions = panels::draw_toolbar(
+                ui,
+                &self.current_canvas,
+                &self.canvas_list,
+                &mut self.panel_state.new_canvas_name,
+            );
             actions.extend(toolbar_actions);
         });
 
@@ -1056,9 +1154,9 @@ impl eframe::App for WasmCanvasApp {
     }
 
     fn on_exit(&mut self) {
-        // Auto-save graph to DB
-        if let Err(e) = persistence::save_graph_to_db(&self.graph, &self.resources.db) {
-            log::error!("Failed to auto-save graph to DB: {}", e);
+        // Auto-save current canvas to DB
+        if let Err(e) = persistence::save_canvas_to_db(&self.current_canvas, &self.graph, &self.resources.db) {
+            log::error!("Failed to auto-save canvas to DB: {}", e);
         }
         // Persist DB to disk
         if let Err(e) = persistence::save_db(&self.resources.db, &PathBuf::from("./db.json")) {

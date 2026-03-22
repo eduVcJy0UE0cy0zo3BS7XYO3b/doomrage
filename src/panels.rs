@@ -20,6 +20,7 @@ pub struct PanelState {
     pub show_debug: bool,
     pub selected_node: Option<NodeId>,
     pub script_view: ScriptViewMode,
+    pub new_canvas_name: String,
 }
 
 impl PanelState {
@@ -32,6 +33,7 @@ impl PanelState {
             show_debug: false,
             selected_node: None,
             script_view: ScriptViewMode::Rendered,
+            new_canvas_name: String::new(),
         }
     }
 }
@@ -47,13 +49,59 @@ pub enum PanelAction {
     UpdateWidget(NodeId, String, Value),
     /// Send a message to a node's actor mailbox
     SendMessage(NodeId, Vec<String>),
+    /// Canvas management
+    NewCanvas(String),
+    SwitchCanvas(String),
+    DeleteCanvas(String),
+    ExportScm,
+    ImportScm,
 }
 
-pub fn draw_toolbar(ui: &mut egui::Ui) -> Vec<PanelAction> {
+pub fn draw_toolbar(
+    ui: &mut egui::Ui,
+    current_canvas: &str,
+    canvas_list: &[String],
+    new_canvas_name: &mut String,
+) -> Vec<PanelAction> {
     let mut actions = Vec::new();
 
     ui.horizontal(|ui| {
         ui.visuals_mut().override_text_color = Some(TEXT);
+
+        // Canvas selector
+        egui::ComboBox::from_id_salt("canvas_selector")
+            .selected_text(RichText::new(current_canvas).color(ACCENT).strong())
+            .width(140.0)
+            .show_ui(ui, |ui| {
+                for name in canvas_list {
+                    let is_current = name == current_canvas;
+                    let label = if is_current {
+                        RichText::new(name).color(ACCENT).strong()
+                    } else {
+                        RichText::new(name).color(TEXT)
+                    };
+                    if ui.selectable_label(is_current, label).clicked() && !is_current {
+                        actions.push(PanelAction::SwitchCanvas(name.clone()));
+                    }
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(new_canvas_name)
+                            .hint_text("new canvas...")
+                            .desired_width(100.0),
+                    );
+                    let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if (ui.button(RichText::new("+").color(ACCENT)).clicked() || enter)
+                        && !new_canvas_name.trim().is_empty()
+                    {
+                        actions.push(PanelAction::NewCanvas(new_canvas_name.trim().to_string()));
+                        *new_canvas_name = String::new();
+                    }
+                });
+            });
+
+        ui.separator();
 
         if ui.button(RichText::new(" Save ").color(TEXT)).clicked()
             || ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S))
@@ -61,14 +109,24 @@ pub fn draw_toolbar(ui: &mut egui::Ui) -> Vec<PanelAction> {
             actions.push(PanelAction::SaveGraph);
         }
 
-        if ui.button(RichText::new(" Load ").color(TEXT)).clicked()
-            || ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::O))
-        {
-            actions.push(PanelAction::LoadGraph);
+        // Export/Import .scm
+        if ui.button(RichText::new(" Export ").color(TEXT_DIM)).clicked() {
+            actions.push(PanelAction::ExportScm);
+        }
+        if ui.button(RichText::new(" Import ").color(TEXT_DIM)).clicked() {
+            actions.push(PanelAction::ImportScm);
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new("WASM Canvas").color(ACCENT).strong());
+            // Delete canvas button (only if not last canvas)
+            if canvas_list.len() > 1 {
+                if ui.button(RichText::new(" x ").color(Color32::from_rgb(0xff, 0x44, 0x44)))
+                    .on_hover_text(format!("Delete canvas '{}'", current_canvas))
+                    .clicked()
+                {
+                    actions.push(PanelAction::DeleteCanvas(current_canvas.to_string()));
+                }
+            }
         });
     });
 
