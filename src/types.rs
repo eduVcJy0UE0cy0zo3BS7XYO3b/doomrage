@@ -273,6 +273,34 @@ impl Graph {
         })
     }
 
+    /// Derive input ports for a node from its imports (local + remote).
+    pub fn derive_inputs_for_node(&self, node_id: NodeId) -> Vec<PortDef> {
+        let node = match self.nodes.get(&node_id) {
+            Some(n) => n,
+            None => return Vec::new(),
+        };
+        let header = match crate::scheme_engine::parse_module_header(&node.script_code) {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+        let mut inputs = Vec::new();
+        let import_labels: Vec<&str> = header.imports.iter().map(|s| s.as_str())
+            .chain(header.remote_imports.iter().map(|(_, m)| m.as_str()))
+            .collect();
+        for label in import_labels {
+            if let Some(src_id) = self.find_node_by_import_label(label) {
+                if let Some(src) = self.nodes.get(&src_id) {
+                    for port in &src.script_outputs {
+                        if !inputs.iter().any(|p: &PortDef| p.name == port.name) {
+                            inputs.push(port.clone());
+                        }
+                    }
+                }
+            }
+        }
+        inputs
+    }
+
     /// Build import-based dependency edges: (source_id, target_id) for each import.
     fn import_edges(&self) -> Vec<(NodeId, NodeId)> {
         let mut edges = Vec::new();

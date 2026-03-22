@@ -4,7 +4,7 @@ pub use crate::scheme_convert::scheme_value_to_json;
 use anyhow::Result;
 use scheme_rs::env::TopLevelEnvironment;
 use scheme_rs::runtime::Runtime;
-use scheme_rs::value::{UnpackedValue, Value};
+use scheme_rs::value::Value;
 use std::collections::HashMap;
 
 /// Convert a Scheme runtime Value into a crate::types::Value.
@@ -160,217 +160,6 @@ const CANVAS_PREVIEW_LIB: &str = r#"
 )
 "#;
 
-// (canvas scribble) library removed — code is pure Scheme now.
-const _SCRIBBLE_REMOVED: &str = r###"
-(library (canvas scribble)
-  (export scribble-preprocess)
-  (import (rnrs))
-
-  ;; --- String utilities ---
-
-  (define (string-lines str)
-    (let ((len (string-length str)))
-      (let loop ((i 0) (start 0) (acc '()))
-        (cond
-          ((= i len)
-           (reverse (cons (substring str start len) acc)))
-          ((char=? (string-ref str i) #\newline)
-           (loop (+ i 1) (+ i 1) (cons (substring str start i) acc)))
-          (else (loop (+ i 1) start acc))))))
-
-  (define (string-trim str)
-    (let* ((len (string-length str))
-           (s (let loop ((i 0))
-                (if (and (< i len) (char-whitespace? (string-ref str i)))
-                    (loop (+ i 1)) i)))
-           (e (let loop ((i len))
-                (if (and (> i s) (char-whitespace? (string-ref str (- i 1))))
-                    (loop (- i 1)) i))))
-      (substring str s e)))
-
-  (define (starts-with? str pre)
-    (let ((sl (string-length str)) (pl (string-length pre)))
-      (and (>= sl pl) (string=? (substring str 0 pl) pre))))
-
-  (define (ends-with? str suf)
-    (let ((sl (string-length str)) (pl (string-length suf)))
-      (and (>= sl pl) (string=? (substring str (- sl pl) sl) suf))))
-
-  (define (split-by-char str ch)
-    (let ((len (string-length str)))
-      (let loop ((i 0) (start 0) (acc '()))
-        (cond
-          ((= i len) (reverse (cons (substring str start len) acc)))
-          ((char=? (string-ref str i) ch)
-           (loop (+ i 1) (+ i 1) (cons (substring str start i) acc)))
-          (else (loop (+ i 1) start acc))))))
-
-  (define (str-join lst sep)
-    (if (null? lst) ""
-        (let loop ((rest (cdr lst)) (out (car lst)))
-          (if (null? rest) out
-              (loop (cdr rest) (string-append out sep (car rest)))))))
-
-  (define (every-char? pred str)
-    (let ((len (string-length str)))
-      (let loop ((i 0))
-        (or (= i len) (and (pred (string-ref str i)) (loop (+ i 1)))))))
-
-  (define (all? pred lst)
-    (or (null? lst) (and (pred (car lst)) (all? pred (cdr lst)))))
-
-  (define (escape s)
-    (let ((len (string-length s)))
-      (let loop ((i 0) (out '()))
-        (if (= i len) (list->string (reverse out))
-            (let ((c (string-ref s i)))
-              (cond
-                ((char=? c #\\) (loop (+ i 1) (cons #\\ (cons #\\ out))))
-                ((char=? c #\") (loop (+ i 1) (cons #\" (cons #\\ out))))
-                (else (loop (+ i 1) (cons c out)))))))))
-
-  (define (ident-char? c)
-    (or (char-alphabetic? c) (char-numeric? c)
-        (char=? c #\-) (char=? c #\_) (char=? c #\?) (char=? c #\!)))
-
-  ;; --- Inline @-expression processing ---
-
-  (define (process-inline text)
-    (let ((len (string-length text)))
-      (let loop ((i 0) (s 0) (parts '()))
-        (cond
-          ((= i len)
-           (let ((final (if (< s i)
-                            (cons (string-append "\"" (escape (substring text s i)) "\"") parts)
-                            parts)))
-             (if (null? final) "\"\""
-                 (str-join (reverse final) " "))))
-
-          ((and (char=? (string-ref text i) #\@) (< (+ i 1) len))
-           (let ((nc (string-ref text (+ i 1))))
-             (cond
-               ;; @(expr)
-               ((char=? nc #\()
-                (let ((flushed (if (< s i)
-                                   (cons (string-append "\"" (escape (substring text s i)) "\"") parts)
-                                   parts)))
-                  (let ploop ((j (+ i 1)) (d 0))
-                    (cond
-                      ((= j len) (loop len len (cons (substring text (+ i 1) j) flushed)))
-                      ((char=? (string-ref text j) #\() (ploop (+ j 1) (+ d 1)))
-                      ((char=? (string-ref text j) #\))
-                       (if (= d 1)
-                           (loop (+ j 1) (+ j 1) (cons (substring text (+ i 1) (+ j 1)) flushed))
-                           (ploop (+ j 1) (- d 1))))
-                      (else (ploop (+ j 1) d))))))
-
-               ;; @name
-               ((ident-char? nc)
-                (let ((flushed (if (< s i)
-                                   (cons (string-append "\"" (escape (substring text s i)) "\"") parts)
-                                   parts)))
-                  (let nloop ((j (+ i 1)))
-                    (if (and (< j len) (ident-char? (string-ref text j)))
-                        (nloop (+ j 1))
-                        (loop j j (cons (substring text (+ i 1) j) flushed))))))
-
-               ;; bare @
-               (else (loop (+ i 1) s parts)))))
-
-          (else (loop (+ i 1) s parts))))))
-
-  ;; --- Table builder ---
-
-  (define (build-table headers rows)
-    (string-append
-     "(table (list " (str-join (map process-inline headers) " ")
-     ") (list " (str-join (map (lambda (row)
-                                 (string-append "(list " (str-join (map process-inline row) " ") ")"))
-                               rows) " ")
-     "))"))
-
-  ;; Flush pending table into render parts
-  (define (flush-tbl render hdr rows)
-    (if hdr (cons (build-table hdr (reverse rows)) render) render))
-
-  ;; --- Main preprocessor ---
-
-  (define (scribble-preprocess source)
-    (let ((lines (string-lines source)))
-      (let loop ((ls lines) (scm '()) (ren '()) (hdr #f) (trows '()) (in-r #f))
-        (if (null? ls)
-            (let ((final-ren (flush-tbl ren hdr trows)))
-              (build-output (reverse scm) (reverse final-ren)))
-
-            (let ((t (string-trim (car ls))) (rest (cdr ls)))
-              (cond
-                ;; blank line
-                ((= (string-length t) 0)
-                 (loop rest scm (flush-tbl ren hdr trows) #f '() in-r))
-
-                ;; scheme line (starts with paren, not in render mode)
-                ((and (char=? (string-ref t 0) #\() (not in-r))
-                 (loop rest (cons t scm) (flush-tbl ren hdr trows) #f '() #f))
-
-                ;; hr
-                ((or (string=? t "---") (string=? t "***") (string=? t "___"))
-                 (loop rest scm (cons "(hr)" (flush-tbl ren hdr trows)) #f '() #t))
-
-                ;; ## heading
-                ((starts-with? t "## ")
-                 (let ((txt (substring t 3 (string-length t))))
-                   (loop rest scm
-                         (cons (string-append "(italic " (process-inline txt) ")")
-                               (flush-tbl ren hdr trows))
-                         #f '() #t)))
-
-                ;; # heading
-                ((starts-with? t "# ")
-                 (let ((txt (substring t 2 (string-length t))))
-                   (loop rest scm
-                         (cons (string-append "(bold " (process-inline txt) ")")
-                               (flush-tbl ren hdr trows))
-                         #f '() #t)))
-
-                ;; table row
-                ((and (char=? (string-ref t 0) #\|) (ends-with? t "|"))
-                 (let* ((inner (substring t 1 (- (string-length t) 1)))
-                        (cells (map string-trim (split-by-char inner #\|))))
-                   (if (all? (lambda (c)
-                               (every-char? (lambda (ch) (or (char=? ch #\-) (char=? ch #\:))) c))
-                             cells)
-                       ;; separator row - skip
-                       (loop rest scm ren hdr trows #t)
-                       ;; data row
-                       (if hdr
-                           (loop rest scm ren hdr (cons cells trows) #t)
-                           (loop rest scm ren cells '() #t)))))
-
-                ;; standalone @(expr)
-                ((and (starts-with? t "@(") (ends-with? t ")"))
-                 (loop rest scm
-                       (cons (substring t 1 (string-length t))
-                             (flush-tbl ren hdr trows))
-                       #f '() #t))
-
-                ;; plain text
-                (else
-                 (loop rest scm
-                       (cons (string-append "(text " (process-inline t) ")")
-                             (flush-tbl ren hdr trows))
-                       #f '() #t))))))))
-
-  ;; Build final output
-  (define (build-output scm-lines ren-parts)
-    (string-append
-     (str-join (map (lambda (l) (string-append l "\n")) scm-lines) "")
-     (if (null? ren-parts) ""
-         (string-append "(render\n"
-                        (str-join (map (lambda (p) (string-append "  " p "\n")) ren-parts) "")
-                        ")"))))
-)
-"###;
-
 /// Extract `(import (node X))` labels from script code textually, without eval.
 /// Module header parsed from `(define-module ...)` in node script code.
 #[derive(Debug, Clone, Default)]
@@ -519,6 +308,56 @@ pub fn strip_module_header(code: &str) -> (String, Vec<String>) {
     }
 }
 
+const PORT_WRAPPERS: &str = r#"
+    (define (input name type) (register-input name type))
+    (define (output name type) (register-output name type))
+    (define (widget name type . params)
+      (register-widget name type
+        (if (null? params) 0 (car params))
+        (if (or (null? params) (null? (cdr params))) 0 (cadr params))))
+    (define (slider name lo hi) (register-widget name 'slider lo hi))
+    (define (checkbox name) (register-widget name 'checkbox 0 0))
+"#;
+
+/// Eval code within bridge port+db context, extract render blocks from results.
+fn eval_with_bridge<F>(
+    available_inputs: Option<&HashMap<String, crate::types::Value>>,
+    db: Option<&crate::db::Db>,
+    f: F,
+) -> (Result<Vec<Value>>, crate::bridge::PortRegistry)
+where
+    F: FnOnce() -> Result<Vec<Value>>,
+{
+    crate::bridge::with_port_context(available_inputs, || {
+        let eval_fn = || f();
+        if let Some(db) = db {
+            crate::bridge::with_db_context(db, eval_fn)
+        } else {
+            eval_fn()
+        }
+    })
+}
+
+fn extract_render_blocks(results: &[Value]) -> Vec<RenderBlock> {
+    let mut blocks = Vec::new();
+    for val in results {
+        if let Some(b) = try_parse_render_from_value(val) {
+            blocks.extend(b);
+        }
+    }
+    blocks
+}
+
+fn collect_side_effects() -> (Option<u64>, Vec<crate::bridge::OCapNSendEntry>, Vec<crate::types::NodeId>, bool, Option<String>) {
+    (
+        crate::bridge::take_tick_interval(),
+        crate::bridge::take_ocapn_sends(),
+        crate::bridge::take_recompute_requests(),
+        crate::bridge::take_has_message_handler(),
+        crate::bridge::take_window_title(),
+    )
+}
+
 pub struct SchemeEngine {
     pub runtime: Runtime,
     env: TopLevelEnvironment,
@@ -561,15 +400,9 @@ impl SchemeEngine {
             .map_err(|e| anyhow::anyhow!("Failed to import canvas actor: {}", e))?;
 
         // Port declaration wrappers: call bridge functions from (canvas ports)
+        env.eval(false, PORT_WRAPPERS)
+            .map_err(|e| anyhow::anyhow!("Failed to define port wrappers: {}", e))?;
         env.eval(false, r#"
-            (define (input name type) (register-input name type))
-            (define (output name type) (register-output name type))
-            (define (widget name type . params)
-              (register-widget name type
-                (if (null? params) 0 (car params))
-                (if (or (null? params) (null? (cdr params))) 0 (cadr params))))
-            (define (slider name lo hi) (register-widget name 'slider lo hi))
-            (define (checkbox name) (register-widget name 'checkbox 0 0))
             (define (net-publish channel) (net-publish-channel channel))
             (define (net-value channel key default) (net-value-get channel key default))
             (define (request-tick ms) (request-tick-ms ms))
@@ -629,16 +462,7 @@ impl SchemeEngine {
         let env = TopLevelEnvironment::new_repl(&self.runtime);
         env.eval(true, "(import (rnrs) (canvas db) (canvas render) (canvas graph) (canvas ports))")
             .map_err(|e| anyhow::anyhow!("Failed to setup REPL env: {}", e))?;
-        env.eval(false, r#"
-            (define (input name type) (register-input name type))
-            (define (output name type) (register-output name type))
-            (define (widget name type . params)
-              (register-widget name type
-                (if (null? params) 0 (car params))
-                (if (or (null? params) (null? (cdr params))) 0 (cadr params))))
-            (define (slider name lo hi) (register-widget name 'slider lo hi))
-            (define (checkbox name) (register-widget name 'checkbox 0 0))
-        "#)
+        env.eval(false, PORT_WRAPPERS)
             .map_err(|e| anyhow::anyhow!("Failed to define port wrappers in REPL env: {}", e))?;
         Ok(env)
     }
@@ -929,25 +753,12 @@ impl SchemeEngine {
         };
 
         // Eval with port context, each top-level form separately
-        let (eval_result, port_registry) = crate::bridge::with_port_context(
-            Some(available_inputs),
-            || {
-                let eval_fn = || Self::eval_forms(&env, &eval_code);
-                if let Some(db) = db {
-                    crate::bridge::with_db_context(db, eval_fn)
-                } else {
-                    eval_fn()
-                }
-            },
+        let (eval_result, port_registry) = eval_with_bridge(
+            Some(available_inputs), db,
+            || Self::eval_forms(&env, &eval_code),
         );
         let results = eval_result?;
-
-        let mut render_blocks = Vec::new();
-        for val in &results {
-            if let Some(blocks) = try_parse_render_from_value(val) {
-                render_blocks.extend(blocks);
-            }
-        }
+        let render_blocks = extract_render_blocks(&results);
 
         // Determine output names: from module header exports, or legacy PortRegistry
         let (declared_inputs, declared_outputs, widget_decls);
@@ -988,25 +799,11 @@ impl SchemeEngine {
             }
         }
 
-
-        let tick_interval_ms = crate::bridge::take_tick_interval();
-        let ocapn_sends = crate::bridge::take_ocapn_sends();
-        let recompute_requests = crate::bridge::take_recompute_requests();
-        let has_message_handler = crate::bridge::take_has_message_handler();
-        let window_title = crate::bridge::take_window_title();
+        let (tick_interval_ms, ocapn_sends, recompute_requests, has_message_handler, window_title) = collect_side_effects();
 
         Ok((ScriptResult {
-            output_values,
-            render_blocks,
-            declared_inputs,
-            declared_outputs,
-            widget_decls,
-
-            tick_interval_ms,
-            ocapn_sends,
-            recompute_requests,
-            has_message_handler,
-            window_title,
+            output_values, render_blocks, declared_inputs, declared_outputs, widget_decls,
+            tick_interval_ms, ocapn_sends, recompute_requests, has_message_handler, window_title,
         }, env, eval_code))
     }
 
@@ -1018,32 +815,18 @@ impl SchemeEngine {
         db: Option<&crate::db::Db>,
         preprocessed: &str,
     ) -> Result<ScriptResult> {
-        let (eval_result, port_registry) = crate::bridge::with_port_context(
-            Some(available_inputs),
-            || {
-                let eval_fn = || Self::eval_forms(env, preprocessed);
-                if let Some(db) = db {
-                    crate::bridge::with_db_context(db, eval_fn)
-                } else {
-                    eval_fn()
-                }
-            },
+        let (eval_result, port_registry) = eval_with_bridge(
+            Some(available_inputs), db,
+            || Self::eval_forms(env, preprocessed),
         );
         let results = eval_result?;
-
-        let mut render_blocks = Vec::new();
-        for val in &results {
-            if let Some(blocks) = try_parse_render_from_value(val) {
-                render_blocks.extend(blocks);
-            }
-        }
+        let render_blocks = extract_render_blocks(&results);
 
         let (declared_inputs, declared_outputs, widget_decls) =
             (port_registry.inputs, port_registry.outputs, port_registry.widgets);
 
         let mut output_values = HashMap::new();
-        let output_names: Vec<String> = declared_outputs.iter().map(|(name, _)| name.clone()).collect();
-        for name in &output_names {
+        for (name, _) in &declared_outputs {
             if let Ok(vals) = env.eval(false, name) {
                 if let Some(val) = vals.first() {
                     output_values.insert(name.clone(), scheme_value_to_types_value(val));
@@ -1051,25 +834,11 @@ impl SchemeEngine {
             }
         }
 
-
-        let tick_interval_ms = crate::bridge::take_tick_interval();
-        let ocapn_sends = crate::bridge::take_ocapn_sends();
-        let recompute_requests = crate::bridge::take_recompute_requests();
-        let has_message_handler = crate::bridge::take_has_message_handler();
-        let window_title = crate::bridge::take_window_title();
+        let (tick_interval_ms, ocapn_sends, recompute_requests, has_message_handler, window_title) = collect_side_effects();
 
         Ok(ScriptResult {
-            output_values,
-            render_blocks,
-            declared_inputs,
-            declared_outputs,
-            widget_decls,
-
-            tick_interval_ms,
-            ocapn_sends,
-            recompute_requests,
-            has_message_handler,
-            window_title,
+            output_values, render_blocks, declared_inputs, declared_outputs, widget_decls,
+            tick_interval_ms, ocapn_sends, recompute_requests, has_message_handler, window_title,
         })
     }
 
@@ -1081,37 +850,20 @@ impl SchemeEngine {
         available_inputs: &HashMap<String, crate::types::Value>,
         db: Option<&crate::db::Db>,
     ) -> Result<ScriptResult> {
-        let (eval_result, _port_registry) = crate::bridge::with_port_context(
-            Some(available_inputs),
-            || {
-                let eval_fn = || env.eval(false, "(__actor-drain-messages)")
-                    .map_err(|e| anyhow::anyhow!("{}", e));
-                if let Some(db) = db {
-                    crate::bridge::with_db_context(db, eval_fn)
-                } else {
-                    eval_fn()
-                }
-            },
+        let (eval_result, _) = eval_with_bridge(
+            Some(available_inputs), db,
+            || env.eval(false, "(__actor-drain-messages)")
+                .map_err(|e| anyhow::anyhow!("{}", e)),
         );
         eval_result?;
 
-
-        let tick_interval_ms = crate::bridge::take_tick_interval();
-        let ocapn_sends = crate::bridge::take_ocapn_sends();
-        let recompute_requests = crate::bridge::take_recompute_requests();
+        let (tick_interval_ms, ocapn_sends, recompute_requests, _, _) = collect_side_effects();
 
         Ok(ScriptResult {
-            output_values: HashMap::new(),
-            render_blocks: Vec::new(),
-            declared_inputs: Vec::new(),
-            declared_outputs: Vec::new(),
-            widget_decls: Vec::new(),
-
-            tick_interval_ms,
-            ocapn_sends,
-            recompute_requests,
-            has_message_handler: true,
-            window_title: None,
+            output_values: HashMap::new(), render_blocks: Vec::new(),
+            declared_inputs: Vec::new(), declared_outputs: Vec::new(), widget_decls: Vec::new(),
+            tick_interval_ms, ocapn_sends, recompute_requests,
+            has_message_handler: true, window_title: None,
         })
     }
 
@@ -1136,38 +888,18 @@ impl SchemeEngine {
             .map_err(|e| anyhow::anyhow!("Safe override failed: {}", e))?;
 
         // Eval with port context (None = preview mode, inputs return <compute>)
-        let (eval_result, _port_registry) = crate::bridge::with_port_context(
-            None,
-            || {
-                let eval_fn = || Self::eval_forms(&env, code);
-                if let Some(db) = db {
-                    crate::bridge::with_db_context(db, eval_fn)
-                } else {
-                    eval_fn()
-                }
-            },
+        let (eval_result, _) = eval_with_bridge(
+            None, db,
+            || Self::eval_forms(&env, code),
         );
         let results = eval_result?;
-
-        let mut render_blocks = Vec::new();
-        for val in &results {
-            if let Some(blocks) = try_parse_render_from_value(val) {
-                render_blocks.extend(blocks);
-            }
-        }
+        let render_blocks = extract_render_blocks(&results);
 
         Ok(ScriptResult {
-            output_values: HashMap::new(),
-            render_blocks,
-            declared_inputs: Vec::new(),
-            declared_outputs: Vec::new(),
-            widget_decls: Vec::new(),
-
-            tick_interval_ms: None,
-            ocapn_sends: Vec::new(),
-            recompute_requests: Vec::new(),
-            has_message_handler: false,
-            window_title: None,
+            output_values: HashMap::new(), render_blocks,
+            declared_inputs: Vec::new(), declared_outputs: Vec::new(), widget_decls: Vec::new(),
+            tick_interval_ms: None, ocapn_sends: Vec::new(), recompute_requests: Vec::new(),
+            has_message_handler: false, window_title: None,
         })
     }
 
