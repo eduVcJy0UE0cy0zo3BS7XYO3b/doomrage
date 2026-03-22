@@ -183,7 +183,24 @@ pub fn draw_inspector(
         // Node info
         ui.label(RichText::new(format!("#{} {}", node.id, node.template_name)).color(TEXT));
 
-        if let Some(template) = template {
+        // Phantom node: show remote info, output values, no code editor
+        if node.phantom {
+            ui.add_space(4.0);
+            let peer_label = node.remote_peer.as_deref()
+                .map(|p| if p.len() > 16 { &p[..16] } else { p })
+                .unwrap_or("unknown");
+            ui.label(RichText::new(format!("Remote module from peer {}...", peer_label))
+                .color(Color32::from_rgb(0xbb, 0x99, 0xff)));
+            ui.separator();
+
+            ui.label(RichText::new("Output values").color(ACCENT));
+            for (name, val) in &node.output_values {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(name).color(TEXT));
+                    ui.label(RichText::new(val.display()).color(TEXT_DIM));
+                });
+            }
+        } else if let Some(template) = template {
             if template.builtin == Some(BuiltinKind::Const) {
                 // Const node: value editor
                 ui.add_space(4.0);

@@ -193,6 +193,8 @@ mod tests {
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
+            phantom: false,
+            remote_peer: None,
         }
     }
 
@@ -212,6 +214,8 @@ mod tests {
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
+            phantom: false,
+            remote_peer: None,
         }
     }
 
@@ -231,6 +235,8 @@ mod tests {
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
+            phantom: false,
+            remote_peer: None,
         }
     }
 

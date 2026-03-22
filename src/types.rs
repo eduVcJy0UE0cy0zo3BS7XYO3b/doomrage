@@ -167,6 +167,12 @@ pub struct Node {
     pub last_exec_us: Option<u64>,
     #[serde(skip)]
     pub render_blocks: Vec<crate::render::RenderBlock>,
+    /// true = remote phantom node, no script_code
+    #[serde(skip)]
+    pub phantom: bool,
+    /// peer ID source for phantom nodes
+    #[serde(skip)]
+    pub remote_peer: Option<String>,
 }
 
 impl Node {
@@ -245,6 +251,8 @@ impl Graph {
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
+            phantom: false,
+            remote_peer: None,
         };
         self.nodes.insert(id, node);
         id

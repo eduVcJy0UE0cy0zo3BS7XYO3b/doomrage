@@ -948,7 +948,7 @@ impl SchemeEngine {
             }
         }
 
-        let net_publishes = crate::bridge::take_net_publishes();
+
         let tick_interval_ms = crate::bridge::take_tick_interval();
         let ocapn_sends = crate::bridge::take_ocapn_sends();
         let recompute_requests = crate::bridge::take_recompute_requests();
@@ -961,7 +961,7 @@ impl SchemeEngine {
             declared_inputs,
             declared_outputs,
             widget_decls,
-            net_publishes,
+
             tick_interval_ms,
             ocapn_sends,
             recompute_requests,
@@ -1011,7 +1011,7 @@ impl SchemeEngine {
             }
         }
 
-        let net_publishes = crate::bridge::take_net_publishes();
+
         let tick_interval_ms = crate::bridge::take_tick_interval();
         let ocapn_sends = crate::bridge::take_ocapn_sends();
         let recompute_requests = crate::bridge::take_recompute_requests();
@@ -1024,7 +1024,7 @@ impl SchemeEngine {
             declared_inputs,
             declared_outputs,
             widget_decls,
-            net_publishes,
+
             tick_interval_ms,
             ocapn_sends,
             recompute_requests,
@@ -1055,7 +1055,7 @@ impl SchemeEngine {
         );
         eval_result?;
 
-        let net_publishes = crate::bridge::take_net_publishes();
+
         let tick_interval_ms = crate::bridge::take_tick_interval();
         let ocapn_sends = crate::bridge::take_ocapn_sends();
         let recompute_requests = crate::bridge::take_recompute_requests();
@@ -1066,7 +1066,7 @@ impl SchemeEngine {
             declared_inputs: Vec::new(),
             declared_outputs: Vec::new(),
             widget_decls: Vec::new(),
-            net_publishes,
+
             tick_interval_ms,
             ocapn_sends,
             recompute_requests,
@@ -1122,7 +1122,7 @@ impl SchemeEngine {
             declared_inputs: Vec::new(),
             declared_outputs: Vec::new(),
             widget_decls: Vec::new(),
-            net_publishes: Vec::new(),
+
             tick_interval_ms: None,
             ocapn_sends: Vec::new(),
             recompute_requests: Vec::new(),
@@ -1140,7 +1140,6 @@ pub struct ScriptResult {
     pub declared_inputs: Vec<(String, String)>,
     pub declared_outputs: Vec<(String, String)>,
     pub widget_decls: Vec<crate::bridge::WidgetDecl>,
-    pub net_publishes: Vec<String>,
     pub tick_interval_ms: Option<u64>,
     pub ocapn_sends: Vec<crate::bridge::OCapNSendEntry>,
     pub recompute_requests: Vec<crate::types::NodeId>,
@@ -1156,7 +1155,7 @@ impl ScriptResult {
             declared_inputs: Vec::new(),
             declared_outputs: Vec::new(),
             widget_decls: Vec::new(),
-            net_publishes: Vec::new(),
+
             tick_interval_ms: None,
             ocapn_sends: Vec::new(),
             recompute_requests: Vec::new(),

@@ -660,9 +660,13 @@ fn draw_node(
     port_positions: &mut Vec<(NodeId, String, bool, PortType, Pos2)>,
     node_id: NodeId,
 ) {
-    let accent = template
-        .map(|t| node_accent_color(&t.name))
-        .unwrap_or(COLOR_CUSTOM);
+    let accent = if node.phantom {
+        Color32::from_rgb(0x88, 0x66, 0xcc) // purple for phantom/remote nodes
+    } else {
+        template
+            .map(|t| node_accent_color(&t.name))
+            .unwrap_or(COLOR_CUSTOM)
+    };
 
     let rounding = cr(6.0 * zoom);
 
@@ -673,8 +677,13 @@ fn draw_node(
         Color32::from_black_alpha(60),
     );
 
-    // Background
-    painter.rect_filled(rect, rounding, NODE_BG);
+    // Background (phantom nodes are semi-transparent)
+    let bg = if node.phantom {
+        Color32::from_rgba_premultiplied(0x2a, 0x2a, 0x2e, 0xcc)
+    } else {
+        NODE_BG
+    };
+    painter.rect_filled(rect, rounding, bg);
 
     // Border
     let border_color = if node.error.is_some() {
@@ -723,15 +732,20 @@ fn draw_node(
     let header_rect =
         Rect::from_min_size(rect.left_top(), vec2(rect.width(), HEADER_HEIGHT * zoom));
     let font = FontId::proportional(13.0 * zoom);
+    let label_text = if node.phantom {
+        format!("\u{1F4E1} {}", node.label)
+    } else {
+        node.label.clone()
+    };
     painter.text(
         pos2(
             rect.left() + (ACCENT_STRIP_WIDTH + 8.0) * zoom,
             header_rect.center().y,
         ),
         egui::Align2::LEFT_CENTER,
-        &node.label,
+        &label_text,
         font.clone(),
-        TEXT,
+        if node.phantom { Color32::from_rgb(0xbb, 0x99, 0xff) } else { TEXT },
     );
 
     // WASM badge

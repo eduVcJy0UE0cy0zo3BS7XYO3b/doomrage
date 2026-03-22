@@ -73,12 +73,6 @@ thread_local! {
 // All bridge functions use with_actor_ctx() from actor.rs.
 // These public functions are kept for callers (app.rs, worker.rs, scheme_engine.rs).
 
-/// Take collected net-publish channel names from actor context.
-pub fn take_net_publishes() -> Vec<String> {
-    crate::actor::with_actor_ctx(|ctx| std::mem::take(&mut ctx.net_publishes))
-        .unwrap_or_default()
-}
-
 /// Take requested tick interval from actor context.
 pub fn take_tick_interval() -> Option<u64> {
     crate::actor::with_actor_ctx(|ctx| ctx.tick_interval_ms.take())
@@ -553,27 +547,25 @@ fn bridge_register_widget(
 }
 
 // --- (canvas net) bridge functions ---
+// net-publish and net-value removed: all modules auto-publish, remote modules appear as phantom nodes.
 
 #[bridge(name = "net-publish-channel", lib = "(canvas net)")]
-fn bridge_net_publish(channel: &Value) -> Result<Vec<Value>, Exception> {
-    let ch = value_to_string(channel);
-    crate::actor::with_actor_ctx(|ctx| {
-        ctx.net_publishes.push(ch);
-    });
+fn bridge_net_publish(_channel: &Value) -> Result<Vec<Value>, Exception> {
     Ok(vec![Value::null()])
 }
 
 #[bridge(name = "net-value-get", lib = "(canvas net)")]
-fn bridge_net_value(channel: &Value, key: &Value, default: &Value) -> Result<Vec<Value>, Exception> {
-    let ch = value_to_string(channel);
+fn bridge_net_value(_channel: &Value, key: &Value, default: &Value) -> Result<Vec<Value>, Exception> {
+    // Legacy compat: try reading from net_values store
     let k = value_to_string(key);
+    let _ch = value_to_string(_channel);
 
     let result = crate::actor::with_actor_ctx(|ctx| {
         match ctx.net_values.as_ref() {
             Some(nv) => {
                 let store = nv.lock().unwrap();
                 for ((_, channel), values) in store.iter() {
-                    if *channel == ch {
+                    if *channel == _ch {
                         if let Some(val) = values.get(&k) {
                             return types_value_to_scheme(val);
                         }

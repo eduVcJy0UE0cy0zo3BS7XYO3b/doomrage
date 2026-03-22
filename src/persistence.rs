@@ -11,7 +11,10 @@ fn db_path_for(graph_path: &Path) -> PathBuf {
 }
 
 pub fn save_graph(graph: &Graph, path: &Path, db: &Db) -> Result<()> {
-    let json = serde_json::to_string_pretty(graph)?;
+    // Filter out phantom nodes before saving
+    let mut save_graph = graph.clone();
+    save_graph.nodes.retain(|_, n| !n.phantom);
+    let json = serde_json::to_string_pretty(&save_graph)?;
     std::fs::write(path, json)?;
 
     // Save DB alongside
@@ -72,7 +75,10 @@ pub fn load_graph_scm(path: &Path, db: &Db) -> Result<Graph> {
 
 /// Save a graph in .scm format
 pub fn save_graph_scm(graph: &Graph, path: &Path, db: &Db) -> Result<()> {
-    let scm = serialize_scm(graph);
+    // Filter out phantom nodes before saving
+    let mut save_graph = graph.clone();
+    save_graph.nodes.retain(|_, n| !n.phantom);
+    let scm = serialize_scm(&save_graph);
     std::fs::write(path, scm)?;
 
     let db_json = db.export()?;
@@ -331,6 +337,8 @@ fn parse_node_form(src: &str, form_start: usize, form_end: usize) -> Result<Node
         error: None,
         last_exec_us: None,
         render_blocks: Vec::new(),
+        phantom: false,
+        remote_peer: None,
     })
 }
 
@@ -681,17 +689,15 @@ mod tests {
     fn test_parse_demo_scm() {
         let src = std::fs::read_to_string("demo.scm").unwrap();
         let graph = parse_scm(&src).unwrap();
-        assert_eq!(graph.nodes.len(), 6);
+        assert_eq!(graph.nodes.len(), 4);
 
         let wave = &graph.nodes[&4];
         assert_eq!(wave.label, "wave");
         assert!(wave.script_code.contains("canvas"));
         assert!(wave.script_code.contains("draw-polyline"));
 
-        let gw_out = &graph.nodes[&2];
-        assert!(gw_out.script_code.contains("net-publish"));
-
-        let gw_in = &graph.nodes[&3];
-        assert!(gw_in.script_code.contains("net-value"));
+        let controls = &graph.nodes[&1];
+        assert_eq!(controls.label, "controls");
+        assert!(controls.script_code.contains("define-module"));
     }
 }

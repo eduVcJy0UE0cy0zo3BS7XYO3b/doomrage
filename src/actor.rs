@@ -34,7 +34,6 @@ pub struct ActorContext {
 
     // --- Per-eval outputs (collected during eval, taken after) ---
     pub ocapn_sends: Vec<OCapNSendEntry>,
-    pub net_publishes: Vec<String>,
     pub tick_interval_ms: Option<u64>,
     pub recompute_requests: Vec<NodeId>,
     pub has_message_handler: bool,
@@ -54,7 +53,6 @@ impl ActorContext {
             node_mailboxes: None,
             slot_owners: None,
             ocapn_sends: Vec::new(),
-            net_publishes: Vec::new(),
             tick_interval_ms: None,
             recompute_requests: Vec::new(),
             has_message_handler: false,
@@ -66,7 +64,6 @@ impl ActorContext {
     pub fn reset_outputs(&mut self) {
         self.export_counter = 0;
         self.ocapn_sends.clear();
-        self.net_publishes.clear();
         self.tick_interval_ms = None;
         self.recompute_requests.clear();
         self.has_message_handler = false;
@@ -77,7 +74,6 @@ impl ActorContext {
     pub fn take_outputs(&mut self) -> ActorOutputs {
         ActorOutputs {
             ocapn_sends: std::mem::take(&mut self.ocapn_sends),
-            net_publishes: std::mem::take(&mut self.net_publishes),
             tick_interval_ms: self.tick_interval_ms.take(),
             recompute_requests: std::mem::take(&mut self.recompute_requests),
             has_message_handler: self.has_message_handler,
@@ -97,7 +93,6 @@ impl ActorContext {
 /// Collected outputs from a single eval.
 pub struct ActorOutputs {
     pub ocapn_sends: Vec<OCapNSendEntry>,
-    pub net_publishes: Vec<String>,
     pub tick_interval_ms: Option<u64>,
     pub recompute_requests: Vec<NodeId>,
     pub has_message_handler: bool,

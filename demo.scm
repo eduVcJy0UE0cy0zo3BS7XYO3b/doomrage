@@ -18,35 +18,10 @@
     (text (string-append "Gain = " (->str gain) ", Freq = " (->str freq))))
 )
 
-(node 2 "Script" "gateway out" (pos 300.0 50.0)
-
-  (define-module (node gateway-out)
-    (use-module (node controls)))
-
-  (net-publish "controls")
-
-  (render
-    (bold "Gateway Out")
-    (text (string-append "Publishing gain=" (->str gain) ", freq=" (->str freq))))
-)
-
-(node 3 "Script" "gateway in" (pos 550.0 50.0)
-
-  (define-module (node gateway-in)
-    (export gain freq))
-
-  (define gain (net-value "controls" "gain" 50.0))
-  (define freq (net-value "controls" "freq" 5.0))
-
-  (render
-    (bold "Gateway In")
-    (text (string-append "Receiving gain=" (->str gain) ", freq=" (->str freq))))
-)
-
-(node 4 "Script" "wave" (pos 800.0 50.0)
+(node 4 "Script" "wave" (pos 300.0 50.0)
 
   (define-module (node wave)
-    (use-module (node gateway-in)))
+    (use-module (node controls)))
 
   (define g (if (compute? gain) 50.0 gain))
   (define f (if (compute? freq) 5.0 freq))
@@ -94,7 +69,7 @@
     swatch)
 )
 
-(node 6 "Script" "synth app" (pos 300.0 350.0)
+(node 6 "Script" "synth app" (pos 550.0 50.0)
 
   (define-module (node synth-app)
     (use-module (node controls))

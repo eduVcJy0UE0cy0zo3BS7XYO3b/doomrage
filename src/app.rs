@@ -183,6 +183,8 @@ impl WasmCanvasApp {
     }
 
     fn compute_node(&mut self, node_id: NodeId) {
+        // Skip phantom nodes — they have no code to execute
+        if self.graph.nodes.get(&node_id).map_or(false, |n| n.phantom) { return; }
         if let Some((node, template, inputs)) = self.resolve_node(node_id) {
             self.pending_nodes.insert(node_id);
             self.actor_runtime.compute(node_id, node, template, inputs, self.resources.db.clone());
@@ -190,6 +192,7 @@ impl WasmCanvasApp {
     }
 
     fn compute_node_debounced(&mut self, node_id: NodeId) {
+        if self.graph.nodes.get(&node_id).map_or(false, |n| n.phantom) { return; }
         if let Some((node, template, inputs)) = self.resolve_node(node_id) {
             self.pending_nodes.insert(node_id);
             self.actor_runtime.compute_debounced(node_id, node, template, inputs, self.resources.db.clone());
@@ -297,40 +300,34 @@ impl WasmCanvasApp {
                             }
                         }
                     }
-                    // Handle net-publish: send all node values to network
-                    for channel in &result.net_publishes {
-                        if let Some(node) = self.graph.nodes.get(&node_id) {
-                            // Merge input values (from imports) + output values + widget values
-                            let mut values = self.graph.resolve_all_input_values(node_id);
-                            for (k, v) in &node.widget_values {
-                                values.insert(k.clone(), v.clone());
-                            }
-                            for (k, v) in &node.output_values {
-                                values.insert(k.clone(), v.clone());
-                            }
-                            // Local loopback: update net_values so same-instance nodes can read
-                            {
-                                let mut store = self.net_values.lock().unwrap();
-                                store.insert(("local".to_string(), channel.clone()), values.clone());
-                            }
-                            // Send to network peers
-                            self.net_handle.send(NetCommand::Publish {
-                                channel: channel.clone(),
-                                values,
-                            });
-                            self.debug_log.log("net", format!(
-                                "publish \"{}\" → {:?}",
-                                channel,
-                                node.output_values.keys().collect::<Vec<_>>()
-                            ));
-                            // Trigger recompute on local nodes that subscribe via net-value
-                            let subscribers: Vec<NodeId> = self.graph.nodes.iter()
-                                .filter(|(id, n)| **id != node_id && n.template_name == "Script" && n.script_code.contains("net-value"))
-                                .map(|(id, _)| *id)
-                                .collect();
-                            for sid in subscribers {
-                                if !self.pending_nodes.contains(&sid) {
-                                    self.compute_node(sid);
+                    // Auto-publish: any node with define-module exports → broadcast to network
+                    if let Some(node) = self.graph.nodes.get(&node_id) {
+                        if !node.phantom {
+                            if let Some(header) = crate::scheme_engine::parse_module_header(&node.script_code) {
+                                if !header.exports.is_empty() && !header.name.is_empty() {
+                                    let channel = header.name.clone();
+                                    let mut values = HashMap::new();
+                                    for (k, v) in &node.output_values {
+                                        values.insert(k.clone(), v.clone());
+                                    }
+                                    for (k, v) in &node.widget_values {
+                                        values.insert(k.clone(), v.clone());
+                                    }
+                                    // Local loopback
+                                    {
+                                        let mut store = self.net_values.lock().unwrap();
+                                        store.insert(("local".to_string(), channel.clone()), values.clone());
+                                    }
+                                    // Send to network peers
+                                    self.net_handle.send(NetCommand::Publish {
+                                        channel: channel.clone(),
+                                        values,
+                                    });
+                                    self.debug_log.log("net", format!(
+                                        "auto-publish \"{}\" → {:?}",
+                                        channel,
+                                        node.output_values.keys().collect::<Vec<_>>()
+                                    ));
                                 }
                             }
                         }
@@ -392,6 +389,16 @@ impl WasmCanvasApp {
                     // Remove values from this peer
                     let mut store = self.net_values.lock().unwrap();
                     store.retain(|(p, _), _| *p != peer);
+                    drop(store);
+                    // Remove phantom nodes from this peer
+                    let phantom_ids: Vec<NodeId> = self.graph.nodes.iter()
+                        .filter(|(_, n)| n.phantom && n.remote_peer.as_deref() == Some(&peer))
+                        .map(|(&id, _)| id)
+                        .collect();
+                    for id in phantom_ids {
+                        self.debug_log.log("net", format!("removing phantom node #{}", id));
+                        self.graph.remove_node(id);
+                    }
                 }
                 NetEvent::ValuesReceived { peer, channel, values } => {
                     self.debug_log.log("net", format!(
@@ -399,8 +406,83 @@ impl WasmCanvasApp {
                         channel,
                         values.keys().collect::<Vec<_>>()
                     ));
-                    let mut store = self.net_values.lock().unwrap();
-                    store.insert((peer, channel), values);
+                    {
+                        let mut store = self.net_values.lock().unwrap();
+                        store.insert((peer.clone(), channel.clone()), values.clone());
+                    }
+
+                    // Phantom node logic: skip if local node with this module name exists
+                    let has_local = self.graph.nodes.values().any(|n| {
+                        !n.phantom && crate::scheme_engine::parse_module_header(&n.script_code)
+                            .map_or(false, |h| h.name == channel)
+                    });
+
+                    if !has_local {
+                        // Find existing phantom for this channel, or create one
+                        let phantom_id = self.graph.nodes.iter()
+                            .find(|(_, n)| n.phantom && n.label == channel)
+                            .map(|(&id, _)| id);
+
+                        let pid = if let Some(id) = phantom_id {
+                            // Update existing phantom
+                            if let Some(n) = self.graph.nodes.get_mut(&id) {
+                                n.output_values = values.clone();
+                                n.remote_peer = Some(peer.clone());
+                                n.script_outputs = values.keys()
+                                    .map(|k| PortDef { name: k.clone(), port_type: PortType::F64 })
+                                    .collect();
+                            }
+                            id
+                        } else {
+                            // Create new phantom node
+                            let id = self.graph.next_node_id;
+                            self.graph.next_node_id += 1;
+                            // Position: stack phantoms on the right side
+                            let phantom_count = self.graph.nodes.values().filter(|n| n.phantom).count();
+                            let node = Node {
+                                id,
+                                template_name: "Script".to_string(),
+                                label: channel.clone(),
+                                pos: [900.0, 50.0 + phantom_count as f32 * 200.0],
+                                input_values: HashMap::new(),
+                                output_values: values.clone(),
+                                script_code: String::new(),
+                                script_inputs: Vec::new(),
+                                script_outputs: values.keys()
+                                    .map(|k| PortDef { name: k.clone(), port_type: PortType::F64 })
+                                    .collect(),
+                                widget_decls: Vec::new(),
+                                widget_values: HashMap::new(),
+                                error: None,
+                                last_exec_us: None,
+                                render_blocks: Vec::new(),
+                                phantom: true,
+                                remote_peer: Some(peer.clone()),
+                            };
+                            self.graph.nodes.insert(id, node);
+                            self.debug_log.log("net", format!(
+                                "created phantom node #{} \"{}\" from peer {}...",
+                                id, channel, &peer[..12.min(peer.len())]
+                            ));
+                            id
+                        };
+
+                        // Register R6RS library so local nodes can (use-module (node <channel>))
+                        self.actor_runtime.engine().register_node_library_named(
+                            pid, Some(&channel), &values,
+                        );
+
+                        // Recompute downstream nodes that import this module
+                        let downstream: Vec<NodeId> = self.graph.nodes.iter()
+                            .filter(|(_, n)| !n.phantom && crate::scheme_engine::extract_imports(&n.script_code).contains(&channel))
+                            .map(|(id, _)| *id)
+                            .collect();
+                        for did in downstream {
+                            if !self.pending_nodes.contains(&did) {
+                                self.compute_node(did);
+                            }
+                        }
+                    }
                     need_recompute = true;
                 }
                 NetEvent::OCapNReceived { peer, message } => {
@@ -506,10 +588,10 @@ impl WasmCanvasApp {
                 }
             }
         }
-        // Recompute all nodes that use net-value (simple approach: recompute all script nodes)
+        // Recompute nodes that still use legacy net-value (backward compat)
         if need_recompute {
             let script_nodes: Vec<NodeId> = self.graph.nodes.iter()
-                .filter(|(_, n)| n.template_name == "Script" && n.script_code.contains("net-value"))
+                .filter(|(_, n)| !n.phantom && n.template_name == "Script" && n.script_code.contains("net-value"))
                 .map(|(id, _)| *id)
                 .collect();
             for nid in script_nodes {
