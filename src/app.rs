@@ -184,36 +184,23 @@ impl WasmCanvasApp {
 
     fn compute_node(&mut self, node_id: NodeId) {
         if let Some((node, template, inputs)) = self.resolve_node(node_id) {
-            let modules = self.connected_source_labels(node_id);
             self.pending_nodes.insert(node_id);
-            self.actor_runtime.compute(node_id, node, template, inputs, self.resources.db.clone(), modules);
+            self.actor_runtime.compute(node_id, node, template, inputs, self.resources.db.clone());
         }
     }
 
     fn compute_node_debounced(&mut self, node_id: NodeId) {
         if let Some((node, template, inputs)) = self.resolve_node(node_id) {
-            let modules = self.connected_source_labels(node_id);
             self.pending_nodes.insert(node_id);
-            self.actor_runtime.compute_debounced(node_id, node, template, inputs, self.resources.db.clone(), modules);
+            self.actor_runtime.compute_debounced(node_id, node, template, inputs, self.resources.db.clone());
         }
     }
 
     fn resolve_node(&self, node_id: NodeId) -> Option<(Node, Option<NodeTemplate>, HashMap<String, Value>)> {
         let node = self.graph.nodes.get(&node_id)?;
         let template = self.registry.templates.get(&node.template_name).cloned();
-        let mut available_inputs = self.graph.resolve_all_input_values(node_id);
-        for (k, v) in &node.widget_values {
-            available_inputs.entry(k.clone()).or_insert_with(|| v.clone());
-        }
+        let available_inputs = self.graph.resolve_all_input_values(node_id);
         Some((node.clone(), template, available_inputs))
-    }
-
-    /// Get labels of source nodes imported by this node (from script code).
-    fn connected_source_labels(&self, node_id: NodeId) -> Vec<String> {
-        match self.graph.nodes.get(&node_id) {
-            Some(node) => crate::scheme_engine::extract_imports(&node.script_code),
-            None => Vec::new(),
-        }
     }
 
     fn poll_worker_results(&mut self) {

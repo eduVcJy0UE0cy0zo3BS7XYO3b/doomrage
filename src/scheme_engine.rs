@@ -160,7 +160,8 @@ const CANVAS_PREVIEW_LIB: &str = r#"
 )
 "#;
 
-const CANVAS_SCRIBBLE_LIB: &str = r###"
+// (canvas scribble) library removed — code is pure Scheme now.
+const _SCRIBBLE_REMOVED: &str = r###"
 (library (canvas scribble)
   (export scribble-preprocess)
   (import (rnrs))
@@ -525,9 +526,6 @@ impl SchemeEngine {
             .map_err(|e| anyhow::anyhow!("Failed to define (canvas render): {}", e))?;
         runtime.def_lib(CANVAS_PREVIEW_LIB)
             .map_err(|e| anyhow::anyhow!("Failed to define (canvas preview): {}", e))?;
-        runtime.def_lib(CANVAS_SCRIBBLE_LIB)
-            .map_err(|e| anyhow::anyhow!("Failed to define (canvas scribble): {}", e))?;
-
         let env = TopLevelEnvironment::new_repl(&runtime);
         env.eval(true, "(import (rnrs))")
             .map_err(|e| anyhow::anyhow!("Failed to import rnrs: {}", e))?;
@@ -537,8 +535,6 @@ impl SchemeEngine {
             .map_err(|e| anyhow::anyhow!("Failed to import canvas render: {}", e))?;
         env.eval(true, "(import (canvas ports))")
             .map_err(|e| anyhow::anyhow!("Failed to import canvas ports: {}", e))?;
-        env.eval(true, "(import (canvas scribble))")
-            .map_err(|e| anyhow::anyhow!("Failed to import canvas scribble: {}", e))?;
         env.eval(true, "(import (canvas net))")
             .map_err(|e| anyhow::anyhow!("Failed to import canvas net: {}", e))?;
         env.eval(true, "(import (canvas timer))")
@@ -754,19 +750,7 @@ impl SchemeEngine {
         }
     }
 
-    /// Call the Scheme preprocessor to convert Scribble markup into pure Scheme.
-    fn preprocess_code(&self, env: &TopLevelEnvironment, code: &str) -> Result<String> {
-        let code_literal = crate::types::Value::Str(code.to_string()).to_scheme_literal();
-        let results = env.eval(false, &format!("(scribble-preprocess {})", code_literal))
-            .map_err(|e| anyhow::anyhow!("Preprocessing failed: {}", e))?;
-        match results.first() {
-            Some(val) => match val.clone().unpack() {
-                UnpackedValue::String(s) => Ok(String::from(s)),
-                _ => Err(anyhow::anyhow!("Preprocessor returned non-string: {}", val)),
-            },
-            None => Ok(String::new()),
-        }
-    }
+
 
     /// Split code string into individual top-level S-expressions.
     /// Tracks paren depth and string literals to find form boundaries.
@@ -863,7 +847,7 @@ impl SchemeEngine {
         db: Option<&crate::db::Db>,
         code: &str,
     ) -> Result<ScriptResult> {
-        let (result, _env, _preprocessed) = self.execute_script_cached(None, available_inputs, db, code, &[])?;
+        let (result, _env, _preprocessed) = self.execute_script_cached(None, available_inputs, db, code)?;
         Ok(result)
     }
 
@@ -876,9 +860,7 @@ impl SchemeEngine {
         available_inputs: &HashMap<String, crate::types::Value>,
         db: Option<&crate::db::Db>,
         code: &str,
-        connected_modules: &[String],
     ) -> Result<(ScriptResult, TopLevelEnvironment, String)> {
-        let _ = connected_modules;
 
         // Parse module header if present
         let module_header = parse_module_header(code);
@@ -1244,57 +1226,6 @@ mod tests {
 
         assert!(extract_imports("(define x 1)").is_empty());
         assert_eq!(extract_imports("(import (node foo-bar))"), vec!["foo-bar"]);
-    }
-
-    #[test]
-    fn test_scribble_preprocess() {
-        let engine = SchemeEngine::new().unwrap();
-        let env = engine.make_env();
-        let output = engine.preprocess_code(&env, r#"(define x (input 'x 'f64))
-(define result (output 'result 'f64))
-
-(set! result (* x 2))
-
-# My Analysis
-
-The result is @result.
-
----
-
-| name | value |
-|------|-------|
-| x    | @x    |
-
-@(plot-line '(1 2 3) "test")
-"#).unwrap();
-        println!("--- preprocessed ---\n{}\n---", output);
-        assert!(output.contains("(define x (input 'x 'f64))"));
-        assert!(output.contains("(define result (output 'result 'f64))"));
-        assert!(output.contains("(set! result (* x 2))"));
-        assert!(output.contains("(render"));
-        assert!(output.contains(r#"(bold "My Analysis")"#));
-        assert!(output.contains("result"));
-        assert!(output.contains("(hr)"));
-        assert!(output.contains("(table"));
-        assert!(output.contains("(plot-line '(1 2 3) \"test\")"));
-    }
-
-    #[test]
-    fn test_scribble_inline_expressions() {
-        let engine = SchemeEngine::new().unwrap();
-        let env = engine.make_env();
-
-        // Test inline @name
-        let output = engine.preprocess_code(&env, "hello @name world").unwrap();
-        assert!(output.contains(r#""hello " name " world""#));
-
-        // Test inline @(expr)
-        let output = engine.preprocess_code(&env, "sum = @(+ x y)!").unwrap();
-        assert!(output.contains(r#""sum = " (+ x y) "!""#));
-
-        // Test plain text
-        let output = engine.preprocess_code(&env, "no at signs").unwrap();
-        assert!(output.contains(r#""no at signs""#));
     }
 
     #[test]
