@@ -177,6 +177,24 @@ impl WasmCanvasApp {
             }
             // 3. Register stub libraries
             resources.scheme.register_stub_libraries(&graph.nodes);
+            // 4. Register stub libraries for ALL other canvases too
+            for (name, other_g) in &all_graphs {
+                if *name != current_canvas {
+                    resources.scheme.register_stub_libraries(&other_g.nodes);
+                    // Register cross-canvas libraries
+                    for (_, other_node) in &other_g.nodes {
+                        if let Some(header) = crate::scheme_engine::parse_module_header(&other_node.script_code) {
+                            if !header.exports.is_empty() && !header.name.is_empty() {
+                                let mut values: HashMap<String, Value> = HashMap::new();
+                                for exp in &header.exports {
+                                    values.insert(exp.clone(), other_node.widget_values.get(exp).cloned().unwrap_or(Value::F64(0.0)));
+                                }
+                                resources.scheme.register_cross_canvas_library(name, &header.name, &values);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         let favorites = persistence::list_favorites(&resources.db);

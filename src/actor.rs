@@ -467,8 +467,23 @@ impl ActorRuntime {
         let tx = self.result_tx.clone();
 
         self.pool.spawn(move || {
-            let result = execute_on_thread(engine, node_id, pending.msg, &shared, cached_env, cached_preprocessed);
-            let _ = tx.send(result);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                execute_on_thread(engine, node_id, pending.msg, &shared, cached_env, cached_preprocessed)
+            }));
+            let actor_result = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = if let Some(s) = e.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = e.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else {
+                        "panic in eval".to_string()
+                    };
+                    ActorResult::Error { node_id, message: format!("Internal error: {}", msg) }
+                }
+            };
+            let _ = tx.send(actor_result);
             if let Some(ctx) = shared.egui_ctx.as_ref() {
                 ctx.request_repaint();
             }
