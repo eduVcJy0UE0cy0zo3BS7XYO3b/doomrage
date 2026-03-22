@@ -22,7 +22,6 @@ pub struct ActorContext {
     // --- Identity ---
     pub node_id: NodeId,
     pub export_counter: u32,
-    pub current_canvas: Option<String>,
 
     // --- Shared resources (read) ---
     pub net_values: Option<NetValues>,
@@ -46,7 +45,6 @@ impl ActorContext {
         Self {
             node_id,
             export_counter: 0,
-            current_canvas: None,
             net_values: None,
             session_mgr: None,
             ocapn_slots: None,
@@ -189,7 +187,6 @@ struct SharedResources {
     slot_owners: Option<OCapNSlotOwners>,
     wasm: Option<WasmRunner>,
     egui_ctx: Option<egui::Context>,
-    current_canvas: Option<String>,
 }
 
 /// Cached environment for a node.
@@ -265,7 +262,6 @@ impl ActorRuntime {
                 slot_owners: None,
                 wasm: None,
                 egui_ctx: None,
-                current_canvas: None,
             },
             env_cache: HashMap::new(),
             node_states: HashMap::new(),
@@ -284,7 +280,6 @@ impl ActorRuntime {
     pub fn set_wasm_runner(&mut self, w: WasmRunner) { self.shared.wasm = Some(w); }
     pub fn set_slot_owners(&mut self, o: OCapNSlotOwners) { self.shared.slot_owners = Some(o); }
     pub fn set_egui_ctx(&mut self, ctx: egui::Context) { self.shared.egui_ctx = Some(ctx); }
-    pub fn set_current_canvas(&mut self, name: String) { self.shared.current_canvas = Some(name); }
 
     /// Compute a node immediately (for cascade, node-send, programmatic triggers).
     pub fn compute(
@@ -511,7 +506,6 @@ fn execute_on_thread(
     if msg.fast_message_path {
         if let Some(env) = cached_env {
             let mut ctx = ActorContext::new(node_id);
-            ctx.current_canvas = shared.current_canvas.clone();
             ctx.net_values = shared.net_values.clone();
             ctx.session_mgr = shared.session_mgr.clone();
             ctx.ocapn_slots = shared.ocapn_slots.clone();
@@ -575,7 +569,6 @@ fn execute_on_thread(
             }
 
             let mut ctx = ActorContext::new(node_id);
-            ctx.current_canvas = shared.current_canvas.clone();
             ctx.net_values = shared.net_values.clone();
             ctx.session_mgr = shared.session_mgr.clone();
             ctx.ocapn_slots = shared.ocapn_slots.clone();

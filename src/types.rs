@@ -283,11 +283,10 @@ impl Graph {
                     edges.push((source_id, target_id));
                 }
             }
-            // Cross-canvas imports: match phantom nodes with label "canvas:module"
+            // Remote imports: match phantom nodes by module name
             if let Some(header) = crate::scheme_engine::parse_module_header(&target_node.script_code) {
-                for (canvas_name, module_name) in &header.cross_imports {
-                    let phantom_label = format!("{}:{}", canvas_name, module_name);
-                    if let Some(source_id) = self.find_node_by_import_label(&phantom_label) {
+                for (_ns, module_name) in &header.remote_imports {
+                    if let Some(source_id) = self.find_node_by_import_label(module_name) {
                         edges.push((source_id, target_id));
                     }
                 }
@@ -341,11 +340,10 @@ impl Graph {
             }
         }
 
-        // Add upstream output values from cross-canvas phantom nodes
+        // Remote imports: pull values from phantom nodes by module name
         if let Some(header) = crate::scheme_engine::parse_module_header(&node.script_code) {
-            for (canvas_name, module_name) in &header.cross_imports {
-                let phantom_label = format!("{}:{}", canvas_name, module_name);
-                if let Some(source_id) = self.find_node_by_import_label(&phantom_label) {
+            for (_ns, module_name) in &header.remote_imports {
+                if let Some(source_id) = self.find_node_by_import_label(module_name) {
                     if let Some(src) = self.nodes.get(&source_id) {
                         for (out_name, out_val) in &src.output_values {
                             vals.insert(out_name.clone(), out_val.clone());

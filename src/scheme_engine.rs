@@ -379,8 +379,8 @@ pub struct ModuleHeader {
     pub exports: Vec<String>,
     /// Local imports: module names from current canvas (use-module (node X))
     pub imports: Vec<String>,
-    /// Cross-canvas imports: (canvas_name, module_name) from (use-module (canvas-name module-name))
-    pub cross_imports: Vec<(String, String)>,
+    /// Remote imports: (namespace, module_name) from (use-module (ns module-name))
+    pub remote_imports: Vec<(String, String)>,
 }
 
 /// Parse `(define-module ...)` header from script code textually.
@@ -431,9 +431,9 @@ pub fn parse_module_header(code: &str) -> Option<ModuleHeader> {
                 2 if parts[0] == "node" => {
                     header.imports.push(parts[1].to_string());
                 }
-                // (use-module (other-canvas controls)) — cross-canvas import
+                // (use-module (other-canvas controls)) — remote import
                 2 if parts[0] != "node" => {
-                    header.cross_imports.push((parts[0].to_string(), parts[1].to_string()));
+                    header.remote_imports.push((parts[0].to_string(), parts[1].to_string()));
                 }
                 _ => {}
             }
@@ -499,10 +499,6 @@ pub fn extract_imports(code: &str) -> Vec<String> {
 /// Strip `(define-module ...)` form from code, returning the body.
 /// Also returns import statements to prepend.
 pub fn strip_module_header(code: &str) -> (String, Vec<String>) {
-    strip_module_header_with_canvas(code, None)
-}
-
-pub fn strip_module_header_with_canvas(code: &str, current_canvas: Option<&str>) -> (String, Vec<String>) {
     if let Some(header) = parse_module_header(code) {
         let dm_start = code.find("(define-module").unwrap();
         let dm_end = find_matching_paren(code, dm_start).unwrap();
@@ -513,14 +509,9 @@ pub fn strip_module_header_with_canvas(code: &str, current_canvas: Option<&str>)
         let mut imports: Vec<String> = header.imports.iter()
             .map(|label| format!("(import (node {}))", label))
             .collect();
-        // Cross-canvas imports: (import (canvas-name module-name))
-        // If canvas == current canvas, treat as local import
-        for (canvas, module) in &header.cross_imports {
-            if current_canvas.map_or(false, |cc| cc == canvas) {
-                imports.push(format!("(import (node {}))", module));
-            } else {
-                imports.push(format!("(import ({} {}))", canvas, module));
-            }
+        // Remote imports: (import (ns module))
+        for (ns, module) in &header.remote_imports {
+            imports.push(format!("(import ({} {}))", ns, module));
         }
         (body.trim_start_matches('\n').to_string(), imports)
     } else {
@@ -778,7 +769,7 @@ impl SchemeEngine {
 
 
     /// Register a cross-canvas module library: `(library (canvas-name module-name) ...)`
-    pub fn register_cross_canvas_library(
+    pub fn register_named_library(
         &self,
         canvas_name: &str,
         module_name: &str,
@@ -925,8 +916,7 @@ impl SchemeEngine {
 
         // Strip define-module, prepend imports as R6RS (import ...) statements
         let eval_code = if module_header.is_some() {
-            let current_canvas = crate::actor::with_actor_ctx(|ctx| ctx.current_canvas.clone()).flatten();
-            let (body, import_stmts) = strip_module_header_with_canvas(code, current_canvas.as_deref());
+            let (body, import_stmts) = strip_module_header(code);
             let mut full = String::new();
             for stmt in &import_stmts {
                 full.push_str(stmt);
@@ -1263,7 +1253,7 @@ mod tests {
         let header3 = parse_module_header(code3).unwrap();
         assert_eq!(header3.name, "synth");
         assert_eq!(header3.imports, vec!["local-mod"]);
-        assert_eq!(header3.cross_imports, vec![("other-canvas".to_string(), "controls".to_string())]);
+        assert_eq!(header3.remote_imports, vec![("other-canvas".to_string(), "controls".to_string())]);
     }
 
     #[test]
