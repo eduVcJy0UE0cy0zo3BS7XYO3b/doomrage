@@ -246,6 +246,74 @@ impl WasmCanvasApp {
             }
         }
         self.resources.scheme.register_stub_libraries(&self.graph.nodes);
+
+        // Resolve cross-canvas imports: load values from other canvases
+        let mut cross_imports: Vec<(String, String)> = Vec::new();
+        for node in self.graph.nodes.values() {
+            if let Some(header) = crate::scheme_engine::parse_module_header(&node.script_code) {
+                for ci in &header.cross_imports {
+                    if !cross_imports.contains(ci) {
+                        cross_imports.push(ci.clone());
+                    }
+                }
+            }
+        }
+        for (canvas_name, module_name) in &cross_imports {
+            // Load the other canvas from DB, find the node with this module name
+            if let Ok(Some(other_graph)) = persistence::load_canvas_from_db(canvas_name, &self.resources.db) {
+                for (_, other_node) in &other_graph.nodes {
+                    if let Some(header) = crate::scheme_engine::parse_module_header(&other_node.script_code) {
+                        if header.name == *module_name {
+                            // Register cross-canvas library with output_values
+                            // Use widget_values as initial values (output_values are runtime-only)
+                            let mut values = other_node.widget_values.clone();
+                            for (k, v) in &other_node.output_values {
+                                values.insert(k.clone(), v.clone());
+                            }
+                            // If no values yet, use 0.0 stubs for exports
+                            if values.is_empty() {
+                                for exp in &header.exports {
+                                    values.insert(exp.clone(), Value::F64(0.0));
+                                }
+                            }
+                            self.resources.scheme.register_cross_canvas_library(
+                                canvas_name, module_name, &values,
+                            );
+                            // Also create a phantom node for visibility
+                            let phantom_label = format!("{}:{}", canvas_name, module_name);
+                            let already_exists = self.graph.nodes.values().any(|n| n.phantom && n.label == phantom_label);
+                            if !already_exists {
+                                let id = self.graph.next_node_id;
+                                self.graph.next_node_id += 1;
+                                let phantom_count = self.graph.nodes.values().filter(|n| n.phantom).count();
+                                let node = Node {
+                                    id,
+                                    template_name: "Script".to_string(),
+                                    label: phantom_label,
+                                    pos: [900.0, 50.0 + phantom_count as f32 * 200.0],
+                                    input_values: HashMap::new(),
+                                    output_values: values.clone(),
+                                    script_code: String::new(),
+                                    script_inputs: Vec::new(),
+                                    script_outputs: header.exports.iter()
+                                        .map(|k| PortDef { name: k.clone(), port_type: PortType::F64 })
+                                        .collect(),
+                                    widget_decls: Vec::new(),
+                                    widget_values: HashMap::new(),
+                                    error: None,
+                                    last_exec_us: None,
+                                    render_blocks: Vec::new(),
+                                    phantom: true,
+                                    remote_peer: Some(format!("canvas:{}", canvas_name)),
+                                };
+                                self.graph.nodes.insert(id, node);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn compute_node(&mut self, node_id: NodeId) {

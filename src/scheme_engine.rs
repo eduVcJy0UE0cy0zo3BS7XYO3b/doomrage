@@ -377,7 +377,10 @@ const _SCRIBBLE_REMOVED: &str = r###"
 pub struct ModuleHeader {
     pub name: String,
     pub exports: Vec<String>,
+    /// Local imports: module names from current canvas (use-module (node X))
     pub imports: Vec<String>,
+    /// Cross-canvas imports: (canvas_name, module_name) from (use-module (canvas-name module-name))
+    pub cross_imports: Vec<(String, String)>,
 }
 
 /// Parse `(define-module ...)` header from script code textually.
@@ -415,15 +418,24 @@ pub fn parse_module_header(code: &str) -> Option<ModuleHeader> {
         }
     }
 
-    // Parse (use-module (node X)) — may appear multiple times
-    let pat = "(use-module (node ";
+    // Parse (use-module (...)) — may appear multiple times
+    let use_pat = "(use-module (";
     let mut start = 0;
-    while let Some(pos) = form[start..].find(pat) {
-        let abs = start + pos + pat.len();
+    while let Some(pos) = form[start..].find(use_pat) {
+        let abs = start + pos + use_pat.len();
         if let Some(end) = form[abs..].find("))") {
-            let label = form[abs..abs + end].trim();
-            if !label.is_empty() {
-                header.imports.push(label.to_string());
+            let inner = form[abs..abs + end].trim();
+            let parts: Vec<&str> = inner.split_whitespace().collect();
+            match parts.len() {
+                // (use-module (node controls)) — local import
+                2 if parts[0] == "node" => {
+                    header.imports.push(parts[1].to_string());
+                }
+                // (use-module (other-canvas controls)) — cross-canvas import
+                2 if parts[0] != "node" => {
+                    header.cross_imports.push((parts[0].to_string(), parts[1].to_string()));
+                }
+                _ => {}
             }
         }
         start = abs;
@@ -493,10 +505,14 @@ pub fn strip_module_header(code: &str) -> (String, Vec<String>) {
         let before = &code[..dm_start];
         let after = &code[dm_end + 1..];
         let body = format!("{}{}", before.trim_end(), after);
-        // Generate (import (node X)) statements from use-module
-        let imports: Vec<String> = header.imports.iter()
+        // Generate (import ...) statements from use-module
+        let mut imports: Vec<String> = header.imports.iter()
             .map(|label| format!("(import (node {}))", label))
             .collect();
+        // Cross-canvas imports: (import (canvas-name module-name))
+        for (canvas, module) in &header.cross_imports {
+            imports.push(format!("(import ({} {}))", canvas, module));
+        }
         (body.trim_start_matches('\n').to_string(), imports)
     } else {
         (code.to_string(), Vec::new())
@@ -751,6 +767,30 @@ impl SchemeEngine {
     }
 
 
+
+    /// Register a cross-canvas module library: `(library (canvas-name module-name) ...)`
+    pub fn register_cross_canvas_library(
+        &self,
+        canvas_name: &str,
+        module_name: &str,
+        outputs: &HashMap<String, crate::types::Value>,
+    ) {
+        if outputs.is_empty() {
+            return;
+        }
+        let exports: Vec<String> = outputs.keys().cloned().collect();
+        let defines: Vec<String> = outputs
+            .iter()
+            .map(|(name, val)| format!("(define {} {})", name, val.to_scheme_literal()))
+            .collect();
+        let lib_str = format!(
+            "(library ({} {}) (export {}) (import (rnrs)) {})",
+            canvas_name, module_name, exports.join(" "), defines.join(" ")
+        );
+        if let Err(e) = self.runtime.def_lib(&lib_str) {
+            log::warn!("Failed to register cross-canvas library ({} {}): {}", canvas_name, module_name, e);
+        }
+    }
 
     /// Split code string into individual top-level S-expressions.
     /// Tracks paren depth and string literals to find form boundaries.
@@ -1202,6 +1242,18 @@ mod tests {
 
         // No define-module
         assert!(parse_module_header("(define x 1)").is_none());
+
+        // Cross-canvas imports
+        let code3 = r#"
+(define-module (node synth)
+  (use-module (node local-mod))
+  (use-module (other-canvas controls))
+  (export sound))
+"#;
+        let header3 = parse_module_header(code3).unwrap();
+        assert_eq!(header3.name, "synth");
+        assert_eq!(header3.imports, vec!["local-mod"]);
+        assert_eq!(header3.cross_imports, vec![("other-canvas".to_string(), "controls".to_string())]);
     }
 
     #[test]
@@ -1211,6 +1263,11 @@ mod tests {
         assert!(!body.contains("define-module"));
         assert!(body.contains("(define bar 42)"));
         assert_eq!(imports, vec!["(import (node foo))"]);
+
+        // Cross-canvas strip
+        let code2 = "(define-module (node x)\n  (use-module (my-canvas ctrl))\n  (export y))\n(define y 1)";
+        let (_, imports2) = strip_module_header(code2);
+        assert!(imports2.contains(&"(import (my-canvas ctrl))".to_string()));
     }
 
     #[test]
