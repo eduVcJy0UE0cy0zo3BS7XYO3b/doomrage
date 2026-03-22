@@ -17,6 +17,8 @@ use std::time::Instant;
 
 pub struct WasmCanvasApp {
     graph: Graph,
+    /// All loaded canvases: canvas_name -> Graph
+    all_graphs: HashMap<String, Graph>,
     registry: NodeRegistry,
     resources: AppResources,
     actor_runtime: ActorRuntime,
@@ -127,6 +129,18 @@ impl WasmCanvasApp {
             canvas_list.push(current_canvas.clone());
         }
 
+        // Load all canvases into memory
+        let mut all_graphs: HashMap<String, Graph> = HashMap::new();
+        for name in &canvas_list {
+            if *name == current_canvas {
+                all_graphs.insert(name.clone(), graph.clone());
+            } else if let Ok(Some(g)) = persistence::load_canvas_from_db(name, &resources.db) {
+                all_graphs.insert(name.clone(), g);
+            } else {
+                all_graphs.insert(name.clone(), Graph::new());
+            }
+        }
+
         // Initialize ports and libraries from define-module headers (before compute)
         {
             // 1. Set script_outputs from (export ...) in define-module
@@ -191,6 +205,7 @@ impl WasmCanvasApp {
 
         Self {
             graph,
+            all_graphs,
             registry,
             resources,
             actor_runtime,
@@ -899,60 +914,36 @@ impl WasmCanvasApp {
                     self.favorites = persistence::list_favorites(&self.resources.db);
                 }
                 PanelAction::NewCanvas(name) => {
-                    // Save current canvas first
-                    let _ = persistence::save_canvas_to_db(&self.current_canvas, &self.graph, &self.resources.db);
-                    // Switch to new empty canvas
+                    // Save current graph
+                    self.all_graphs.insert(self.current_canvas.clone(), self.graph.clone());
+                    // Create new empty canvas
                     self.graph = Graph::new();
                     self.current_canvas = name.clone();
+                    self.all_graphs.insert(name.clone(), Graph::new());
                     let _ = persistence::save_canvas_to_db(&self.current_canvas, &self.graph, &self.resources.db);
                     self.canvas_list = persistence::list_canvases(&self.resources.db);
-                    self.undo_history = UndoHistory::new(10);
-                    self.undo_history.push(&self.graph);
                     self.panel_state.selected_node = None;
-                    self.pending_nodes.clear();
-                    self.actor_runtime.cancel_all();
                 }
                 PanelAction::SwitchCanvas(name) => {
-                    // Save current canvas
-                    let _ = persistence::save_canvas_to_db(&self.current_canvas, &self.graph, &self.resources.db);
-                    // Load target canvas (None = empty canvas, that's OK)
-                    let g = match persistence::load_canvas_from_db(&name, &self.resources.db) {
-                        Ok(Some(g)) => g,
-                        Ok(None) => Graph::new(),
-                        Err(e) => {
-                            log::error!("Failed to load canvas '{}': {}", name, e);
-                            Graph::new()
-                        }
-                    };
-                    self.graph = g;
+                    // Save current graph back to all_graphs
+                    self.all_graphs.insert(self.current_canvas.clone(), self.graph.clone());
+                    // Switch to target graph
+                    self.graph = self.all_graphs.get(&name).cloned().unwrap_or_else(Graph::new);
                     self.current_canvas = name;
                     self.init_graph_libraries();
-                    self.undo_history = UndoHistory::new(10);
-                    self.undo_history.push(&self.graph);
                     self.panel_state.selected_node = None;
-                    self.pending_nodes.clear();
-                    self.actor_runtime.cancel_all();
+                    // Don't cancel actor runtime or clear env cache — keep everything running
                 }
                 PanelAction::DeleteCanvas(name) => {
                     if self.canvas_list.len() > 1 {
                         let _ = persistence::delete_canvas(&name, &self.resources.db);
+                        self.all_graphs.remove(&name);
                         self.canvas_list = persistence::list_canvases(&self.resources.db);
-                        // Switch to first remaining canvas
                         if self.current_canvas == name {
                             let next = self.canvas_list.first().cloned().unwrap_or_else(|| "default".to_string());
-                            match persistence::load_canvas_from_db(&next, &self.resources.db) {
-                                Ok(Some(g)) => {
-                                    self.graph = g;
-                                    self.current_canvas = next;
-                                    self.init_graph_libraries();
-                                }
-                                _ => {
-                                    self.graph = Graph::new();
-                                    self.current_canvas = next;
-                                }
-                            }
-                            self.undo_history = UndoHistory::new(10);
-                            self.undo_history.push(&self.graph);
+                            self.graph = self.all_graphs.get(&next).cloned().unwrap_or_else(Graph::new);
+                            self.current_canvas = next;
+                            self.init_graph_libraries();
                             self.panel_state.selected_node = None;
                         }
                         // Persist to disk immediately
@@ -998,8 +989,13 @@ impl WasmCanvasApp {
     }
 
     fn save_graph(&mut self) {
-        if let Err(e) = persistence::save_canvas_to_db(&self.current_canvas, &self.graph, &self.resources.db) {
-            log::error!("Failed to save canvas to DB: {}", e);
+        // Save current graph back to all_graphs
+        self.all_graphs.insert(self.current_canvas.clone(), self.graph.clone());
+        // Save all canvases to DB
+        for (name, g) in &self.all_graphs {
+            if let Err(e) = persistence::save_canvas_to_db(name, g, &self.resources.db) {
+                log::error!("Failed to save canvas '{}' to DB: {}", name, e);
+            }
         }
         // Persist to disk immediately
         let _ = persistence::save_db(&self.resources.db, &PathBuf::from("./db.json"));
@@ -1296,9 +1292,12 @@ impl eframe::App for WasmCanvasApp {
     }
 
     fn on_exit(&mut self) {
-        // Auto-save current canvas to DB
-        if let Err(e) = persistence::save_canvas_to_db(&self.current_canvas, &self.graph, &self.resources.db) {
-            log::error!("Failed to auto-save canvas to DB: {}", e);
+        // Auto-save all canvases to DB
+        self.all_graphs.insert(self.current_canvas.clone(), self.graph.clone());
+        for (name, g) in &self.all_graphs {
+            if let Err(e) = persistence::save_canvas_to_db(name, g, &self.resources.db) {
+                log::error!("Failed to auto-save canvas '{}': {}", name, e);
+            }
         }
         // Persist DB to disk
         if let Err(e) = persistence::save_db(&self.resources.db, &PathBuf::from("./db.json")) {
