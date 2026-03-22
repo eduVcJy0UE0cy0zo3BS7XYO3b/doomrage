@@ -56,6 +56,129 @@ pub fn load_db(db: &Db, path: &Path) -> Result<()> {
     Ok(())
 }
 
+// --- DB graph persistence ---
+
+/// Save graph into the DB (graph_meta + graph_nodes tables).
+pub fn save_graph_to_db(graph: &Graph, db: &Db) -> Result<()> {
+    // Clear existing graph data
+    db.run("DELETE graph_meta")?;
+    db.run("DELETE graph_nodes")?;
+
+    // Save metadata
+    db.run(&format!(
+        "CREATE graph_meta SET viewport_offset_x = {}, viewport_offset_y = {}, viewport_zoom = {}, next_node_id = {}",
+        graph.viewport_offset[0], graph.viewport_offset[1], graph.viewport_zoom, graph.next_node_id
+    ))?;
+
+    // Save each non-phantom node using record ID = node:N
+    for (_, node) in &graph.nodes {
+        if node.phantom { continue; }
+        // Serialize values as JSON strings to avoid SurrealDB key issues
+        let input_values_json = serde_json::to_string(&node.input_values)?;
+        let widget_values_json = serde_json::to_string(&node.widget_values)?;
+        let script_code_escaped = Db::escape_surql(&node.script_code);
+        let label_escaped = Db::escape_surql(&node.label);
+        let template_escaped = Db::escape_surql(&node.template_name);
+
+        db.run(&format!(
+            "CREATE graph_nodes:{} SET \
+             node_id = {}, \
+             template_name = '{}', \
+             label = '{}', \
+             pos_x = {}, \
+             pos_y = {}, \
+             script_code = '{}', \
+             input_values_json = '{}', \
+             widget_values_json = '{}'",
+            node.id,
+            node.id,
+            template_escaped,
+            label_escaped,
+            node.pos[0],
+            node.pos[1],
+            script_code_escaped,
+            Db::escape_surql(&input_values_json),
+            Db::escape_surql(&widget_values_json),
+        ))?;
+    }
+
+    log::info!("Saved graph to DB: {} nodes", graph.nodes.values().filter(|n| !n.phantom).count());
+    Ok(())
+}
+
+/// Load graph from the DB. Returns None if no graph data found.
+pub fn load_graph_from_db(db: &Db) -> Result<Option<Graph>> {
+    let meta_rows = db.query("SELECT * FROM graph_meta")?;
+    let meta = match meta_rows.first() {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+
+    let mut graph = Graph::new();
+    graph.viewport_offset[0] = meta.get("viewport_offset_x")
+        .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    graph.viewport_offset[1] = meta.get("viewport_offset_y")
+        .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    graph.viewport_zoom = meta.get("viewport_zoom")
+        .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+    graph.next_node_id = meta.get("next_node_id")
+        .and_then(|v| v.as_u64()).unwrap_or(1);
+
+    let node_rows = db.query("SELECT * FROM graph_nodes")?;
+    for row in &node_rows {
+        let node_id = match row.get("node_id").and_then(|v| v.as_u64()) {
+            Some(id) => id,
+            None => continue,
+        };
+        let template_name = row.get("template_name")
+            .and_then(|v| v.as_str()).unwrap_or("Script").to_string();
+        let label = row.get("label")
+            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let pos_x = row.get("pos_x")
+            .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let pos_y = row.get("pos_y")
+            .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let script_code = row.get("script_code")
+            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        let input_values: HashMap<String, crate::types::Value> = row.get("input_values_json")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let widget_values: HashMap<String, crate::types::Value> = row.get("widget_values_json")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
+        let node = Node {
+            id: node_id,
+            template_name,
+            label,
+            pos: [pos_x, pos_y],
+            input_values,
+            output_values: HashMap::new(),
+            script_code,
+            script_inputs: Vec::new(),
+            script_outputs: Vec::new(),
+            widget_decls: Vec::new(),
+            widget_values,
+            error: None,
+            last_exec_us: None,
+            render_blocks: Vec::new(),
+            phantom: false,
+            remote_peer: None,
+        };
+        graph.nodes.insert(node_id, node);
+    }
+
+    if graph.nodes.is_empty() {
+        return Ok(None);
+    }
+
+    log::info!("Loaded graph from DB: {} nodes", graph.nodes.len());
+    Ok(Some(graph))
+}
+
 // --- SCM format support ---
 
 /// Load a graph from .scm format
@@ -699,5 +822,150 @@ mod tests {
         let controls = &graph.nodes[&1];
         assert_eq!(controls.label, "controls");
         assert!(controls.script_code.contains("define-module"));
+    }
+
+    #[test]
+    fn test_db_graph_roundtrip() {
+        let db = crate::db::Db::new().unwrap();
+
+        // Build a graph with various node types
+        let mut graph = Graph::new();
+        let mut node = Node {
+            id: 1,
+            template_name: "Script".to_string(),
+            label: "test-node".to_string(),
+            pos: [100.0, 200.0],
+            input_values: HashMap::new(),
+            output_values: HashMap::new(),
+            script_code: "(define x 42)\n(define y (+ x 1))".to_string(),
+            script_inputs: Vec::new(),
+            script_outputs: Vec::new(),
+            widget_decls: Vec::new(),
+            widget_values: HashMap::new(),
+            error: None,
+            last_exec_us: None,
+            render_blocks: Vec::new(),
+            phantom: false,
+            remote_peer: None,
+        };
+        node.input_values.insert("gain".into(), crate::types::Value::F64(55.0));
+        node.input_values.insert("name".into(), crate::types::Value::Str("hello".into()));
+        node.widget_values.insert("speed".into(), crate::types::Value::F64(3.0));
+        graph.nodes.insert(1, node);
+
+        graph.viewport_offset = [10.0, 20.0];
+        graph.viewport_zoom = 1.5;
+        graph.next_node_id = 2;
+
+        // Save to DB
+        save_graph_to_db(&graph, &db).unwrap();
+
+        // Load from DB
+        let loaded = load_graph_from_db(&db).unwrap().unwrap();
+        assert_eq!(loaded.nodes.len(), 1);
+        assert_eq!(loaded.viewport_offset, [10.0, 20.0]);
+        assert!((loaded.viewport_zoom - 1.5).abs() < 0.01);
+        assert_eq!(loaded.next_node_id, 2);
+
+        let n = &loaded.nodes[&1];
+        assert_eq!(n.label, "test-node");
+        assert_eq!(n.pos, [100.0, 200.0]);
+        assert!(n.script_code.contains("(define x 42)"));
+        match n.input_values.get("gain") {
+            Some(crate::types::Value::F64(v)) => assert!((v - 55.0).abs() < 0.01),
+            other => panic!("Expected F64(55.0), got {:?}", other),
+        }
+        match n.input_values.get("name") {
+            Some(crate::types::Value::Str(s)) => assert_eq!(s, "hello"),
+            other => panic!("Expected Str(\"hello\"), got {:?}", other),
+        }
+        match n.widget_values.get("speed") {
+            Some(crate::types::Value::F64(v)) => assert!((v - 3.0).abs() < 0.01),
+            other => panic!("Expected F64(3.0), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_db_graph_phantom_not_saved() {
+        let db = crate::db::Db::new().unwrap();
+
+        let mut graph = Graph::new();
+        // Regular node
+        graph.nodes.insert(1, Node {
+            id: 1,
+            template_name: "Script".to_string(),
+            label: "real".to_string(),
+            pos: [0.0, 0.0],
+            input_values: HashMap::new(),
+            output_values: HashMap::new(),
+            script_code: String::new(),
+            script_inputs: Vec::new(),
+            script_outputs: Vec::new(),
+            widget_decls: Vec::new(),
+            widget_values: HashMap::new(),
+            error: None,
+            last_exec_us: None,
+            render_blocks: Vec::new(),
+            phantom: false,
+            remote_peer: None,
+        });
+        // Phantom node
+        graph.nodes.insert(2, Node {
+            id: 2,
+            template_name: "Script".to_string(),
+            label: "phantom".to_string(),
+            pos: [0.0, 0.0],
+            input_values: HashMap::new(),
+            output_values: HashMap::new(),
+            script_code: String::new(),
+            script_inputs: Vec::new(),
+            script_outputs: Vec::new(),
+            widget_decls: Vec::new(),
+            widget_values: HashMap::new(),
+            error: None,
+            last_exec_us: None,
+            render_blocks: Vec::new(),
+            phantom: true,
+            remote_peer: Some("peer123".to_string()),
+        });
+        graph.next_node_id = 3;
+
+        save_graph_to_db(&graph, &db).unwrap();
+        let loaded = load_graph_from_db(&db).unwrap().unwrap();
+        assert_eq!(loaded.nodes.len(), 1);
+        assert!(loaded.nodes.contains_key(&1));
+        assert!(!loaded.nodes.contains_key(&2));
+    }
+
+    #[test]
+    fn test_db_graph_special_chars_in_code() {
+        let db = crate::db::Db::new().unwrap();
+
+        let mut graph = Graph::new();
+        graph.nodes.insert(1, Node {
+            id: 1,
+            template_name: "Script".to_string(),
+            label: "node with 'quotes'".to_string(),
+            pos: [0.0, 0.0],
+            input_values: HashMap::new(),
+            output_values: HashMap::new(),
+            script_code: "(define msg \"hello 'world' \\\"quoted\\\"\")\n; comment with 'quotes'".to_string(),
+            script_inputs: Vec::new(),
+            script_outputs: Vec::new(),
+            widget_decls: Vec::new(),
+            widget_values: HashMap::new(),
+            error: None,
+            last_exec_us: None,
+            render_blocks: Vec::new(),
+            phantom: false,
+            remote_peer: None,
+        });
+        graph.next_node_id = 2;
+
+        save_graph_to_db(&graph, &db).unwrap();
+        let loaded = load_graph_from_db(&db).unwrap().unwrap();
+        let n = &loaded.nodes[&1];
+        assert_eq!(n.label, "node with 'quotes'");
+        assert!(n.script_code.contains("hello 'world'"));
     }
 }

@@ -99,7 +99,7 @@ impl Db {
     // --- Key-value convenience ---
 
     /// Escape a string for safe use inside SurrealQL single quotes
-    fn escape_surql(s: &str) -> String {
+    pub fn escape_surql(s: &str) -> String {
         s.replace('\\', "\\\\").replace('\'', "\\'")
     }
 

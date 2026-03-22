@@ -63,34 +63,48 @@ impl WasmCanvasApp {
             log::warn!("Failed to restore DB: {}", e);
         }
 
-        // Try loading demo graph on first launch (prefer .scm over .json)
-        let (mut graph, current_file) = {
-            let scm_path = PathBuf::from("./demo.scm");
-            let json_path = PathBuf::from("./demo.json");
-            if scm_path.exists() {
-                match persistence::load_graph_scm(&scm_path, &resources.db) {
-                    Ok(g) => {
-                        log::info!("Loaded demo graph from .scm");
-                        (g, Some(scm_path))
+        // Load graph: DB first, then fallback to .scm/.json import
+        let mut graph = match persistence::load_graph_from_db(&resources.db) {
+            Ok(Some(g)) => {
+                log::info!("Loaded graph from DB");
+                g
+            }
+            _ => {
+                // First launch or empty DB — try importing from .scm/.json
+                let scm_path = PathBuf::from("./demo.scm");
+                let json_path = PathBuf::from("./demo.json");
+                if scm_path.exists() {
+                    match persistence::load_graph_scm(&scm_path, &resources.db) {
+                        Ok(g) => {
+                            log::info!("Imported graph from demo.scm into DB");
+                            // Save imported graph to DB immediately
+                            if let Err(e) = persistence::save_graph_to_db(&g, &resources.db) {
+                                log::warn!("Failed to save imported graph to DB: {}", e);
+                            }
+                            g
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to load demo.scm: {}", e);
+                            Graph::new()
+                        }
                     }
-                    Err(e) => {
-                        log::warn!("Failed to load demo.scm: {}", e);
-                        (Graph::new(), None)
+                } else if json_path.exists() {
+                    match persistence::load_graph(&json_path, &resources.db) {
+                        Ok(g) => {
+                            log::info!("Imported graph from demo.json into DB");
+                            if let Err(e) = persistence::save_graph_to_db(&g, &resources.db) {
+                                log::warn!("Failed to save imported graph to DB: {}", e);
+                            }
+                            g
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to load demo.json: {}", e);
+                            Graph::new()
+                        }
                     }
+                } else {
+                    Graph::new()
                 }
-            } else if json_path.exists() {
-                match persistence::load_graph(&json_path, &resources.db) {
-                    Ok(g) => {
-                        log::info!("Loaded demo graph from .json");
-                        (g, Some(json_path))
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to load demo.json: {}", e);
-                        (Graph::new(), None)
-                    }
-                }
-            } else {
-                (Graph::new(), None)
             }
         };
         // Initialize ports and libraries from define-module headers (before compute)
@@ -162,7 +176,7 @@ impl WasmCanvasApp {
             canvas_state: CanvasState::new(),
             panel_state: PanelState::new(),
             undo_history,
-            current_file,
+            current_file: None,
             theme_applied: false,
             pending_nodes: HashSet::new(),
             debug_log: DebugLog::new(),
@@ -711,9 +725,14 @@ impl WasmCanvasApp {
     }
 
     fn save_graph(&mut self) {
+        // Always save to DB
+        if let Err(e) = persistence::save_graph_to_db(&self.graph, &self.resources.db) {
+            log::error!("Failed to save graph to DB: {}", e);
+        }
+        // Also export to file if user wants
         let path = self.current_file.clone().or_else(|| {
             rfd::FileDialog::new()
-                .set_title("Save Graph")
+                .set_title("Export Graph")
                 .add_filter("Scheme", &["scm"])
                 .add_filter("JSON", &["json"])
                 .save_file()
@@ -726,7 +745,7 @@ impl WasmCanvasApp {
                 persistence::save_graph(&self.graph, &path, &self.resources.db)
             };
             if let Err(e) = result {
-                log::error!("Failed to save graph: {}", e);
+                log::error!("Failed to export graph: {}", e);
             } else {
                 self.current_file = Some(path);
             }
@@ -734,8 +753,9 @@ impl WasmCanvasApp {
     }
 
     fn load_graph(&mut self) {
+        // Import from file → DB
         let path = rfd::FileDialog::new()
-            .set_title("Load Graph")
+            .set_title("Import Graph")
             .add_filter("Graph files", &["scm", "json"])
             .pick_file();
 
@@ -748,11 +768,15 @@ impl WasmCanvasApp {
             match result {
                 Ok(graph) => {
                     self.graph = graph;
+                    // Save imported graph to DB
+                    if let Err(e) = persistence::save_graph_to_db(&self.graph, &self.resources.db) {
+                        log::error!("Failed to save imported graph to DB: {}", e);
+                    }
                     self.undo_history.push(&self.graph);
                     self.current_file = Some(path);
                 }
                 Err(e) => {
-                    log::error!("Failed to load graph: {}", e);
+                    log::error!("Failed to import graph: {}", e);
                 }
             }
         }
@@ -1032,6 +1056,11 @@ impl eframe::App for WasmCanvasApp {
     }
 
     fn on_exit(&mut self) {
+        // Auto-save graph to DB
+        if let Err(e) = persistence::save_graph_to_db(&self.graph, &self.resources.db) {
+            log::error!("Failed to auto-save graph to DB: {}", e);
+        }
+        // Persist DB to disk
         if let Err(e) = persistence::save_db(&self.resources.db, &PathBuf::from("./db.json")) {
             log::error!("Failed to auto-save DB: {}", e);
         }
