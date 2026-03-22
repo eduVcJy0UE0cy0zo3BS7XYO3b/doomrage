@@ -15,6 +15,9 @@ pub type NetValues = Arc<Mutex<HashMap<(String, String), HashMap<String, crate::
 /// Shared OCapN slot store: swiss-hex -> mutable slot value
 pub type OCapNSlotStore = Arc<Mutex<HashMap<String, Arc<Mutex<crate::ocapn::syrup::SyrupValue>>>>>;
 
+/// Mapping: swiss-hex -> owner node ID (for routing OCapN delivers to actor mailboxes)
+pub type OCapNSlotOwners = Arc<Mutex<HashMap<String, crate::types::NodeId>>>;
+
 thread_local! {
     static THREAD_DB: RefCell<Option<Db>> = RefCell::new(None);
 }
@@ -690,6 +693,13 @@ fn bridge_ocapn_export(value: &Value) -> Result<Vec<Value>, Exception> {
             });
             swiss_hex
         };
+
+        // Record owner node_id for OCapN → mailbox routing
+        crate::actor::with_actor_ctx(|ctx| {
+            if let Some(owners) = ctx.slot_owners.as_ref() {
+                owners.lock().unwrap().insert(swiss_hex.clone(), ctx.node_id);
+            }
+        });
 
         format!("ocapn://{}.libp2p/s/{}", peer_id, swiss_hex)
     })?;

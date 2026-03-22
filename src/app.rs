@@ -9,7 +9,7 @@ use crate::persistence::{self, UndoHistory};
 use crate::registry::NodeRegistry;
 use crate::theme;
 use crate::types::*;
-use crate::actor::{ActorMsg, ActorResult, ActorRuntime};
+use crate::actor::{ActorResult, ActorRuntime};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -36,6 +36,7 @@ pub struct WasmCanvasApp {
     connected_peers: crate::bridge::ConnectedPeers,
     ocapn_call_results: crate::bridge::OCapNCallResults,
     node_mailboxes: crate::bridge::NodeMailboxes,
+    ocapn_slot_owners: crate::bridge::OCapNSlotOwners,
     /// Nodes that registered an on-message handler (reactive actors)
     actor_nodes: HashSet<NodeId>,
 }
@@ -96,6 +97,7 @@ impl WasmCanvasApp {
         let connected_peers: crate::bridge::ConnectedPeers = Arc::new(Mutex::new(HashSet::new()));
         let ocapn_call_results: crate::bridge::OCapNCallResults = Arc::new(Mutex::new(HashMap::new()));
         let node_mailboxes: crate::bridge::NodeMailboxes = Arc::new(Mutex::new(HashMap::new()));
+        let ocapn_slot_owners: crate::bridge::OCapNSlotOwners = Arc::new(Mutex::new(HashMap::new()));
 
         let mut actor_runtime = ActorRuntime::new(Arc::clone(&resources.scheme));
         actor_runtime.set_net_values(net_values.clone());
@@ -105,6 +107,8 @@ impl WasmCanvasApp {
         actor_runtime.set_ocapn_call_results(ocapn_call_results.clone());
         actor_runtime.set_node_mailboxes(node_mailboxes.clone());
         actor_runtime.set_wasm_runner(resources.wasm.clone());
+        actor_runtime.set_slot_owners(ocapn_slot_owners.clone());
+        actor_runtime.set_egui_ctx(cc.egui_ctx.clone());
 
         Self {
             graph,
@@ -126,27 +130,33 @@ impl WasmCanvasApp {
             connected_peers,
             ocapn_call_results,
             node_mailboxes,
+            ocapn_slot_owners,
             actor_nodes: HashSet::new(),
         }
     }
 
     fn compute_node(&mut self, node_id: NodeId) {
-        if let Some(node) = self.graph.nodes.get(&node_id) {
-            let template = self.registry.templates.get(&node.template_name).cloned();
-
-            let mut available_inputs = self.graph.resolve_all_input_values(node_id);
-            for (k, v) in &node.widget_values {
-                available_inputs.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-
+        if let Some((node, template, inputs)) = self.resolve_node(node_id) {
             self.pending_nodes.insert(node_id);
-            self.actor_runtime.send(node_id, ActorMsg {
-                node: node.clone(),
-                template,
-                available_inputs,
-                db: self.resources.db.clone(),
-            });
+            self.actor_runtime.compute(node_id, node, template, inputs, self.resources.db.clone());
         }
+    }
+
+    fn compute_node_debounced(&mut self, node_id: NodeId) {
+        if let Some((node, template, inputs)) = self.resolve_node(node_id) {
+            self.pending_nodes.insert(node_id);
+            self.actor_runtime.compute_debounced(node_id, node, template, inputs, self.resources.db.clone());
+        }
+    }
+
+    fn resolve_node(&self, node_id: NodeId) -> Option<(Node, Option<NodeTemplate>, HashMap<String, Value>)> {
+        let node = self.graph.nodes.get(&node_id)?;
+        let template = self.registry.templates.get(&node.template_name).cloned();
+        let mut available_inputs = self.graph.resolve_all_input_values(node_id);
+        for (k, v) in &node.widget_values {
+            available_inputs.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        Some((node.clone(), template, available_inputs))
     }
 
     fn poll_worker_results(&mut self) {
@@ -349,6 +359,7 @@ impl WasmCanvasApp {
                             ) = (&args[0], &args[1]) {
                                 if method == "deliver-to" {
                                     if let Some(swiss) = crate::ocapn::types::SwissNum::from_syrup(swiss_val) {
+                                        let swiss_hex = swiss.to_hex();
                                         let remaining_args = &args[2..];
                                         let mgr = self.session_manager.lock().unwrap();
                                         match mgr.deliver_by_swiss(&swiss, remaining_args) {
@@ -356,8 +367,22 @@ impl WasmCanvasApp {
                                                 self.debug_log.log("ocapn", format!(
                                                     "deliver ok: {:?}", result
                                                 ));
-                                                // Trigger recompute on nodes using ocapn-receive
                                                 drop(mgr);
+
+                                                // Route to owner node's mailbox
+                                                let owner_id = self.ocapn_slot_owners.lock().unwrap()
+                                                    .get(&swiss_hex).copied();
+                                                if let Some(owner_id) = owner_id {
+                                                    let mut mailboxes = self.node_mailboxes.lock().unwrap();
+                                                    mailboxes.entry(owner_id).or_default()
+                                                        .push_back(remaining_args.to_vec());
+                                                    drop(mailboxes);
+                                                    if !self.pending_nodes.contains(&owner_id) {
+                                                        self.compute_node(owner_id);
+                                                    }
+                                                }
+
+                                                // Also trigger recompute on nodes using ocapn-receive
                                                 let ocapn_nodes: Vec<NodeId> = self.graph.nodes.iter()
                                                     .filter(|(_, n)| n.template_name == "Script" && n.script_code.contains("ocapn-receive"))
                                                     .map(|(id, _)| *id).collect();
@@ -484,11 +509,10 @@ impl WasmCanvasApp {
                     if let Some(node) = self.graph.nodes.get_mut(&node_id) {
                         node.widget_values.insert(key, val);
                     }
-                    // Re-register node library with updated outputs and recompute
                     if let Some(node) = self.graph.nodes.get(&node_id) {
                         self.actor_runtime.engine().register_node_library(node_id, &node.output_values);
                     }
-                    self.compute_node(node_id);
+                    self.compute_node_debounced(node_id);
                 }
             }
         }
@@ -670,7 +694,7 @@ impl eframe::App for WasmCanvasApp {
                 if let Some(node) = self.graph.nodes.get(&node_id) {
                     self.actor_runtime.engine().register_node_library(node_id, &node.output_values);
                 }
-                self.compute_node(node_id);
+                self.compute_node_debounced(node_id);
             }
 
             // Context menu for adding nodes

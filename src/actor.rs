@@ -1,6 +1,6 @@
 use crate::bridge::{
-    ConnectedPeers, NodeMailboxes, OCapNCallResults, OCapNSendEntry, OCapNSlotStore,
-    SharedSessionManager,
+    ConnectedPeers, NodeMailboxes, OCapNCallResults, OCapNSendEntry, OCapNSlotOwners,
+    OCapNSlotStore, SharedSessionManager,
 };
 use crate::bridge::NetValues;
 use crate::db::Db;
@@ -30,6 +30,7 @@ pub struct ActorContext {
     pub connected_peers: Option<ConnectedPeers>,
     pub ocapn_call_results: Option<OCapNCallResults>,
     pub node_mailboxes: Option<NodeMailboxes>,
+    pub slot_owners: Option<OCapNSlotOwners>,
 
     // --- Per-eval outputs (collected during eval, taken after) ---
     pub ocapn_sends: Vec<OCapNSendEntry>,
@@ -50,6 +51,7 @@ impl ActorContext {
             connected_peers: None,
             ocapn_call_results: None,
             node_mailboxes: None,
+            slot_owners: None,
             ocapn_sends: Vec::new(),
             net_publishes: Vec::new(),
             tick_interval_ms: None,
@@ -139,12 +141,14 @@ pub fn with_actor_context<R>(ctx: &mut ActorContext, f: impl FnOnce() -> R) -> R
 
 // --- ActorRuntime: per-node async dispatch ---
 
-/// Message sent to an actor.
-pub struct ActorMsg {
-    pub node: crate::types::Node,
-    pub template: Option<NodeTemplate>,
-    pub available_inputs: HashMap<String, Value>,
-    pub db: Db,
+/// Internal message — not exposed to callers.
+struct ActorMsg {
+    node: crate::types::Node,
+    template: Option<NodeTemplate>,
+    available_inputs: HashMap<String, Value>,
+    db: Db,
+    immediate: bool,
+    fast_message_path: bool,
 }
 
 /// Result from processing an actor message.
@@ -178,7 +182,9 @@ struct SharedResources {
     connected_peers: Option<ConnectedPeers>,
     ocapn_call_results: Option<OCapNCallResults>,
     node_mailboxes: Option<NodeMailboxes>,
+    slot_owners: Option<OCapNSlotOwners>,
     wasm: Option<WasmRunner>,
+    egui_ctx: Option<egui::Context>,
 }
 
 /// Cached environment for a node.
@@ -207,6 +213,8 @@ struct NodeState {
 pub struct ActorRuntime {
     /// Scheme engine shared across all actor threads
     engine: Arc<SchemeEngine>,
+    /// Thread pool for eval execution
+    pool: rayon::ThreadPool,
     /// Channel for receiving completed results from worker threads
     result_rx: mpsc::Receiver<ActorResult>,
     result_tx: mpsc::Sender<ActorResult>,
@@ -220,6 +228,8 @@ pub struct ActorRuntime {
     debounce_queue: HashMap<NodeId, PendingCompute>,
     /// Debounce delay in milliseconds (0 = immediate)
     debounce_ms: u64,
+    /// Nodes that have on-message handlers (for fast path)
+    handler_nodes: std::collections::HashSet<NodeId>,
 }
 
 impl ActorRuntime {
@@ -229,8 +239,13 @@ impl ActorRuntime {
 
     pub fn with_debounce(engine: Arc<SchemeEngine>, debounce_ms: u64) -> Self {
         let (result_tx, result_rx) = mpsc::channel();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("Failed to create thread pool");
         Self {
             engine,
+            pool,
             result_rx,
             result_tx,
             shared: SharedResources {
@@ -240,12 +255,15 @@ impl ActorRuntime {
                 connected_peers: None,
                 ocapn_call_results: None,
                 node_mailboxes: None,
+                slot_owners: None,
                 wasm: None,
+                egui_ctx: None,
             },
             env_cache: HashMap::new(),
             node_states: HashMap::new(),
             debounce_queue: HashMap::new(),
             debounce_ms,
+            handler_nodes: std::collections::HashSet::new(),
         }
     }
 
@@ -256,9 +274,50 @@ impl ActorRuntime {
     pub fn set_ocapn_call_results(&mut self, r: OCapNCallResults) { self.shared.ocapn_call_results = Some(r); }
     pub fn set_node_mailboxes(&mut self, m: NodeMailboxes) { self.shared.node_mailboxes = Some(m); }
     pub fn set_wasm_runner(&mut self, w: WasmRunner) { self.shared.wasm = Some(w); }
+    pub fn set_slot_owners(&mut self, o: OCapNSlotOwners) { self.shared.slot_owners = Some(o); }
+    pub fn set_egui_ctx(&mut self, ctx: egui::Context) { self.shared.egui_ctx = Some(ctx); }
 
-    /// Queue a compute for a node with debounce + coalesce.
-    pub fn send(&mut self, node_id: NodeId, msg: ActorMsg) {
+    /// Compute a node immediately (for cascade, node-send, programmatic triggers).
+    pub fn compute(
+        &mut self,
+        node_id: NodeId,
+        node: crate::types::Node,
+        template: Option<NodeTemplate>,
+        available_inputs: HashMap<String, Value>,
+        db: Db,
+    ) {
+        self.enqueue(node_id, node, template, available_inputs, db, true);
+    }
+
+    /// Compute a node with debounce (for slider/widget user interaction).
+    pub fn compute_debounced(
+        &mut self,
+        node_id: NodeId,
+        node: crate::types::Node,
+        template: Option<NodeTemplate>,
+        available_inputs: HashMap<String, Value>,
+        db: Db,
+    ) {
+        self.enqueue(node_id, node, template, available_inputs, db, false);
+    }
+
+    fn enqueue(
+        &mut self,
+        node_id: NodeId,
+        node: crate::types::Node,
+        template: Option<NodeTemplate>,
+        available_inputs: HashMap<String, Value>,
+        db: Db,
+        immediate: bool,
+    ) {
+        // Detect fast message path internally
+        let fast_message_path = self.should_fast_path(node_id, &node);
+
+        let msg = ActorMsg {
+            node, template, available_inputs, db,
+            immediate, fast_message_path,
+        };
+
         let state = self.node_states.entry(node_id).or_insert(NodeState {
             in_flight: false,
             dirty: None,
@@ -271,9 +330,25 @@ impl ActorRuntime {
 
         if state.in_flight {
             state.dirty = Some(pending);
+        } else if immediate {
+            self.debounce_queue.remove(&node_id);
+            self.spawn_eval(node_id, pending);
         } else {
             self.debounce_queue.insert(node_id, pending);
         }
+    }
+
+    /// Check if a node qualifies for fast message-handler path.
+    fn should_fast_path(&self, node_id: NodeId, node: &crate::types::Node) -> bool {
+        if !self.handler_nodes.contains(&node_id) {
+            return false;
+        }
+        let code_hash = hash_code(&node.script_code);
+        let env_matches = self.env_cache.get(&node_id)
+            .map_or(false, |c| c.code_hash == code_hash);
+        let has_messages = self.shared.node_mailboxes.as_ref()
+            .map_or(false, |mb| mb.lock().unwrap().get(&node_id).map_or(false, |q| !q.is_empty()));
+        env_matches && has_messages
     }
 
     /// Flush debounced computes whose timer has expired. Call every frame.
@@ -326,12 +401,17 @@ impl ActorRuntime {
                     ActorResult::Error { node_id, .. } => *node_id,
                 };
 
-                // Cache env
-                if let ActorResult::Computed { node_id, ref env, code_hash, .. } = result {
+                // Cache env and track handler nodes
+                if let ActorResult::Computed { node_id, ref env, code_hash, ref result, .. } = result {
                     self.env_cache.insert(node_id, CachedEnv {
                         code_hash,
                         env: env.clone(),
                     });
+                    if result.has_message_handler {
+                        self.handler_nodes.insert(node_id);
+                    } else {
+                        self.handler_nodes.remove(&node_id);
+                    }
                 }
 
                 // Handle coalesce: if dirty, re-spawn with latest data
@@ -377,9 +457,12 @@ impl ActorRuntime {
         let shared = self.shared.clone();
         let tx = self.result_tx.clone();
 
-        std::thread::spawn(move || {
-            let result = execute_on_thread(engine, node_id, pending.msg, shared, cached_env);
+        self.pool.spawn(move || {
+            let result = execute_on_thread(engine, node_id, pending.msg, &shared, cached_env);
             let _ = tx.send(result);
+            if let Some(ctx) = shared.egui_ctx.as_ref() {
+                ctx.request_repaint();
+            }
         });
     }
 }
@@ -389,10 +472,40 @@ fn execute_on_thread(
     engine: Arc<SchemeEngine>,
     node_id: NodeId,
     msg: ActorMsg,
-    shared: SharedResources,
+    shared: &SharedResources,
     cached_env: Option<TopLevelEnvironment>,
 ) -> ActorResult {
     let builtin = msg.template.as_ref().and_then(|t| t.builtin);
+
+    // Fast message path: only drain messages via handler, skip full re-eval
+    if msg.fast_message_path {
+        if let Some(env) = cached_env {
+            let mut ctx = ActorContext::new(node_id);
+            ctx.net_values = shared.net_values.clone();
+            ctx.session_mgr = shared.session_mgr.clone();
+            ctx.ocapn_slots = shared.ocapn_slots.clone();
+            ctx.connected_peers = shared.connected_peers.clone();
+            ctx.ocapn_call_results = shared.ocapn_call_results.clone();
+            ctx.node_mailboxes = shared.node_mailboxes.clone();
+            ctx.slot_owners = shared.slot_owners.clone();
+
+            let ch = hash_code(&msg.node.script_code);
+
+            let result = with_actor_context(&mut ctx, || {
+                engine.execute_message_handler(&env, &msg.available_inputs, Some(&msg.db))
+            });
+
+            return match result {
+                Ok(script_result) => ActorResult::Computed {
+                    node_id,
+                    result: script_result,
+                    env,
+                    code_hash: ch,
+                },
+                Err(e) => ActorResult::Error { node_id, message: e.to_string() },
+            };
+        }
+    }
 
     match builtin {
         Some(BuiltinKind::Script) => {
@@ -407,12 +520,13 @@ fn execute_on_thread(
             }
 
             let mut ctx = ActorContext::new(node_id);
-            ctx.net_values = shared.net_values;
-            ctx.session_mgr = shared.session_mgr;
-            ctx.ocapn_slots = shared.ocapn_slots;
-            ctx.connected_peers = shared.connected_peers;
-            ctx.ocapn_call_results = shared.ocapn_call_results;
-            ctx.node_mailboxes = shared.node_mailboxes;
+            ctx.net_values = shared.net_values.clone();
+            ctx.session_mgr = shared.session_mgr.clone();
+            ctx.ocapn_slots = shared.ocapn_slots.clone();
+            ctx.connected_peers = shared.connected_peers.clone();
+            ctx.ocapn_call_results = shared.ocapn_call_results.clone();
+            ctx.node_mailboxes = shared.node_mailboxes.clone();
+            ctx.slot_owners = shared.slot_owners.clone();
 
             let ch = hash_code(code);
 

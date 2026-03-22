@@ -424,13 +424,22 @@ impl SchemeEngine {
             (define (receive) (actor-receive-msg))
             (define (mailbox-count) (actor-mailbox-count))
             (define (self-send method . args) (actor-self-send-msg method args))
+            (define __actor-msg-handler #f)
             (define (on-message handler)
               (actor-register-handler)
+              (set! __actor-msg-handler handler)
               (let loop ()
                 (let ((msg (receive)))
                   (when msg
                     (handler msg)
                     (loop)))))
+            (define (__actor-drain-messages)
+              (when __actor-msg-handler
+                (let loop ()
+                  (let ((msg (receive)))
+                    (when msg
+                      (__actor-msg-handler msg)
+                      (loop))))))
         "#)
             .map_err(|e| anyhow::anyhow!("Failed to define port wrappers: {}", e))?;
 
@@ -689,6 +698,47 @@ impl SchemeEngine {
             recompute_requests,
             has_message_handler,
         }, env))
+    }
+
+    /// Fast path: drain messages via handler in an existing env, without full re-eval.
+    /// Only processes messages and collects side-effects + render output.
+    pub fn execute_message_handler(
+        &self,
+        env: &TopLevelEnvironment,
+        available_inputs: &HashMap<String, crate::types::Value>,
+        db: Option<&crate::db::Db>,
+    ) -> Result<ScriptResult> {
+        let (eval_result, _port_registry) = crate::bridge::with_port_context(
+            Some(available_inputs),
+            || {
+                let eval_fn = || env.eval(false, "(__actor-drain-messages)")
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                if let Some(db) = db {
+                    crate::bridge::with_db_context(db, eval_fn)
+                } else {
+                    eval_fn()
+                }
+            },
+        );
+        eval_result?;
+
+        let net_publishes = crate::bridge::take_net_publishes();
+        let tick_interval_ms = crate::bridge::take_tick_interval();
+        let ocapn_sends = crate::bridge::take_ocapn_sends();
+        let recompute_requests = crate::bridge::take_recompute_requests();
+
+        Ok(ScriptResult {
+            output_values: HashMap::new(),
+            render_blocks: Vec::new(),
+            declared_inputs: Vec::new(),
+            declared_outputs: Vec::new(),
+            widget_decls: Vec::new(),
+            net_publishes,
+            tick_interval_ms,
+            ocapn_sends,
+            recompute_requests,
+            has_message_handler: true,
+        })
     }
 
     /// Preview: bind all inputs as <compute> placeholder, eval for structure only

@@ -159,7 +159,7 @@ fn wasm_val_to_value(val: &Val) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actor::{ActorMsg, ActorResult, ActorRuntime};
+    use crate::actor::{ActorResult, ActorRuntime};
     use crate::registry::NodeRegistry;
 
     fn fresh_resources() -> AppResources {
@@ -309,13 +309,14 @@ mod tests {
         assert_eq!(rows[0]["title"], serde_json::json!("hello"));
     }
 
-    fn script_msg(code: &str, inputs: HashMap<String, Value>, db: &Db) -> ActorMsg {
-        ActorMsg {
-            node: script_node(1, code),
-            template: Some(builtin_registry().templates["Script"].clone()),
-            available_inputs: inputs,
-            db: db.clone(),
-        }
+    fn send_script(rt: &mut ActorRuntime, code: &str, inputs: HashMap<String, Value>, db: &Db) {
+        rt.compute(
+            1,
+            script_node(1, code),
+            Some(builtin_registry().templates["Script"].clone()),
+            inputs,
+            db.clone(),
+        );
     }
 
     // ── Script execution via ActorRuntime ──
@@ -328,7 +329,7 @@ mod tests {
         let code = "(define x (input 'x 'f64))\n(define result (output 'result 'f64))\n(set! result (* x 2))";
         let mut inputs = HashMap::new();
         inputs.insert("x".to_string(), Value::F64(5.0));
-        rt.send(1, script_msg(code, inputs, &res.db));
+        send_script(&mut rt,code, inputs, &res.db);
         // Wait for result
         loop {
             if let Some(result) = rt.poll() {
@@ -350,7 +351,7 @@ mod tests {
 
         let res = fresh_resources();
         let mut rt = ActorRuntime::with_debounce(Arc::clone(&res.scheme), 0);
-        rt.send(1, script_msg("(render (bold \"hi\"))", HashMap::new(), &res.db));
+        send_script(&mut rt,"(render (bold \"hi\"))", HashMap::new(), &res.db);
         loop {
             if let Some(result) = rt.poll() {
                 match result {
@@ -370,7 +371,7 @@ mod tests {
 
         let res = fresh_resources();
         let mut rt = ActorRuntime::with_debounce(Arc::clone(&res.scheme), 0);
-        rt.send(1, script_msg("(store-set! \"mykey\" \"myval\")", HashMap::new(), &res.db));
+        send_script(&mut rt,"(store-set! \"mykey\" \"myval\")", HashMap::new(), &res.db);
         loop {
             if let Some(result) = rt.poll() {
                 match result {
@@ -392,7 +393,7 @@ mod tests {
         let res = fresh_resources();
         res.db.run("CREATE items SET name = 'apple', qty = 3").unwrap();
         let mut rt = ActorRuntime::with_debounce(Arc::clone(&res.scheme), 0);
-        rt.send(1, script_msg("(db-query \"SELECT * FROM items\")", HashMap::new(), &res.db));
+        send_script(&mut rt,"(db-query \"SELECT * FROM items\")", HashMap::new(), &res.db);
         loop {
             if let Some(result) = rt.poll() {
                 match result {
@@ -409,7 +410,7 @@ mod tests {
 
         let res = fresh_resources();
         let mut rt = ActorRuntime::with_debounce(Arc::clone(&res.scheme), 0);
-        rt.send(1, script_msg("   ", HashMap::new(), &res.db));
+        send_script(&mut rt,"   ", HashMap::new(), &res.db);
         loop {
             if let Some(result) = rt.poll() {
                 match result {
@@ -448,7 +449,7 @@ mod tests {
         let mut rt = ActorRuntime::with_debounce(Arc::clone(&res.scheme), 0);
 
         // Script sets a kv value
-        rt.send(1, script_msg("(store-set! \"color\" \"red\")", HashMap::new(), &res.db));
+        send_script(&mut rt,"(store-set! \"color\" \"red\")", HashMap::new(), &res.db);
         loop {
             if let Some(result) = rt.poll() {
                 match result {
