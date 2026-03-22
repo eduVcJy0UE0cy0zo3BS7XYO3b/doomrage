@@ -277,9 +277,19 @@ impl Graph {
     fn import_edges(&self) -> Vec<(NodeId, NodeId)> {
         let mut edges = Vec::new();
         for (&target_id, target_node) in &self.nodes {
+            // Local imports
             for import_label in extract_imports(&target_node.script_code) {
                 if let Some(source_id) = self.find_node_by_import_label(&import_label) {
                     edges.push((source_id, target_id));
+                }
+            }
+            // Cross-canvas imports: match phantom nodes with label "canvas:module"
+            if let Some(header) = crate::scheme_engine::parse_module_header(&target_node.script_code) {
+                for (canvas_name, module_name) in &header.cross_imports {
+                    let phantom_label = format!("{}:{}", canvas_name, module_name);
+                    if let Some(source_id) = self.find_node_by_import_label(&phantom_label) {
+                        edges.push((source_id, target_id));
+                    }
                 }
             }
         }
@@ -320,12 +330,26 @@ impl Graph {
 
         let mut vals = node.input_values.clone();
 
-        // Add upstream output values from imported nodes
+        // Add upstream output values from imported nodes (local)
         for import_label in extract_imports(&node.script_code) {
             if let Some(source_id) = self.find_node_by_import_label(&import_label) {
                 if let Some(src) = self.nodes.get(&source_id) {
                     for (out_name, out_val) in &src.output_values {
                         vals.insert(out_name.clone(), out_val.clone());
+                    }
+                }
+            }
+        }
+
+        // Add upstream output values from cross-canvas phantom nodes
+        if let Some(header) = crate::scheme_engine::parse_module_header(&node.script_code) {
+            for (canvas_name, module_name) in &header.cross_imports {
+                let phantom_label = format!("{}:{}", canvas_name, module_name);
+                if let Some(source_id) = self.find_node_by_import_label(&phantom_label) {
+                    if let Some(src) = self.nodes.get(&source_id) {
+                        for (out_name, out_val) in &src.output_values {
+                            vals.insert(out_name.clone(), out_val.clone());
+                        }
                     }
                 }
             }

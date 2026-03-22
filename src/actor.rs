@@ -371,9 +371,11 @@ impl ActorRuntime {
         }
     }
 
-    /// Cancel all pending and debounced work.
+    /// Cancel all pending and debounced work, clear cached envs.
     pub fn cancel_all(&mut self) {
         self.debounce_queue.clear();
+        self.env_cache.clear();
+        self.handler_nodes.clear();
         for state in self.node_states.values_mut() {
             state.dirty = None;
         }

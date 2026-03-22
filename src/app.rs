@@ -230,8 +230,22 @@ impl WasmCanvasApp {
             .filter_map(|(&id, node)| {
                 let header = crate::scheme_engine::parse_module_header(&node.script_code)?;
                 let mut inputs = Vec::new();
+                // Local imports
                 for import_label in &header.imports {
                     if let Some(src_id) = self.graph.find_node_by_import_label(import_label) {
+                        if let Some(src) = self.graph.nodes.get(&src_id) {
+                            for port in &src.script_outputs {
+                                if !inputs.iter().any(|p: &PortDef| p.name == port.name) {
+                                    inputs.push(port.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                // Cross-canvas imports (from phantom nodes)
+                for (canvas_name, module_name) in &header.cross_imports {
+                    let phantom_label = format!("{}:{}", canvas_name, module_name);
+                    if let Some(src_id) = self.graph.find_node_by_import_label(&phantom_label) {
                         if let Some(src) = self.graph.nodes.get(&src_id) {
                             for port in &src.script_outputs {
                                 if !inputs.iter().any(|p: &PortDef| p.name == port.name) {
