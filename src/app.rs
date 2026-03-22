@@ -44,6 +44,8 @@ pub struct WasmCanvasApp {
     closed_windows: HashSet<NodeId>,
     /// Nodes the user explicitly triggered Compute on (for open-window gating)
     explicit_compute: HashSet<NodeId>,
+    /// Cached window render data: survives canvas switches
+    window_cache: HashMap<NodeId, (Vec<crate::render::RenderBlock>, Vec<crate::bridge::WidgetDecl>, HashMap<String, Value>)>,
     /// Current canvas name
     current_canvas: String,
     /// Cached list of canvas names
@@ -211,6 +213,7 @@ impl WasmCanvasApp {
             node_windows: HashMap::new(),
             closed_windows: HashSet::new(),
             explicit_compute: HashSet::new(),
+            window_cache: HashMap::new(),
             current_canvas,
             canvas_list,
             favorites,
@@ -1205,12 +1208,23 @@ impl eframe::App for WasmCanvasApp {
 
         self.handle_actions(actions);
 
-        // Render node windows as separate native viewports
+        // Update window cache from current graph nodes
+        for (&node_id, title) in &self.node_windows {
+            if let Some(node) = self.graph.nodes.get(&node_id) {
+                self.window_cache.insert(node_id, (
+                    node.render_blocks.clone(),
+                    node.widget_decls.clone(),
+                    node.widget_values.clone(),
+                ));
+            }
+        }
+
+        // Render node windows as separate native viewports (using cache)
         let window_entries: Vec<(NodeId, String, Vec<crate::render::RenderBlock>, Vec<crate::bridge::WidgetDecl>, HashMap<String, Value>)> =
             self.node_windows.iter()
                 .filter_map(|(&node_id, title)| {
-                    let node = self.graph.nodes.get(&node_id)?;
-                    Some((node_id, title.clone(), node.render_blocks.clone(), node.widget_decls.clone(), node.widget_values.clone()))
+                    let cached = self.window_cache.get(&node_id)?;
+                    Some((node_id, title.clone(), cached.0.clone(), cached.1.clone(), cached.2.clone()))
                 })
                 .collect();
 
@@ -1274,6 +1288,7 @@ impl eframe::App for WasmCanvasApp {
         }
         for id in windows_to_close {
             self.node_windows.remove(&id);
+            self.window_cache.remove(&id);
             self.closed_windows.insert(id);
         }
         self.handle_actions(window_actions);
