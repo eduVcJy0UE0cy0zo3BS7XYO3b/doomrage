@@ -435,9 +435,9 @@ mod tests {
         let res = fresh_resources();
         let mut outputs = HashMap::new();
         outputs.insert("out".to_string(), Value::F64(42.0));
-        res.scheme.register_node_library(1, &outputs);
+        res.scheme.register_node_library_named(1, "test-canvas", "my-mod", &outputs);
         let env = res.scheme.make_env();
-        env.eval(true, "(import (node n1))").unwrap();
+        env.eval(true, "(import (test-canvas my-mod))").unwrap();
         let results = env.eval(false, "out").unwrap();
         let val = results[0].cast_to_scheme_type::<f64>().unwrap();
         assert!((val - 42.0).abs() < f64::EPSILON);

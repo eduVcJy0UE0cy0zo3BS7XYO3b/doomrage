@@ -179,7 +179,7 @@ impl WasmCanvasApp {
                     node.script_inputs = inputs;
                 }
             }
-            resources.scheme.register_stub_libraries(&graph.nodes);
+            resources.scheme.register_stub_libraries(&current_canvas, &graph.nodes);
         }
 
         let favorites = persistence::list_favorites(&resources.db);
@@ -302,7 +302,7 @@ impl WasmCanvasApp {
                 node.script_inputs = inputs;
             }
         }
-        self.resources.scheme.register_stub_libraries(&self.graph().nodes);
+        self.resources.scheme.register_stub_libraries(&self.current_canvas, &self.graph().nodes);
     }
 
 }
@@ -350,14 +350,9 @@ impl WasmCanvasApp {
             None => return,
         };
 
-        // Collect import labels that have no matching node on this canvas
+        // Collect import module names that have no matching node on this canvas
         let mut missing: Vec<String> = Vec::new();
-        for label in &header.imports {
-            if graph.find_node_by_import_label(label).is_none() {
-                missing.push(label.clone());
-            }
-        }
-        for (_ns, module_name) in &header.remote_imports {
+        for (_, module_name) in &header.imports {
             if graph.find_node_by_import_label(module_name).is_none() {
                 missing.push(module_name.clone());
             }
@@ -499,15 +494,12 @@ impl WasmCanvasApp {
     }
 
     fn register_node_libraries(&self, node_id: NodeId) {
-        if let Some(node) = self.find_node(node_id) {
-            self.actor_runtime.engine().register_node_library_named(
-                node_id, Some(&node.label), &node.output_values,
-            );
+        if let Some((canvas_name, node)) = self.find_node_canvas(node_id) {
             if let Some(header) = crate::scheme_engine::parse_module_header(&node.script_code) {
-                let safe_label = node.label.replace(' ', "-");
-                if header.name != safe_label && !header.name.is_empty() {
+                let canvas = if header.canvas.is_empty() { canvas_name } else { &header.canvas };
+                if !header.name.is_empty() {
                     self.actor_runtime.engine().register_node_library_named(
-                        node_id, Some(&header.name), &node.output_values,
+                        node_id, canvas, &header.name, &node.output_values,
                     );
                 }
             }
@@ -515,16 +507,18 @@ impl WasmCanvasApp {
     }
 
     fn auto_publish_node(&mut self, node_id: NodeId) {
-        let info: Option<(String, String, HashMap<String, Value>)> = self.find_node_canvas(node_id)
+        let info: Option<(String, String, String, HashMap<String, Value>)> = self.find_node_canvas(node_id)
             .and_then(|(canvas_name, node)| {
                 if node.phantom { return None; }
                 let header = crate::scheme_engine::parse_module_header(&node.script_code)?;
                 if header.exports.is_empty() || header.name.is_empty() { return None; }
                 let mut values = node.output_values.clone();
                 for (k, v) in &node.widget_values { values.insert(k.clone(), v.clone()); }
-                Some((canvas_name.to_string(), header.name.clone(), values))
+                let canvas = if header.canvas.is_empty() { canvas_name.to_string() } else { header.canvas.clone() };
+                Some((canvas_name.to_string(), canvas, header.name.clone(), values))
             });
-        if let Some((source_canvas, channel, values)) = info {
+        if let Some((source_canvas, header_canvas, module_name, values)) = info {
+            let channel = format!("{}/{}", header_canvas, module_name);
             {
                 let mut store = self.net_values.lock().unwrap();
                 store.insert(("local".to_string(), channel.clone()), values.clone());
@@ -537,7 +531,7 @@ impl WasmCanvasApp {
                 .filter(|k| **k != source_canvas)
                 .cloned().collect();
             for other_canvas in other_canvases {
-                self.deliver_values(&other_canvas, &source_canvas, &channel, &values);
+                self.deliver_values(&other_canvas, &source_canvas, &module_name, &values);
             }
         }
     }
@@ -566,8 +560,10 @@ impl WasmCanvasApp {
     }
 
     /// Deliver values to a specific canvas as if from a peer.
+    /// `module_name` is the module name (not the full channel).
+    /// `peer` is the source canvas name (loopback) or peer ID (network).
     /// Creates/updates phantom node, registers R6RS libraries, recomputes downstream.
-    fn deliver_values(&mut self, canvas_key: &str, peer: &str, channel: &str, values: &HashMap<String, Value>) {
+    fn deliver_values(&mut self, canvas_key: &str, peer: &str, module_name: &str, values: &HashMap<String, Value>) {
         let graph = match self.all_graphs.get(canvas_key) {
             Some(g) => g,
             None => return,
@@ -576,12 +572,12 @@ impl WasmCanvasApp {
         // Skip if this canvas has a local node with this module name
         let has_local = graph.nodes.values().any(|n| {
             !n.phantom && crate::scheme_engine::parse_module_header(&n.script_code)
-                .map_or(false, |h| h.name == channel)
+                .map_or(false, |h| h.name == module_name)
         });
         if has_local { return; }
 
         let phantom_id = graph.nodes.iter()
-            .find(|(_, n)| n.phantom && n.label == channel)
+            .find(|(_, n)| n.phantom && n.label == module_name)
             .map(|(&id, _)| id);
 
         let graph = self.all_graphs.get_mut(canvas_key).unwrap();
@@ -605,7 +601,7 @@ impl WasmCanvasApp {
             let node = Node {
                 id,
                 template_name: "Script".to_string(),
-                label: channel.to_string(),
+                label: module_name.to_string(),
                 pos: [900.0, 50.0 + phantom_count as f32 * 200.0],
                 input_values: HashMap::new(),
                 output_values: values.clone(),
@@ -625,33 +621,22 @@ impl WasmCanvasApp {
             graph.nodes.insert(id, node);
             self.debug_log.log("net", format!(
                 "created phantom node #{} \"{}\" from peer \"{}\" on canvas \"{}\"",
-                id, channel, peer, canvas_key
+                id, module_name, peer, canvas_key
             ));
             id
         };
 
-        // Register R6RS library (node channel) for imports
-        self.actor_runtime.engine().register_node_library_named(pid, Some(channel), values);
-        // Register R6RS library (peer channel) for explicit addressing
-        self.resources.scheme.register_named_library(peer, channel, values);
+        // Register R6RS library (peer module-name) for imports
+        self.actor_runtime.engine().register_node_library_named(pid, peer, module_name, values);
 
-        // Recompute downstream nodes that import this channel (local or remote)
-        let channel_str = channel.to_string();
+        // Recompute downstream nodes that import this module
+        let module_str = module_name.to_string();
         let graph = self.all_graphs.get(canvas_key).unwrap();
         let downstream: Vec<NodeId> = graph.nodes.iter()
             .filter(|(_, n)| {
                 if n.phantom { return false; }
-                // Local import: (use-module (node channel))
-                if crate::scheme_engine::extract_imports(&n.script_code).contains(&channel_str) {
-                    return true;
-                }
-                // Remote import: (use-module (peer channel))
-                if let Some(header) = crate::scheme_engine::parse_module_header(&n.script_code) {
-                    if header.remote_imports.iter().any(|(_, m)| *m == channel_str) {
-                        return true;
-                    }
-                }
-                false
+                crate::scheme_engine::extract_imports(&n.script_code)
+                    .iter().any(|(_, m)| *m == module_str)
             })
             .map(|(id, _)| *id).collect();
         for did in downstream {
@@ -717,10 +702,16 @@ impl WasmCanvasApp {
                         store.insert((peer.clone(), channel.clone()), values.clone());
                     }
 
+                    // Parse channel: "canvas-name/module-name" or legacy "module-name"
+                    let (source_canvas, module_name) = if let Some(slash) = channel.find('/') {
+                        (&channel[..slash], &channel[slash + 1..])
+                    } else {
+                        (peer.as_str(), channel.as_str())
+                    };
                     // Deliver to all canvases via unified deliver_values
                     let all_canvas_keys: Vec<String> = self.all_graphs.keys().cloned().collect();
                     for canvas_key in all_canvas_keys {
-                        self.deliver_values(&canvas_key, &peer, &channel, &values);
+                        self.deliver_values(&canvas_key, source_canvas, module_name, &values);
                     }
                     need_recompute = true;
                 }
@@ -995,30 +986,33 @@ impl WasmCanvasApp {
         if self.graph().nodes.contains_key(&node_id) {
             self.graph_mut().nodes.get_mut(&node_id).unwrap()
                 .widget_values.insert(key, val);
-            let node = self.graph().nodes.get(&node_id).unwrap();
-            self.actor_runtime.engine().register_node_library_named(
-                node_id, Some(&node.label), &node.output_values,
-            );
+            self.register_node_libraries(node_id);
             self.compute_node_debounced(node_id);
             return;
         }
         // Node is on another canvas
-        let mut to_compute: Option<(Node, Option<NodeTemplate>, HashMap<String, Value>)> = None;
-        for (_, other_graph) in &mut self.all_graphs {
+        let mut to_compute: Option<(String, Node, Option<NodeTemplate>, HashMap<String, Value>)> = None;
+        for (canvas_name, other_graph) in &mut self.all_graphs {
             if let Some(node) = other_graph.nodes.get_mut(&node_id) {
                 node.widget_values.insert(key, val);
                 let template = self.registry.templates.get(&node.template_name).cloned();
                 let node_clone = node.clone();
+                let cn = canvas_name.clone();
                 drop(node);
                 let inputs = other_graph.resolve_all_input_values(node_id);
-                to_compute = Some((node_clone, template, inputs));
+                to_compute = Some((cn, node_clone, template, inputs));
                 break;
             }
         }
-        if let Some((node_clone, template, inputs)) = to_compute {
-            self.actor_runtime.engine().register_node_library_named(
-                node_id, Some(&node_clone.label), &node_clone.output_values,
-            );
+        if let Some((canvas_name, node_clone, template, inputs)) = to_compute {
+            if let Some(header) = crate::scheme_engine::parse_module_header(&node_clone.script_code) {
+                if !header.name.is_empty() {
+                    let canvas = if header.canvas.is_empty() { canvas_name.as_str() } else { &header.canvas };
+                    self.actor_runtime.engine().register_node_library_named(
+                        node_id, canvas, &header.name, &node_clone.output_values,
+                    );
+                }
+            }
             self.pending_nodes.insert(node_id);
             self.actor_runtime.compute_debounced(node_id, node_clone, template, inputs, self.resources.db.clone());
         }
@@ -1140,9 +1134,10 @@ impl eframe::App for WasmCanvasApp {
             }
 
             if let Some((from_node, _from_port, to_node, _to_port)) = canvas_response.new_connection {
-                let graph = self.all_graphs.get_mut(&self.current_canvas).unwrap();
+                let canvas_name = self.current_canvas.clone();
+                let graph = self.all_graphs.get_mut(&canvas_name).unwrap();
                 if let Some(source_label) = graph.nodes.get(&from_node).map(|n| n.label.replace(' ', "-")) {
-                    let import_line = format!("(import (node {}))", source_label);
+                    let import_line = format!("(import ({} {}))", canvas_name, source_label);
                     if let Some(target_node) = graph.nodes.get_mut(&to_node) {
                         if !target_node.script_code.contains(&import_line) {
                             target_node.script_code = format!("{}\n{}", import_line, target_node.script_code);
@@ -1160,11 +1155,7 @@ impl eframe::App for WasmCanvasApp {
             for (node_id, key, val) in canvas_response.widget_updates {
                 let graph = self.all_graphs.get_mut(&self.current_canvas).unwrap();
                 graph.nodes.get_mut(&node_id).map(|n| n.widget_values.insert(key, val));
-                if let Some(node) = graph.nodes.get(&node_id) {
-                    self.actor_runtime.engine().register_node_library_named(
-                        node_id, Some(&node.label), &node.output_values,
-                    );
-                }
+                self.register_node_libraries(node_id);
                 self.compute_node_debounced(node_id);
             }
 

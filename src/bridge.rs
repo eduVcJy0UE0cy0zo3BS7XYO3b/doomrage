@@ -137,6 +137,7 @@ pub fn with_port_context<R>(
 pub struct GraphContext {
     graph: *mut Graph,
     registry: *const NodeRegistry,
+    canvas_name: String,
 }
 
 // SAFETY: GraphContext is only used within with_graph_context scope-guard
@@ -152,10 +153,20 @@ pub fn with_graph_context<R>(
     registry: &NodeRegistry,
     f: impl FnOnce() -> R,
 ) -> R {
+    with_graph_context_named("", graph, registry, f)
+}
+
+pub fn with_graph_context_named<R>(
+    canvas_name: &str,
+    graph: &mut Graph,
+    registry: &NodeRegistry,
+    f: impl FnOnce() -> R,
+) -> R {
     THREAD_GRAPH.with(|cell| {
         cell.borrow_mut().replace(GraphContext {
             graph: graph as *mut Graph,
             registry: registry as *const NodeRegistry,
+            canvas_name: canvas_name.to_string(),
         });
     });
     let result = f();
@@ -372,15 +383,23 @@ fn bridge_connect(
     let _from_port_name = value_to_string(from_port);
     let to_id = to.cast_to_scheme_type::<f64>().unwrap_or(0.0) as NodeId;
     let _to_port_name = value_to_string(to_port);
-    with_graph(|graph, _| {
-        // Insert (import (node <label>)) into target node's script_code
-        if let Some(source_label) = graph.nodes.get(&from_id).map(|n| n.label.replace(' ', "-")) {
-            if let Some(target_node) = graph.nodes.get_mut(&to_id) {
-                let import_line = format!("(import (node {}))", source_label);
-                if !target_node.script_code.contains(&import_line) {
-                    target_node.script_code = format!("{}\n{}", import_line, target_node.script_code);
+    THREAD_GRAPH.with(|cell| {
+        let borrow = cell.borrow();
+        match borrow.as_ref() {
+            Some(ctx) => {
+                let graph = unsafe { &mut *ctx.graph };
+                let canvas_name = &ctx.canvas_name;
+                if let Some(source_label) = graph.nodes.get(&from_id).map(|n| n.label.replace(' ', "-")) {
+                    if let Some(target_node) = graph.nodes.get_mut(&to_id) {
+                        let import_line = format!("(import ({} {}))", canvas_name, source_label);
+                        if !target_node.script_code.contains(&import_line) {
+                            target_node.script_code = format!("{}\n{}", import_line, target_node.script_code);
+                        }
+                    }
                 }
+                Ok(())
             }
+            None => Err(Exception::error("No graph context available")),
         }
     })?;
     Ok(vec![Value::null()])

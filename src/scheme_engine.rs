@@ -160,16 +160,14 @@ const CANVAS_PREVIEW_LIB: &str = r#"
 )
 "#;
 
-/// Extract `(import (node X))` labels from script code textually, without eval.
 /// Module header parsed from `(define-module ...)` in node script code.
 #[derive(Debug, Clone, Default)]
 pub struct ModuleHeader {
+    pub canvas: String,
     pub name: String,
     pub exports: Vec<String>,
-    /// Local imports: module names from current canvas (use-module (node X))
-    pub imports: Vec<String>,
-    /// Remote imports: (namespace, module_name) from (use-module (ns module-name))
-    pub remote_imports: Vec<(String, String)>,
+    /// All imports: (canvas_name, module_name) from (use-module (canvas module))
+    pub imports: Vec<(String, String)>,
 }
 
 /// Parse `(define-module ...)` header from script code textually.
@@ -177,10 +175,10 @@ pub struct ModuleHeader {
 ///
 /// Format:
 /// ```scheme
-/// (define-module (node controls)
+/// (define-module (my-canvas controls)
 ///   (export gain freq)
-///   (use-module (node wave))
-///   (use-module (node gateway-in)))
+///   (use-module (my-canvas wave))
+///   (use-module (other-canvas sensors)))
 /// ```
 pub fn parse_module_header(code: &str) -> Option<ModuleHeader> {
     let dm_start = code.find("(define-module")?;
@@ -190,11 +188,17 @@ pub fn parse_module_header(code: &str) -> Option<ModuleHeader> {
 
     let mut header = ModuleHeader::default();
 
-    // Parse (node X) → name
-    if let Some(pos) = form.find("(node ") {
-        let after = pos + 6;
-        if let Some(end) = form[after..].find(')') {
-            header.name = form[after..after + end].trim().to_string();
+    // Parse (canvas-name module-name) after define-module
+    let after_dm = "define-module".len() + 1; // skip past "(define-module"
+    if let Some(paren_pos) = form[after_dm..].find('(') {
+        let inner_start = after_dm + paren_pos + 1;
+        if let Some(paren_end) = form[inner_start..].find(')') {
+            let inner = form[inner_start..inner_start + paren_end].trim();
+            let parts: Vec<&str> = inner.split_whitespace().collect();
+            if parts.len() == 2 {
+                header.canvas = parts[0].to_string();
+                header.name = parts[1].to_string();
+            }
         }
     }
 
@@ -207,7 +211,7 @@ pub fn parse_module_header(code: &str) -> Option<ModuleHeader> {
         }
     }
 
-    // Parse (use-module (...)) — may appear multiple times
+    // Parse (use-module (canvas-name module-name)) — may appear multiple times
     let use_pat = "(use-module (";
     let mut start = 0;
     while let Some(pos) = form[start..].find(use_pat) {
@@ -215,16 +219,8 @@ pub fn parse_module_header(code: &str) -> Option<ModuleHeader> {
         if let Some(end) = form[abs..].find("))") {
             let inner = form[abs..abs + end].trim();
             let parts: Vec<&str> = inner.split_whitespace().collect();
-            match parts.len() {
-                // (use-module (node controls)) — local import
-                2 if parts[0] == "node" => {
-                    header.imports.push(parts[1].to_string());
-                }
-                // (use-module (other-canvas controls)) — remote import
-                2 if parts[0] != "node" => {
-                    header.remote_imports.push((parts[0].to_string(), parts[1].to_string()));
-                }
-                _ => {}
+            if parts.len() == 2 {
+                header.imports.push((parts[0].to_string(), parts[1].to_string()));
             }
         }
         start = abs;
@@ -261,28 +257,12 @@ fn find_matching_paren(code: &str, start: usize) -> Option<usize> {
     None
 }
 
-/// Extract import labels from code. Supports both:
-/// - `(define-module ... (use-module (node X)))` headers
-/// - Legacy `(import (node X))` in body
-pub fn extract_imports(code: &str) -> Vec<String> {
+/// Extract imports from code as (canvas_name, module_name) pairs.
+pub fn extract_imports(code: &str) -> Vec<(String, String)> {
     if let Some(header) = parse_module_header(code) {
         return header.imports;
     }
-    // Fallback: legacy (import (node X)) pattern
-    let mut labels = Vec::new();
-    let pat = "(import (node ";
-    let mut start = 0;
-    while let Some(pos) = code[start..].find(pat) {
-        let abs = start + pos + pat.len();
-        if let Some(end) = code[abs..].find("))") {
-            let label = code[abs..abs + end].trim();
-            if !label.is_empty() {
-                labels.push(label.to_string());
-            }
-        }
-        start = abs;
-    }
-    labels
+    Vec::new()
 }
 
 /// Strip `(define-module ...)` form from code, returning the body.
@@ -294,14 +274,9 @@ pub fn strip_module_header(code: &str) -> (String, Vec<String>) {
         let before = &code[..dm_start];
         let after = &code[dm_end + 1..];
         let body = format!("{}{}", before.trim_end(), after);
-        // Generate (import ...) statements from use-module
-        let mut imports: Vec<String> = header.imports.iter()
-            .map(|label| format!("(import (node {}))", label))
+        let imports: Vec<String> = header.imports.iter()
+            .map(|(canvas, module)| format!("(import ({} {}))", canvas, module))
             .collect();
-        // Remote imports: (import (ns module))
-        for (ns, module) in &header.remote_imports {
-            imports.push(format!("(import ({} {}))", ns, module));
-        }
         (body.trim_start_matches('\n').to_string(), imports)
     } else {
         (code.to_string(), Vec::new())
@@ -469,9 +444,9 @@ impl SchemeEngine {
     }
 
     /// Register stub libraries for all nodes with define-module headers.
-    /// All exports get `<compute>` sentinel values. This ensures (import (node X))
+    /// All exports get sentinel values. This ensures (import (canvas module))
     /// never fails, even before first compute.
-    pub fn register_stub_libraries(&self, nodes: &std::collections::HashMap<crate::types::NodeId, crate::types::Node>) {
+    pub fn register_stub_libraries(&self, canvas_name: &str, nodes: &std::collections::HashMap<crate::types::NodeId, crate::types::Node>) {
         for (node_id, node) in nodes {
             if let Some(header) = parse_module_header(&node.script_code) {
                 if header.exports.is_empty() && header.name.is_empty() {
@@ -484,7 +459,7 @@ impl SchemeEngine {
                         .unwrap_or(crate::types::Value::F64(0.0));
                     stub_outputs.insert(export_name.clone(), val);
                 }
-                self.register_node_library_named(*node_id, Some(&header.name), &stub_outputs);
+                self.register_node_library_named(*node_id, canvas_name, &header.name, &stub_outputs);
             }
         }
     }
@@ -519,23 +494,15 @@ impl SchemeEngine {
         }
     }
 
-    /// Register a node's outputs as an R6RS library `(node <id>)`.
-    /// After this, script nodes can do `(import (node 3))` to access upstream outputs.
-    pub fn register_node_library(
-        &self,
-        node_id: crate::types::NodeId,
-        outputs: &HashMap<String, crate::types::Value>,
-    ) {
-        self.register_node_library_named(node_id, None, outputs);
-    }
-
+    /// Register a node's outputs as an R6RS library `(canvas-name module-name)`.
     pub fn register_node_library_named(
         &self,
-        node_id: crate::types::NodeId,
-        label: Option<&str>,
+        _node_id: crate::types::NodeId,
+        canvas_name: &str,
+        module_name: &str,
         outputs: &HashMap<String, crate::types::Value>,
     ) {
-        if outputs.is_empty() {
+        if outputs.is_empty() || canvas_name.is_empty() || module_name.is_empty() {
             return;
         }
 
@@ -548,72 +515,35 @@ impl SchemeEngine {
         let export_str = exports.join(" ");
         let define_str = defines.join(" ");
 
-        // Register by numeric id
+        let safe_module = module_name.replace(' ', "-");
+        let safe_canvas = canvas_name.replace(' ', "-");
+
+        // Self-reference: (import (canvas controls)) gives binding `controls` = "controls"
+        let self_ref_export = if exports.contains(&safe_module) {
+            String::new()
+        } else {
+            format!(" {}", safe_module)
+        };
+        let self_ref_define = if exports.contains(&safe_module) {
+            String::new()
+        } else {
+            format!(" (define {} \"{}\")", safe_module, safe_module)
+        };
+        // Export <module>-widgets and <module>-blocks as render block values
+        let widgets_name = format!("{}-widgets", safe_module);
+        let blocks_name = format!("{}-blocks", safe_module);
+        let extra_exports = format!(" {} {}", widgets_name, blocks_name);
+        let extra_defines = format!(
+            " (define {} (list 'render-node-widgets \"{}\")) (define {} (list 'render-node-blocks \"{}\"))",
+            widgets_name, safe_module, blocks_name, safe_module
+        );
         let lib_str = format!(
-            "(library (node n{}) (export {}) (import (rnrs)) {})",
-            node_id, export_str, define_str
+            "(library ({} {}) (export {}{}{}) (import (rnrs)) {}{}{})",
+            safe_canvas, safe_module, export_str, self_ref_export, extra_exports,
+            define_str, self_ref_define, extra_defines
         );
         if let Err(e) = self.runtime.def_lib(&lib_str) {
-            log::warn!("Failed to register node {} library: {}", node_id, e);
-        }
-
-        // Also register by label (sanitized: spaces → hyphens)
-        if let Some(label) = label {
-            let safe_label = label.replace(' ', "-");
-            if !safe_label.is_empty() {
-                // Add self-reference: (import (node controls)) gives binding `controls` = "controls"
-                let self_ref_export = if exports.contains(&safe_label) {
-                    String::new() // avoid conflict with output of same name
-                } else {
-                    format!(" {}", safe_label)
-                };
-                let self_ref_define = if exports.contains(&safe_label) {
-                    String::new()
-                } else {
-                    format!(" (define {} \"{}\")", safe_label, safe_label)
-                };
-                // Export <label>-widgets and <label>-blocks as render block values
-                let widgets_name = format!("{}-widgets", safe_label);
-                let blocks_name = format!("{}-blocks", safe_label);
-                let extra_exports = format!(" {} {}", widgets_name, blocks_name);
-                let extra_defines = format!(
-                    " (define {} (list 'render-node-widgets \"{}\")) (define {} (list 'render-node-blocks \"{}\"))",
-                    widgets_name, safe_label, blocks_name, safe_label
-                );
-                let label_lib = format!(
-                    "(library (node {}) (export {}{}{}) (import (rnrs)) {}{}{})",
-                    safe_label, export_str, self_ref_export, extra_exports, define_str, self_ref_define, extra_defines
-                );
-                if let Err(e) = self.runtime.def_lib(&label_lib) {
-                    log::warn!("Failed to register node label '{}' library: {}", label, e);
-                }
-            }
-        }
-    }
-
-
-
-    /// Register a cross-canvas module library: `(library (canvas-name module-name) ...)`
-    pub fn register_named_library(
-        &self,
-        canvas_name: &str,
-        module_name: &str,
-        outputs: &HashMap<String, crate::types::Value>,
-    ) {
-        if outputs.is_empty() {
-            return;
-        }
-        let exports: Vec<String> = outputs.keys().cloned().collect();
-        let defines: Vec<String> = outputs
-            .iter()
-            .map(|(name, val)| format!("(define {} {})", name, val.to_scheme_literal()))
-            .collect();
-        let lib_str = format!(
-            "(library ({} {}) (export {}) (import (rnrs)) {})",
-            canvas_name, module_name, exports.join(" "), defines.join(" ")
-        );
-        if let Err(e) = self.runtime.def_lib(&lib_str) {
-            log::warn!("Failed to register cross-canvas library ({} {}): {}", canvas_name, module_name, e);
+            log::warn!("Failed to register library ({} {}): {}", canvas_name, module_name, e);
         }
     }
 
@@ -673,22 +603,32 @@ impl SchemeEngine {
                 continue;
             }
             let is_import = trimmed.starts_with("(import ");
-            let is_node_import = is_import && trimmed.contains("(node ");
+            // Canvas module imports have two words: (import (canvas-name module-name))
+            let is_module_import = is_import && {
+                if let Some(inner) = trimmed.strip_prefix("(import (").and_then(|s| s.strip_suffix("))")) {
+                    inner.trim().split_whitespace().count() == 2
+                } else {
+                    false
+                }
+            };
             match env.eval(is_import, trimmed) {
                 Ok(r) => results.extend(r),
-                Err(e) if is_node_import => {
-                    // Gracefully skip node imports if module not registered yet.
+                Err(e) if is_module_import => {
+                    // Gracefully skip module imports if library not registered yet.
                     // Define fallback bindings for label, label-widgets, label-blocks.
-                    log::debug!("Node import skipped: {}", e);
-                    if let Some(label) = trimmed
-                        .strip_prefix("(import (node ")
-                        .and_then(|s| s.strip_suffix("))"))
-                    {
-                        let label = label.trim();
-                        let _ = env.eval(false, &format!(
-                            "(define {} \"{}\") (define {}-widgets (list 'render-node-widgets \"{}\")) (define {}-blocks (list 'render-node-blocks \"{}\"))",
-                            label, label, label, label, label, label
-                        ));
+                    log::debug!("Module import skipped: {}", e);
+                    // Extract module name (last word before closing parens)
+                    let inner = trimmed.strip_prefix("(import (")
+                        .and_then(|s| s.strip_suffix("))"));
+                    if let Some(inner) = inner {
+                        let parts: Vec<&str> = inner.trim().split_whitespace().collect();
+                        let label = parts.last().map(|s| s.trim()).unwrap_or("");
+                        if !label.is_empty() {
+                            let _ = env.eval(false, &format!(
+                                "(define {} \"{}\") (define {}-widgets (list 'render-node-widgets \"{}\")) (define {}-blocks (list 'render-node-blocks \"{}\"))",
+                                label, label, label, label, label, label
+                            ));
+                        }
                     }
                 }
                 Err(e) => return Err(anyhow::anyhow!("Eval failed: {}", e)),
@@ -952,69 +892,75 @@ mod tests {
     #[test]
     fn test_parse_module_header() {
         let code = r#"
-(define-module (node controls)
+(define-module (my-canvas controls)
   (export gain freq))
 
 (define gain 50.0)
 "#;
         let header = parse_module_header(code).unwrap();
+        assert_eq!(header.canvas, "my-canvas");
         assert_eq!(header.name, "controls");
         assert_eq!(header.exports, vec!["gain", "freq"]);
         assert!(header.imports.is_empty());
 
         let code2 = r#"
-(define-module (node wave)
-  (use-module (node controls))
-  (use-module (node gateway-in))
+(define-module (demo wave)
+  (use-module (demo controls))
+  (use-module (demo gateway-in))
   (export osc))
 "#;
         let header2 = parse_module_header(code2).unwrap();
+        assert_eq!(header2.canvas, "demo");
         assert_eq!(header2.name, "wave");
         assert_eq!(header2.exports, vec!["osc"]);
-        assert_eq!(header2.imports, vec!["controls", "gateway-in"]);
+        assert_eq!(header2.imports, vec![
+            ("demo".to_string(), "controls".to_string()),
+            ("demo".to_string(), "gateway-in".to_string()),
+        ]);
 
         // No define-module
         assert!(parse_module_header("(define x 1)").is_none());
 
         // Cross-canvas imports
         let code3 = r#"
-(define-module (node synth)
-  (use-module (node local-mod))
+(define-module (my-canvas synth)
+  (use-module (my-canvas local-mod))
   (use-module (other-canvas controls))
   (export sound))
 "#;
         let header3 = parse_module_header(code3).unwrap();
+        assert_eq!(header3.canvas, "my-canvas");
         assert_eq!(header3.name, "synth");
-        assert_eq!(header3.imports, vec!["local-mod"]);
-        assert_eq!(header3.remote_imports, vec![("other-canvas".to_string(), "controls".to_string())]);
+        assert_eq!(header3.imports, vec![
+            ("my-canvas".to_string(), "local-mod".to_string()),
+            ("other-canvas".to_string(), "controls".to_string()),
+        ]);
     }
 
     #[test]
     fn test_strip_module_header() {
-        let code = "(define-module (node test)\n  (use-module (node foo))\n  (export bar))\n\n(define bar 42)";
+        let code = "(define-module (demo test)\n  (use-module (demo foo))\n  (export bar))\n\n(define bar 42)";
         let (body, imports) = strip_module_header(code);
         assert!(!body.contains("define-module"));
         assert!(body.contains("(define bar 42)"));
-        assert_eq!(imports, vec!["(import (node foo))"]);
+        assert_eq!(imports, vec!["(import (demo foo))"]);
 
         // Cross-canvas strip
-        let code2 = "(define-module (node x)\n  (use-module (my-canvas ctrl))\n  (export y))\n(define y 1)";
+        let code2 = "(define-module (demo x)\n  (use-module (my-canvas ctrl))\n  (export y))\n(define y 1)";
         let (_, imports2) = strip_module_header(code2);
         assert!(imports2.contains(&"(import (my-canvas ctrl))".to_string()));
     }
 
     #[test]
     fn test_extract_imports() {
-        let code = r#"
-(import (node controls))
-(define gain (input 'gain 'f64))
-(import (node gateway-in))
-"#;
+        let code = "(define-module (demo wave)\n  (use-module (demo controls))\n  (use-module (demo gateway-in))\n  (export osc))";
         let imports = extract_imports(code);
-        assert_eq!(imports, vec!["controls", "gateway-in"]);
+        assert_eq!(imports, vec![
+            ("demo".to_string(), "controls".to_string()),
+            ("demo".to_string(), "gateway-in".to_string()),
+        ]);
 
         assert!(extract_imports("(define x 1)").is_empty());
-        assert_eq!(extract_imports("(import (node foo-bar))"), vec!["foo-bar"]);
     }
 
     #[test]

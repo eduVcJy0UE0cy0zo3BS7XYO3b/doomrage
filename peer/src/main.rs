@@ -50,8 +50,8 @@ fn main() {
     }
 
     // Init scheme libraries
-    for (_, graph) in &all_graphs {
-        resources.scheme.register_stub_libraries(&graph.nodes);
+    for (name, graph) in &all_graphs {
+        resources.scheme.register_stub_libraries(name, &graph.nodes);
     }
 
     log::info!("Loaded {} canvas(es)", all_graphs.len());
@@ -121,19 +121,21 @@ fn main() {
                     }
 
                     // Register library + auto-publish
-                    for (_, g) in &all_graphs {
+                    for (canvas_name, g) in &all_graphs {
                         if let Some(node) = g.nodes.get(&node_id) {
-                            actor_runtime.engine().register_node_library_named(
-                                node_id, Some(&node.label), &node.output_values,
-                            );
-                            if !node.phantom {
-                                if let Some(header) = scheme_engine::parse_module_header(&node.script_code) {
-                                    if !header.exports.is_empty() && !header.name.is_empty() {
-                                        let mut values = node.output_values.clone();
-                                        for (k, v) in &node.widget_values { values.insert(k.clone(), v.clone()); }
-                                        net_handle.send(NetCommand::Publish { channel: header.name.clone(), values });
-                                        log::info!("Published \"{}\"", header.name);
-                                    }
+                            if let Some(header) = scheme_engine::parse_module_header(&node.script_code) {
+                                let canvas = if header.canvas.is_empty() { canvas_name.as_str() } else { &header.canvas };
+                                if !header.name.is_empty() {
+                                    actor_runtime.engine().register_node_library_named(
+                                        node_id, canvas, &header.name, &node.output_values,
+                                    );
+                                }
+                                if !node.phantom && !header.exports.is_empty() && !header.name.is_empty() {
+                                    let mut values = node.output_values.clone();
+                                    for (k, v) in &node.widget_values { values.insert(k.clone(), v.clone()); }
+                                    let channel = format!("{}/{}", canvas, header.name);
+                                    net_handle.send(NetCommand::Publish { channel: channel.clone(), values });
+                                    log::info!("Published \"{}\"", channel);
                                 }
                             }
 
@@ -173,16 +175,23 @@ fn main() {
                     log::info!("Recv \"{}\": {:?}", channel, values.keys().collect::<Vec<_>>());
                     net_values.lock().unwrap().insert((peer.clone(), channel.clone()), values.clone());
 
+                    // Parse channel: "canvas-name/module-name" or legacy "module-name"
+                    let (source_canvas, module_name) = if let Some(slash) = channel.find('/') {
+                        (&channel[..slash], &channel[slash + 1..])
+                    } else {
+                        (peer.as_str(), channel.as_str())
+                    };
+
                     for (canvas_key, graph) in &mut all_graphs {
                         let has_local = graph.nodes.values().any(|n| {
                             !n.phantom && scheme_engine::parse_module_header(&n.script_code)
-                                .map_or(false, |h| h.name == channel)
+                                .map_or(false, |h| h.name == module_name)
                         });
                         if has_local { continue; }
 
                         // Upsert phantom
                         let phantom_id = graph.nodes.iter()
-                            .find(|(_, n)| n.phantom && n.label == channel)
+                            .find(|(_, n)| n.phantom && n.label == module_name)
                             .map(|(&id, _)| id);
 
                         let pid = if let Some(id) = phantom_id {
@@ -205,7 +214,7 @@ fn main() {
                             graph.nodes.insert(id, Node {
                                 id,
                                 template_name: "Script".to_string(),
-                                label: channel.clone(),
+                                label: module_name.to_string(),
                                 pos: [900.0, 50.0 + pc as f32 * 200.0],
                                 input_values: HashMap::new(),
                                 output_values: values.clone(),
@@ -222,22 +231,19 @@ fn main() {
                                 phantom: true,
                                 remote_peer: Some(peer.clone()),
                             });
-                            log::info!("Phantom \"{}\" on \"{}\"", channel, canvas_key);
+                            log::info!("Phantom \"{}\" on \"{}\"", module_name, canvas_key);
                             id
                         };
 
-                        actor_runtime.engine().register_node_library_named(pid, Some(&channel), &values);
+                        actor_runtime.engine().register_node_library_named(pid, source_canvas, module_name, &values);
 
                         // Recompute downstream
-                        let ch = channel.clone();
+                        let mod_name = module_name.to_string();
                         let downstream: Vec<NodeId> = graph.nodes.iter()
                             .filter(|(_, n)| {
                                 if n.phantom { return false; }
-                                if scheme_engine::extract_imports(&n.script_code).contains(&ch) { return true; }
-                                if let Some(h) = scheme_engine::parse_module_header(&n.script_code) {
-                                    if h.remote_imports.iter().any(|(_, m)| *m == ch) { return true; }
-                                }
-                                false
+                                scheme_engine::extract_imports(&n.script_code)
+                                    .iter().any(|(_, m)| *m == mod_name)
                             })
                             .map(|(id, _)| *id).collect();
                         for did in downstream {
