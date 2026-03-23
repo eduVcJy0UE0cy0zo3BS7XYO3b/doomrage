@@ -45,6 +45,9 @@ pub struct WasmCanvasApp {
     canvas_list: Vec<String>,
     favorites: Vec<String>,
     saved_relays: Vec<String>,
+    user_name: String,
+    peer_names: HashMap<String, String>,
+    trusted_peers: Vec<String>,
 }
 
 // --- Graph access helpers ---
@@ -186,6 +189,12 @@ impl WasmCanvasApp {
         let saved_relays = resources.db.kv_get("saved_relays")
             .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
             .unwrap_or_default();
+        let user_name = resources.db.kv_get("user_name")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        let trusted_peers = resources.db.kv_get("trusted_peers")
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+            .unwrap_or_default();
         let mut undo_history = UndoHistory::new(10);
         undo_history.push(all_graphs.get(&current_canvas).unwrap());
 
@@ -239,6 +248,9 @@ impl WasmCanvasApp {
             canvas_list,
             favorites,
             saved_relays,
+            user_name,
+            peer_names: HashMap::new(),
+            trusted_peers,
         }
     }
 
@@ -514,9 +526,15 @@ impl WasmCanvasApp {
                 if header.exports.is_empty() || header.name.is_empty() { return None; }
                 let mut values = node.output_values.clone();
                 for (k, v) in &node.widget_values { values.insert(k.clone(), v.clone()); }
-                // Include source code so peers can see/clone this node
-                if !node.script_code.is_empty() {
+                // Include source code only if canvas allows sharing
+                let share_code = self.all_graphs.get(canvas_name)
+                    .map_or(true, |g| g.share_code);
+                if share_code && !node.script_code.is_empty() {
                     values.insert("__source__".to_string(), Value::Str(node.script_code.clone()));
+                }
+                // Include user name for peer identification
+                if !self.user_name.is_empty() {
+                    values.insert("__peer_name__".to_string(), Value::Str(self.user_name.clone()));
                 }
                 let canvas = if header.canvas.is_empty() { canvas_name.to_string() } else { header.canvas.clone() };
                 Some((canvas_name.to_string(), canvas, header.name.clone(), values))
@@ -568,13 +586,18 @@ impl WasmCanvasApp {
     /// `peer` is the source canvas name (loopback) or peer ID (network).
     /// Creates/updates phantom node, registers R6RS libraries, recomputes downstream.
     fn deliver_values(&mut self, canvas_key: &str, peer: &str, module_name: &str, values: &HashMap<String, Value>) {
-        // Extract source code before filtering
+        // Extract metadata before filtering
         let source_code = match values.get("__source__") {
             Some(Value::Str(s)) => Some(s.clone()),
             _ => None,
         };
+        if let Some(Value::Str(name)) = values.get("__peer_name__") {
+            if !name.is_empty() {
+                self.peer_names.insert(peer.to_string(), name.clone());
+            }
+        }
 
-        // Filter out __source__ from values that go into phantom node outputs
+        // Filter out __ metadata from values that go into phantom node outputs
         let node_values: HashMap<String, Value> = values.iter()
             .filter(|(k, _)| !k.starts_with("__"))
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -594,13 +617,16 @@ impl WasmCanvasApp {
 
         // Register as a remote template in the Node Library
         if let Some(ref code) = source_code {
+            let display_name = self.peer_names.get(peer)
+                .cloned()
+                .unwrap_or_else(|| peer.to_string());
             let template_key = format!("{}/{}", peer, module_name);
             let outputs: Vec<PortDef> = node_values.keys()
                 .map(|k| PortDef { name: k.clone(), port_type: PortType::F64 })
                 .collect();
             self.registry.templates.insert(template_key, NodeTemplate {
                 name: module_name.to_string(),
-                category: peer.to_string(),
+                category: display_name,
                 path: None,
                 inputs: Vec::new(),
                 outputs,
@@ -1004,12 +1030,31 @@ impl WasmCanvasApp {
                 }
                 PanelAction::ConnectRelay(addr) => {
                     if addr.is_empty() {
-                        // Disconnect: show input field again
                         self.panel_state.relay_connected = false;
                     } else {
                         self.net_handle.send(NetCommand::ConnectRelay { addr });
                         self.panel_state.relay_connected = true;
                     }
+                }
+                PanelAction::SetUserName(name) => {
+                    self.user_name = name.clone();
+                    self.resources.db.kv_set("user_name", serde_json::Value::String(name));
+                }
+                PanelAction::ToggleShareCode => {
+                    let graph = self.all_graphs.get_mut(&self.current_canvas).unwrap();
+                    graph.share_code = !graph.share_code;
+                }
+                PanelAction::TrustPeer(name) => {
+                    if !self.trusted_peers.contains(&name) {
+                        self.trusted_peers.push(name);
+                        let json = serde_json::to_value(&self.trusted_peers).unwrap_or_default();
+                        self.resources.db.kv_set("trusted_peers", json);
+                    }
+                }
+                PanelAction::UntrustPeer(name) => {
+                    self.trusted_peers.retain(|p| p != &name);
+                    let json = serde_json::to_value(&self.trusted_peers).unwrap_or_default();
+                    self.resources.db.kv_set("trusted_peers", json);
                 }
             }
         }
@@ -1094,12 +1139,16 @@ impl eframe::App for WasmCanvasApp {
 
         // Toolbar
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            let share_code = self.all_graphs.get(&self.current_canvas)
+                .map_or(true, |g| g.share_code);
             let toolbar_actions = panels::draw_toolbar(
                 ui, &self.current_canvas, &self.canvas_list,
                 &mut self.panel_state.new_canvas_name,
                 &mut self.panel_state.relay_addr,
                 self.panel_state.relay_connected,
                 &self.saved_relays,
+                &mut self.user_name,
+                share_code,
             );
             actions.extend(toolbar_actions);
         });
@@ -1134,6 +1183,7 @@ impl eframe::App for WasmCanvasApp {
                 .show(ctx, |ui| {
                     let lib_actions = panels::draw_library(
                         ui, &self.registry, &mut self.panel_state, &self.favorites,
+                        &self.trusted_peers,
                     );
                     actions.extend(lib_actions);
                 });

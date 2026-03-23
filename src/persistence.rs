@@ -70,8 +70,8 @@ pub fn save_canvas_to_db(canvas_name: &str, graph: &Graph, db: &Db) -> Result<()
 
     // Save metadata
     db.run(&format!(
-        "CREATE graph_meta SET canvas = '{}', viewport_offset_x = {}, viewport_offset_y = {}, viewport_zoom = {}, next_node_id = {}",
-        cn, graph.viewport_offset[0], graph.viewport_offset[1], graph.viewport_zoom, graph.next_node_id
+        "CREATE graph_meta SET canvas = '{}', viewport_offset_x = {}, viewport_offset_y = {}, viewport_zoom = {}, next_node_id = {}, share_code = {}",
+        cn, graph.viewport_offset[0], graph.viewport_offset[1], graph.viewport_zoom, graph.next_node_id, graph.share_code
     ))?;
 
     // Save each non-phantom node
@@ -132,6 +132,8 @@ pub fn load_canvas_from_db(canvas_name: &str, db: &Db) -> Result<Option<Graph>> 
         .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
     graph.next_node_id = meta.get("next_node_id")
         .and_then(|v| v.as_u64()).unwrap_or(1);
+    graph.share_code = meta.get("share_code")
+        .and_then(|v| v.as_bool()).unwrap_or(true);
 
     let node_rows = db.query(&format!(
         "SELECT * FROM graph_nodes WHERE canvas = '{}'", cn

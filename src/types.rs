@@ -171,7 +171,11 @@ pub struct Graph {
     pub next_node_id: NodeId,
     pub viewport_offset: [f32; 2],
     pub viewport_zoom: f32,
+    #[serde(default = "default_true")]
+    pub share_code: bool,
 }
+
+fn default_true() -> bool { true }
 
 impl Graph {
     pub fn new() -> Self {
@@ -180,6 +184,7 @@ impl Graph {
             next_node_id: 1,
             viewport_offset: [0.0, 0.0],
             viewport_zoom: 1.0,
+            share_code: true,
         }
     }
 

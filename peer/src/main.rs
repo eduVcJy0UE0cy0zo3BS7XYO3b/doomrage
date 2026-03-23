@@ -49,6 +49,10 @@ fn main() {
         all_graphs.insert("default".to_string(), Graph::new());
     }
 
+    let user_name = resources.db.kv_get("user_name")
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
     // Init scheme libraries
     for (name, graph) in &all_graphs {
         resources.scheme.register_stub_libraries(name, &graph.nodes);
@@ -133,8 +137,13 @@ fn main() {
                                 if !node.phantom && !header.exports.is_empty() && !header.name.is_empty() {
                                     let mut values = node.output_values.clone();
                                     for (k, v) in &node.widget_values { values.insert(k.clone(), v.clone()); }
-                                    if !node.script_code.is_empty() {
+                                    let share_code = all_graphs.get(canvas_name)
+                                        .map_or(true, |g| g.share_code);
+                                    if share_code && !node.script_code.is_empty() {
                                         values.insert("__source__".to_string(), Value::Str(node.script_code.clone()));
+                                    }
+                                    if !user_name.is_empty() {
+                                        values.insert("__peer_name__".to_string(), Value::Str(user_name.clone()));
                                     }
                                     let channel = format!("{}/{}", canvas, header.name);
                                     net_handle.send(NetCommand::Publish { channel: channel.clone(), values });

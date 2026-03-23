@@ -65,6 +65,11 @@ pub enum PanelAction {
     ImportScm,
     ConnectRelay(String),
     SaveRelay(String),
+    /// User profile & trust
+    SetUserName(String),
+    ToggleShareCode,
+    TrustPeer(String),
+    UntrustPeer(String),
 }
 
 pub fn draw_toolbar(
@@ -75,6 +80,8 @@ pub fn draw_toolbar(
     relay_addr: &mut String,
     relay_connected: bool,
     saved_relays: &[String],
+    user_name: &mut String,
+    share_code: bool,
 ) -> Vec<PanelAction> {
     let mut actions = Vec::new();
 
@@ -172,6 +179,14 @@ pub fn draw_toolbar(
             }
         }
 
+        ui.separator();
+
+        // Share code toggle
+        let mut sc = share_code;
+        if ui.checkbox(&mut sc, RichText::new("share code").color(TEXT_DIM).small()).changed() {
+            actions.push(PanelAction::ToggleShareCode);
+        }
+
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Delete canvas button (only if not last canvas)
             if canvas_list.len() > 1 {
@@ -181,6 +196,16 @@ pub fn draw_toolbar(
                 {
                     actions.push(PanelAction::DeleteCanvas(current_canvas.to_string()));
                 }
+            }
+
+            // User name field
+            let resp = ui.add(
+                egui::TextEdit::singleline(user_name)
+                    .hint_text("your name")
+                    .desired_width(80.0),
+            );
+            if resp.lost_focus() {
+                actions.push(PanelAction::SetUserName(user_name.clone()));
             }
         });
     });
@@ -193,6 +218,7 @@ pub fn draw_library(
     registry: &NodeRegistry,
     panel: &mut PanelState,
     favorites: &[String],
+    trusted_peers: &[String],
 ) -> Vec<PanelAction> {
     let mut actions = Vec::new();
 
@@ -241,6 +267,14 @@ pub fn draw_library(
                 }
 
                 for (category, templates) in registry.grouped_templates() {
+                    // Filter by trust: if trust list is non-empty, hide remote templates from untrusted peers
+                    let is_remote = templates.iter().any(|t| t.script_code.is_some());
+                    if is_remote && !trusted_peers.is_empty() {
+                        // Check if any trusted peer name matches this category
+                        let trusted = trusted_peers.iter().any(|tp| category.contains(tp) || tp.contains(&category));
+                        if !trusted { continue; }
+                    }
+
                     let filtered: Vec<_> = templates
                         .iter()
                         .filter(|t| search.is_empty() || t.name.to_lowercase().contains(&search))
@@ -250,7 +284,22 @@ pub fn draw_library(
                         continue;
                     }
 
-                    ui.label(RichText::new(&category).color(TEXT_DIM).small());
+                    let is_remote_category = filtered.iter().any(|t| t.script_code.is_some());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&category).color(if is_remote_category { ACCENT } else { TEXT_DIM }).small());
+                        if is_remote_category {
+                            let is_trusted = trusted_peers.iter().any(|tp| category.contains(tp));
+                            if is_trusted {
+                                if ui.small_button(RichText::new("untrust").color(TEXT_DIM)).clicked() {
+                                    actions.push(PanelAction::UntrustPeer(category.clone()));
+                                }
+                            } else {
+                                if ui.small_button(RichText::new("trust").color(Color32::from_rgb(0x00, 0xcc, 0x66))).clicked() {
+                                    actions.push(PanelAction::TrustPeer(category.clone()));
+                                }
+                            }
+                        }
+                    });
                     ui.add_space(2.0);
 
                     for template in filtered {

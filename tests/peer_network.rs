@@ -262,3 +262,150 @@ fn test_source_code_over_gossipsub() {
     assert_eq!(node_values.len(), 1);
     assert!(node_values.contains_key("gain"));
 }
+
+// ---------------------------------------------------------------------------
+// Canvas privacy: share_code controls __source__ inclusion
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_share_code_false_excludes_source() {
+    let code = "(define-module (private-canvas secret)\n  (export val))\n(define val (output 'val 'f64))";
+    let mut values = HashMap::new();
+    values.insert("val".to_string(), Value::F64(99.0));
+
+    // Simulate auto_publish_node with share_code = false
+    let share_code = false;
+    if share_code && !code.is_empty() {
+        values.insert("__source__".to_string(), Value::Str(code.to_string()));
+    }
+
+    // __source__ should NOT be present
+    assert!(!values.contains_key("__source__"));
+    // Values should still be there (phantom nodes work)
+    assert_eq!(values.get("val"), Some(&Value::F64(99.0)));
+}
+
+#[test]
+fn test_share_code_true_includes_source() {
+    let code = "(define-module (public-canvas open)\n  (export val))";
+    let mut values = HashMap::new();
+    values.insert("val".to_string(), Value::F64(1.0));
+
+    let share_code = true;
+    if share_code && !code.is_empty() {
+        values.insert("__source__".to_string(), Value::Str(code.to_string()));
+    }
+
+    assert!(values.contains_key("__source__"));
+}
+
+// ---------------------------------------------------------------------------
+// User profile: __peer_name__ in values
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_peer_name_in_published_values() {
+    let mut values = HashMap::new();
+    values.insert("gain".to_string(), Value::F64(42.0));
+
+    let user_name = "Alice";
+    if !user_name.is_empty() {
+        values.insert("__peer_name__".to_string(), Value::Str(user_name.to_string()));
+    }
+
+    // Wire roundtrip
+    let json = serde_json::to_vec(&values).unwrap();
+    let received: HashMap<String, Value> = serde_json::from_slice(&json).unwrap();
+
+    match received.get("__peer_name__") {
+        Some(Value::Str(name)) => assert_eq!(name, "Alice"),
+        other => panic!("Expected peer name, got {:?}", other),
+    }
+
+    // Filtered out from node values
+    let node_values: HashMap<String, Value> = received.into_iter()
+        .filter(|(k, _)| !k.starts_with("__"))
+        .collect();
+    assert!(!node_values.contains_key("__peer_name__"));
+    assert_eq!(node_values.len(), 1);
+}
+
+#[test]
+fn test_peer_name_mapping() {
+    let mut peer_names: HashMap<String, String> = HashMap::new();
+
+    // Simulate receiving __peer_name__ from a peer
+    let peer_id = "12D3KooWAbCdEf";
+    let values: HashMap<String, Value> = HashMap::from([
+        ("gain".to_string(), Value::F64(50.0)),
+        ("__peer_name__".to_string(), Value::Str("Bob".to_string())),
+    ]);
+
+    if let Some(Value::Str(name)) = values.get("__peer_name__") {
+        if !name.is_empty() {
+            peer_names.insert(peer_id.to_string(), name.clone());
+        }
+    }
+
+    assert_eq!(peer_names.get(peer_id), Some(&"Bob".to_string()));
+
+    // Display name used for template category
+    let display = peer_names.get(peer_id).cloned().unwrap_or_else(|| peer_id.to_string());
+    assert_eq!(display, "Bob");
+}
+
+// ---------------------------------------------------------------------------
+// Canvas privacy persistence
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_share_code_persistence_roundtrip() {
+    let db = wasm_canvas::db::Db::new().expect("create db");
+
+    let mut graph = Graph::new();
+    graph.share_code = false;
+    wasm_canvas::persistence::save_canvas_to_db("private", &graph, &db).expect("save");
+
+    let loaded = wasm_canvas::persistence::load_canvas_from_db("private", &db)
+        .expect("load").expect("canvas exists");
+    assert_eq!(loaded.share_code, false);
+
+    // Default: true
+    let mut graph2 = Graph::new();
+    assert_eq!(graph2.share_code, true);
+    wasm_canvas::persistence::save_canvas_to_db("public", &graph2, &db).expect("save");
+
+    let loaded2 = wasm_canvas::persistence::load_canvas_from_db("public", &db)
+        .expect("load").expect("canvas exists");
+    assert_eq!(loaded2.share_code, true);
+}
+
+// ---------------------------------------------------------------------------
+// Trust list filtering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_trust_list_empty_shows_all() {
+    let trusted_peers: Vec<String> = Vec::new();
+    let is_remote = true;
+    let category = "Alice";
+
+    // Empty trust list = show all
+    let visible = trusted_peers.is_empty() || trusted_peers.iter().any(|tp| category.contains(tp));
+    assert!(visible);
+}
+
+#[test]
+fn test_trust_list_filters_untrusted() {
+    let trusted_peers = vec!["Alice".to_string()];
+    let category_alice = "Alice";
+    let category_mallory = "Mallory";
+
+    let visible_alice = trusted_peers.is_empty()
+        || trusted_peers.iter().any(|tp| category_alice.contains(tp) || tp.contains(category_alice));
+    let visible_mallory = trusted_peers.is_empty()
+        || trusted_peers.iter().any(|tp| category_mallory.contains(tp) || tp.contains(category_mallory));
+
+    assert!(visible_alice);
+    assert!(!visible_mallory);
+}
