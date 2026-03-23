@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "relay"]
+
 [package]
 name = "wasm-canvas"
 version = "0.1.0"
@@ -23,7 +26,7 @@ scheme-rs = { version = "0.1.0", default-features = false, features = ["load-lib
 inventory = "0.3"
 surrealdb = { version = "3.0.4", default-features = false, features = ["kv-mem"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
-libp2p = { version = "0.54", features = ["gossipsub", "mdns", "noise", "yamux", "tcp", "tokio", "macros", "request-response", "cbor"] }
+libp2p = { version = "0.54", features = ["gossipsub", "mdns", "noise", "yamux", "tcp", "tokio", "macros", "request-response", "cbor", "relay", "dcutr", "identify"] }
 rayon = "1"
 rand = "0.8"
 anyhow = "1.0.102"

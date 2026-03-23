@@ -44,6 +44,7 @@ pub struct WasmCanvasApp {
     window_cache: HashMap<NodeId, (Vec<crate::render::RenderBlock>, Vec<crate::bridge::WidgetDecl>, HashMap<String, Value>)>,
     canvas_list: Vec<String>,
     favorites: Vec<String>,
+    saved_relays: Vec<String>,
 }
 
 // --- Graph access helpers ---
@@ -182,6 +183,9 @@ impl WasmCanvasApp {
         }
 
         let favorites = persistence::list_favorites(&resources.db);
+        let saved_relays = resources.db.kv_get("saved_relays")
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+            .unwrap_or_default();
         let mut undo_history = UndoHistory::new(10);
         undo_history.push(all_graphs.get(&current_canvas).unwrap());
 
@@ -233,6 +237,7 @@ impl WasmCanvasApp {
             window_cache: HashMap::new(),
             canvas_list,
             favorites,
+            saved_relays,
         }
     }
 
@@ -960,6 +965,22 @@ impl WasmCanvasApp {
                         }
                     }
                 }
+                PanelAction::SaveRelay(addr) => {
+                    if !self.saved_relays.contains(&addr) {
+                        self.saved_relays.push(addr);
+                        let json = serde_json::to_value(&self.saved_relays).unwrap_or_default();
+                        self.resources.db.kv_set("saved_relays", json);
+                    }
+                }
+                PanelAction::ConnectRelay(addr) => {
+                    if addr.is_empty() {
+                        // Disconnect: show input field again
+                        self.panel_state.relay_connected = false;
+                    } else {
+                        self.net_handle.send(NetCommand::ConnectRelay { addr });
+                        self.panel_state.relay_connected = true;
+                    }
+                }
             }
         }
     }
@@ -1043,6 +1064,9 @@ impl eframe::App for WasmCanvasApp {
             let toolbar_actions = panels::draw_toolbar(
                 ui, &self.current_canvas, &self.canvas_list,
                 &mut self.panel_state.new_canvas_name,
+                &mut self.panel_state.relay_addr,
+                self.panel_state.relay_connected,
+                &self.saved_relays,
             );
             actions.extend(toolbar_actions);
         });

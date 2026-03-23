@@ -3,8 +3,8 @@ use crate::ocapn::session::SessionManager;
 use crate::ocapn::types::OCapNMessage;
 use crate::types::Value;
 use libp2p::{
-    futures::StreamExt,
-    gossipsub, mdns, noise,
+    dcutr, futures::StreamExt,
+    gossipsub, identify, mdns, noise, relay,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm,
@@ -25,6 +25,9 @@ pub enum NetCommand {
     OCapNSend {
         peer_id: String,
         message: OCapNMessage,
+    },
+    ConnectRelay {
+        addr: String,
     },
 }
 
@@ -85,6 +88,9 @@ struct NodeBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
     ocapn_rr: request_response::cbor::Behaviour<OCapNReq, OCapNResp>,
+    relay_client: relay::client::Behaviour,
+    dcutr: dcutr::Behaviour,
+    identify: identify::Behaviour,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -174,6 +180,20 @@ async fn run_swarm(
                             swarm.behaviour_mut().ocapn_rr.send_request(&pid, OCapNReq(data));
                         } else {
                             log::warn!("Invalid PeerId for OCapN send: {}", peer_id);
+                        }
+                    }
+                    NetCommand::ConnectRelay { addr } => {
+                        match addr.parse::<Multiaddr>() {
+                            Ok(maddr) => {
+                                log::info!("Connecting to relay: {}", maddr);
+                                if let Err(e) = swarm.dial(maddr.clone()) {
+                                    log::error!("Failed to dial relay: {}", e);
+                                } else {
+                                    let relay_listen = maddr.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                                    let _ = swarm.listen_on(relay_listen);
+                                }
+                            }
+                            Err(e) => log::error!("Invalid relay address '{}': {}", addr, e),
                         }
                     }
                 }
@@ -279,6 +299,23 @@ async fn run_swarm(
                             }
                         }
                     }
+                    SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(
+                        identify::Event::Received { peer_id, .. },
+                    )) => {
+                        // Peer discovered via relay — add to gossipsub
+                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                        let _ = event_tx.send(NetEvent::PeerDiscovered(peer_id.to_string()));
+                        ctx.request_repaint();
+                        log::info!("Identified peer via relay: {}", peer_id);
+                    }
+                    SwarmEvent::Behaviour(NodeBehaviourEvent::Dcutr(
+                        dcutr::Event { remote_peer_id, result },
+                    )) => {
+                        match result {
+                            Ok(_) => log::info!("DCUtR hole-punch success with {}", remote_peer_id),
+                            Err(e) => log::warn!("DCUtR hole-punch failed with {}: {}", remote_peer_id, e),
+                        }
+                    }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         log::info!("Listening on {}/p2p/{}", address, local_peer_id);
                     }
@@ -329,7 +366,8 @@ fn build_swarm() -> Result<Swarm<NodeBehaviour>, Box<dyn std::error::Error>> {
             noise::Config::new,
             yamux::Config::default,
         )?
-        .with_behaviour(|key| {
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|key, relay_client| {
             let gossipsub_config = gossipsub::ConfigBuilder::default()
                 .heartbeat_interval(Duration::from_secs(1))
                 .validation_mode(gossipsub::ValidationMode::Permissive)
@@ -352,7 +390,13 @@ fn build_swarm() -> Result<Swarm<NodeBehaviour>, Box<dyn std::error::Error>> {
                 request_response::Config::default(),
             );
 
-            Ok(NodeBehaviour { gossipsub, mdns, ocapn_rr })
+            let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
+
+            let identify = identify::Behaviour::new(
+                identify::Config::new("/wasm-canvas/1.0.0".to_string(), key.public()),
+            );
+
+            Ok(NodeBehaviour { gossipsub, mdns, ocapn_rr, relay_client, dcutr, identify })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();

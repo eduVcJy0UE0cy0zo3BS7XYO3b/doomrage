@@ -21,6 +21,8 @@ pub struct PanelState {
     pub selected_node: Option<NodeId>,
     pub script_view: ScriptViewMode,
     pub new_canvas_name: String,
+    pub relay_addr: String,
+    pub relay_connected: bool,
 }
 
 impl PanelState {
@@ -34,6 +36,8 @@ impl PanelState {
             selected_node: None,
             script_view: ScriptViewMode::Rendered,
             new_canvas_name: String::new(),
+            relay_addr: String::new(),
+            relay_connected: false,
         }
     }
 }
@@ -59,6 +63,8 @@ pub enum PanelAction {
     DeleteCanvas(String),
     ExportScm,
     ImportScm,
+    ConnectRelay(String),
+    SaveRelay(String),
 }
 
 pub fn draw_toolbar(
@@ -66,6 +72,9 @@ pub fn draw_toolbar(
     current_canvas: &str,
     canvas_list: &[String],
     new_canvas_name: &mut String,
+    relay_addr: &mut String,
+    relay_connected: bool,
+    saved_relays: &[String],
 ) -> Vec<PanelAction> {
     let mut actions = Vec::new();
 
@@ -118,6 +127,49 @@ pub fn draw_toolbar(
         }
         if ui.button(RichText::new(" Import ").color(TEXT_DIM)).clicked() {
             actions.push(PanelAction::ImportScm);
+        }
+
+        ui.separator();
+
+        // Relay connection
+        if relay_connected {
+            if ui.button(RichText::new("relay ✓").color(Color32::from_rgb(0x00, 0xcc, 0x66)))
+                .on_hover_text("Click to disconnect")
+                .clicked()
+            {
+                actions.push(PanelAction::ConnectRelay(String::new()));
+            }
+        } else {
+            // Saved relays dropdown
+            if !saved_relays.is_empty() {
+                egui::ComboBox::from_id_salt("relay_saved")
+                    .selected_text(RichText::new("▾").color(TEXT_DIM))
+                    .width(20.0)
+                    .show_ui(ui, |ui| {
+                        for addr in saved_relays {
+                            let short = if addr.len() > 30 {
+                                format!("{}...", &addr[..30])
+                            } else {
+                                addr.clone()
+                            };
+                            if ui.selectable_label(false, RichText::new(&short).color(TEXT)).clicked() {
+                                *relay_addr = addr.clone();
+                            }
+                        }
+                    });
+            }
+            let resp = ui.add(
+                egui::TextEdit::singleline(relay_addr)
+                    .hint_text("/ip4/.../p2p/...")
+                    .desired_width(180.0),
+            );
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button(RichText::new("Connect").color(ACCENT)).clicked() || enter)
+                && !relay_addr.trim().is_empty()
+            {
+                actions.push(PanelAction::ConnectRelay(relay_addr.trim().to_string()));
+                actions.push(PanelAction::SaveRelay(relay_addr.trim().to_string()));
+            }
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
