@@ -302,6 +302,7 @@ async fn run_swarm(
                     SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(
                         identify::Event::Received { peer_id, .. },
                     )) => {
+                        if peer_id == local_peer_id { continue; }
                         // Peer discovered via relay — add to gossipsub
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                         let _ = event_tx.send(NetEvent::PeerDiscovered(peer_id.to_string()));
