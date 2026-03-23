@@ -589,7 +589,9 @@ impl WasmCanvasApp {
             if let Some(n) = graph.nodes.get_mut(&id) {
                 n.output_values = values.clone();
                 n.remote_peer = Some(peer.to_string());
-                n.script_outputs = values.keys()
+                let mut sorted_keys: Vec<_> = values.keys().cloned().collect();
+                sorted_keys.sort();
+                n.script_outputs = sorted_keys.iter()
                     .map(|k| PortDef { name: k.clone(), port_type: PortType::F64 })
                     .collect();
             }
@@ -598,6 +600,8 @@ impl WasmCanvasApp {
             let id = graph.next_node_id;
             graph.next_node_id += 1;
             let phantom_count = graph.nodes.values().filter(|n| n.phantom).count();
+            let mut sorted_keys: Vec<_> = values.keys().cloned().collect();
+            sorted_keys.sort();
             let node = Node {
                 id,
                 template_name: "Script".to_string(),
@@ -607,7 +611,7 @@ impl WasmCanvasApp {
                 output_values: values.clone(),
                 script_code: String::new(),
                 script_inputs: Vec::new(),
-                script_outputs: values.keys()
+                script_outputs: sorted_keys.iter()
                     .map(|k| PortDef { name: k.clone(), port_type: PortType::F64 })
                     .collect(),
                 widget_decls: Vec::new(),
