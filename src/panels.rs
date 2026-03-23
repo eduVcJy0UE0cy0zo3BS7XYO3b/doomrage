@@ -853,6 +853,23 @@ fn draw_render_blocks_full(
                             debug_log.log("button", format!("delete {:?}", key));
                             db.kv_delete(key);
                         }
+                        StoreAction::Splice { key, index, delete_count, value } => {
+                            debug_log.log("button", format!("splice {:?}[{}] del={} val={:?}", key, index, delete_count, value));
+                            let mut arr = db.kv_get(key)
+                                .and_then(|v| v.as_array().cloned())
+                                .unwrap_or_default();
+                            let idx = *index;
+                            let del = *delete_count;
+                            if idx <= arr.len() {
+                                let end = (idx + del).min(arr.len());
+                                arr.drain(idx..end);
+                                if !value.is_empty() {
+                                    let resolved = resolve_store_ref(value, db);
+                                    arr.insert(idx.min(arr.len()), serde_json::Value::String(resolved));
+                                }
+                                db.kv_set(key, serde_json::Value::Array(arr));
+                            }
+                        }
                     }
                     store_mutated = true;
                 }

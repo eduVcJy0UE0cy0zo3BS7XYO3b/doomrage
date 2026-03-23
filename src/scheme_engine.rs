@@ -24,10 +24,10 @@ pub fn scheme_value_to_types_value(val: &Value) -> crate::types::Value {
 const CANVAS_RENDER_LIB: &str = r#"
 (library (canvas render)
   (export <compute> compute? ->str
-          text bold italic code link hr table render
+          text bold italic code link hr table render render-map
           plot-line plot-scatter plot-bar
           numbered-list bullet-list
-          button checkbox text-input editable-list
+          button checkbox text-input editable-list slider
           json-null
           canvas draw-line draw-rect draw-circle draw-polyline draw-text
           row group node-blocks node-widgets
@@ -110,6 +110,14 @@ const CANVAS_RENDER_LIB: &str = r#"
     (list 'render-slider key lo hi))
   (define (editable-list key)
     (list 'render-editable-list key))
+
+  ;; Dynamic list rendering: call fn for each element with (item index)
+  (define (render-map lst fn)
+    (list 'render-group
+      (let loop ((rest lst) (i 0))
+        (if (or (null? rest) (not (pair? rest))) '()
+          (cons (fn (car rest) i)
+                (loop (cdr rest) (+ i 1)))))))
 
   ;; Generic canvas drawing
   (define (canvas w h . cmds) (list 'render-canvas w h cmds))
@@ -1114,6 +1122,53 @@ mod tests {
 
         let has_button = result.render_blocks.iter().any(|b| matches!(b, RenderBlock::Button { label, .. } if label == "Click Me"));
         assert!(has_button, "Expected a Button with label 'Click Me', got: {:?}", result.render_blocks);
+    }
+
+    #[test]
+    fn test_splice_button_parsing() {
+        let engine = SchemeEngine::new().unwrap();
+        let result = engine.execute_script(
+            &HashMap::new(),
+            None,
+            r#"(render (button "Delete" 'splice "todos" "2" "1" ""))"#,
+        ).unwrap();
+        let has_button = result.render_blocks.iter().any(|b|
+            matches!(b, RenderBlock::Button { label, action } if label == "Delete"
+                && matches!(action, crate::render::StoreAction::Splice { key, index, delete_count, value }
+                    if key == "todos" && *index == 2 && *delete_count == 1 && value.is_empty())));
+        assert!(has_button, "Expected Splice button, got: {:?}", result.render_blocks);
+    }
+
+    #[test]
+    fn test_render_map() {
+        let engine = SchemeEngine::new().unwrap();
+        let result = engine.execute_script(
+            &HashMap::new(),
+            None,
+            r#"(render-map '("alpha" "beta" "gamma") (lambda (item i) (text (->str i) ". " item)))"#,
+        ).unwrap();
+        // Should produce 3 text blocks
+        assert!(result.render_blocks.len() >= 3,
+            "Expected at least 3 render blocks, got: {:?}", result.render_blocks);
+        let texts: Vec<&str> = result.render_blocks.iter().filter_map(|b| {
+            if let RenderBlock::Text(t) = b { Some(t.as_str()) } else { None }
+        }).collect();
+        assert!(texts.iter().any(|t| t.contains("alpha")), "Missing alpha in {:?}", texts);
+        assert!(texts.iter().any(|t| t.contains("beta")), "Missing beta in {:?}", texts);
+        assert!(texts.iter().any(|t| t.contains("gamma")), "Missing gamma in {:?}", texts);
+    }
+
+    #[test]
+    fn test_render_map_with_buttons() {
+        let engine = SchemeEngine::new().unwrap();
+        // Simulate a todo list rendering with per-item delete buttons
+        let result = engine.execute_script(
+            &HashMap::new(),
+            None,
+            r#"(render-map '("buy milk" "fix bug") (lambda (item i) (render (text item) (button "x" 'splice "todos" (->str i) "1" ""))))"#,
+        ).unwrap();
+        let button_count = result.render_blocks.iter().filter(|b| matches!(b, RenderBlock::Button { .. })).count();
+        assert_eq!(button_count, 2, "Expected 2 delete buttons, got: {:?}", result.render_blocks);
     }
 
     #[test]

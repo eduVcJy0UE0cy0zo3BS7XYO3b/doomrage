@@ -192,9 +192,17 @@ pub(crate) fn try_parse_render_from_value(val: &Value) -> Option<Vec<RenderBlock
             let action_args = args.get(2).map(|a| collect_list(a)).unwrap_or_default();
             let arg1 = action_args.first().map(|v| value_display(v)).unwrap_or_default();
             let arg2 = action_args.get(1).map(|v| value_display(v)).unwrap_or_default();
+            let arg3 = action_args.get(2).map(|v| value_display(v)).unwrap_or_default();
+            let arg4 = action_args.get(3).map(|v| value_display(v)).unwrap_or_default();
             let action = match action_type.as_str() {
                 "append" => crate::render::StoreAction::Append { key: arg1, value: arg2 },
                 "delete" => crate::render::StoreAction::Delete { key: arg1 },
+                "splice" => crate::render::StoreAction::Splice {
+                    key: arg1,
+                    index: arg2.parse().unwrap_or(0),
+                    delete_count: arg3.parse().unwrap_or(1),
+                    value: arg4,
+                },
                 _ => crate::render::StoreAction::Set { key: arg1, value: arg2 },
             };
             Some(vec![RenderBlock::Button { label, action }])

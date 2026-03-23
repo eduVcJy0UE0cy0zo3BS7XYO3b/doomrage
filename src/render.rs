@@ -49,6 +49,10 @@ pub enum StoreAction {
     Set { key: String, value: String },
     Append { key: String, value: String },
     Delete { key: String },
+    /// Splice array at index: remove `delete_count` elements, insert `value` (if non-empty).
+    /// (button "x" 'splice (list "todos" 2 1 ""))    → remove index 2
+    /// (button "v" 'splice (list "todos" 2 1 "done")) → replace index 2 with "done"
+    Splice { key: String, index: usize, delete_count: usize, value: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
