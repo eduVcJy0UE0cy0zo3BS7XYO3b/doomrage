@@ -1,7 +1,7 @@
 use clap::Parser;
 use libp2p::{
     futures::StreamExt,
-    identify, noise, relay, rendezvous,
+    gossipsub, identify, noise, relay, rendezvous,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr,
 };
@@ -20,6 +20,7 @@ struct RelayBehaviour {
     relay: relay::Behaviour,
     identify: identify::Behaviour,
     rendezvous: rendezvous::server::Behaviour,
+    gossipsub: gossipsub::Behaviour,
 }
 
 #[tokio::main]
@@ -46,13 +47,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rendezvous = rendezvous::server::Behaviour::new(
                 rendezvous::server::Config::default(),
             );
-            Ok(RelayBehaviour { relay, identify, rendezvous })
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(Duration::from_secs(1))
+                .validation_mode(gossipsub::ValidationMode::Permissive)
+                .max_transmit_size(256 * 1024)
+                .build()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let gossipsub = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Signed(key.clone()),
+                gossipsub_config,
+            )?;
+            Ok(RelayBehaviour { relay, identify, rendezvous, gossipsub })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
 
     let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", args.port).parse()?;
     swarm.listen_on(listen_addr)?;
+
+    // Subscribe to gossipsub topic so we relay messages between peers
+    let topic = gossipsub::IdentTopic::new("wasm-canvas/values");
+    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
     let local_peer_id = *swarm.local_peer_id();
     log::info!("Relay server starting...");
@@ -116,6 +131,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.to_string(),
                 };
                 log::info!("+ {} from {}", peer_id, addr);
+                // Add peer to gossipsub mesh
+                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 log::info!("- {}", peer_id);

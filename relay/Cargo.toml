@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-libp2p = { version = "0.54", features = ["noise", "yamux", "tcp", "tokio", "macros", "relay", "identify", "rendezvous"] }
+libp2p = { version = "0.54", features = ["noise", "yamux", "tcp", "tokio", "macros", "relay", "identify", "rendezvous", "gossipsub"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
