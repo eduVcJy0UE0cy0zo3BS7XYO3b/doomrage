@@ -74,6 +74,7 @@ impl NodeRegistry {
             outputs,
             wasm_bytes,
             builtin: None,
+            script_code: None,
         };
 
         self.templates.insert(stem, template);
@@ -90,7 +91,7 @@ impl NodeRegistry {
         Ok(())
     }
 
-    pub(crate) fn register_builtins(&mut self) {
+    pub fn register_builtins(&mut self) {
         self.templates.insert(
             "Const".to_string(),
             NodeTemplate {
@@ -104,6 +105,7 @@ impl NodeRegistry {
                 }],
                 wasm_bytes: None,
                 builtin: Some(BuiltinKind::Const),
+                script_code: None,
             },
         );
 
@@ -120,6 +122,7 @@ impl NodeRegistry {
                 outputs: vec![],
                 wasm_bytes: None,
                 builtin: Some(BuiltinKind::Output),
+                script_code: None,
             },
         );
 
@@ -133,6 +136,7 @@ impl NodeRegistry {
                 outputs: vec![],
                 wasm_bytes: None,
                 builtin: Some(BuiltinKind::Script),
+                script_code: None,
             },
         );
     }

@@ -133,6 +133,9 @@ fn main() {
                                 if !node.phantom && !header.exports.is_empty() && !header.name.is_empty() {
                                     let mut values = node.output_values.clone();
                                     for (k, v) in &node.widget_values { values.insert(k.clone(), v.clone()); }
+                                    if !node.script_code.is_empty() {
+                                        values.insert("__source__".to_string(), Value::Str(node.script_code.clone()));
+                                    }
                                     let channel = format!("{}/{}", canvas, header.name);
                                     net_handle.send(NetCommand::Publish { channel: channel.clone(), values });
                                     log::info!("Published \"{}\"", channel);
@@ -175,6 +178,12 @@ fn main() {
                     log::info!("Recv \"{}\": {:?}", channel, values.keys().collect::<Vec<_>>());
                     net_values.lock().unwrap().insert((peer.clone(), channel.clone()), values.clone());
 
+                    // Filter out __source__ metadata from node values
+                    let node_values: HashMap<String, Value> = values.iter()
+                        .filter(|(k, _)| !k.starts_with("__"))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+
                     // Parse channel: "canvas-name/module-name" or legacy "module-name"
                     let (source_canvas, module_name) = if let Some(slash) = channel.find('/') {
                         (&channel[..slash], &channel[slash + 1..])
@@ -196,9 +205,9 @@ fn main() {
 
                         let pid = if let Some(id) = phantom_id {
                             if let Some(n) = graph.nodes.get_mut(&id) {
-                                n.output_values = values.clone();
+                                n.output_values = node_values.clone();
                                 n.remote_peer = Some(peer.clone());
-                                let mut sorted_keys: Vec<_> = values.keys().cloned().collect();
+                                let mut sorted_keys: Vec<_> = node_values.keys().cloned().collect();
                                 sorted_keys.sort();
                                 n.script_outputs = sorted_keys.iter()
                                     .map(|k| PortDef { name: k.clone(), port_type: PortType::F64 })
@@ -209,7 +218,7 @@ fn main() {
                             let id = graph.next_node_id;
                             graph.next_node_id += 1;
                             let pc = graph.nodes.values().filter(|n| n.phantom).count();
-                            let mut sorted_keys: Vec<_> = values.keys().cloned().collect();
+                            let mut sorted_keys: Vec<_> = node_values.keys().cloned().collect();
                             sorted_keys.sort();
                             graph.nodes.insert(id, Node {
                                 id,
@@ -217,7 +226,7 @@ fn main() {
                                 label: module_name.to_string(),
                                 pos: [900.0, 50.0 + pc as f32 * 200.0],
                                 input_values: HashMap::new(),
-                                output_values: values.clone(),
+                                output_values: node_values.clone(),
                                 script_code: String::new(),
                                 script_inputs: Vec::new(),
                                 script_outputs: sorted_keys.iter()
@@ -235,7 +244,7 @@ fn main() {
                             id
                         };
 
-                        actor_runtime.engine().register_node_library_named(pid, source_canvas, module_name, &values);
+                        actor_runtime.engine().register_node_library_named(pid, source_canvas, module_name, &node_values);
 
                         // Recompute downstream
                         let mod_name = module_name.to_string();

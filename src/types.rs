@@ -91,6 +91,8 @@ pub struct NodeTemplate {
     pub outputs: Vec<PortDef>,
     pub wasm_bytes: Option<Vec<u8>>,
     pub builtin: Option<BuiltinKind>,
+    /// Script code for remote/network templates (double-click to create node with this code)
+    pub script_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,7 +192,9 @@ impl Graph {
             input_values.insert(port.name.clone(), port.port_type.default_value());
         }
 
-        let script_code = if template.builtin == Some(BuiltinKind::Script) {
+        let script_code = if let Some(ref code) = template.script_code {
+            code.clone()
+        } else if template.builtin == Some(BuiltinKind::Script) {
             "(define x (input 'x 'f64))\n(define y (input 'y 'f64))\n(define result (output 'result 'f64))\n(set! result (+ x y))\n\n# Result\n\nThe sum is @result.\n\n| input | value |\n|-------|-------|\n| x     | @x    |\n| y     | @y    |".to_string()
         } else {
             String::new()
@@ -1083,5 +1087,67 @@ mod tests {
         let result = engine.execute_script(&HashMap::new(), None, code);
         // Should succeed — fallback defines stub bindings
         assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // Source code sharing via __source__ in published values
+    // =========================================================================
+
+    /// __source__ is included in published values and can be extracted.
+    #[test]
+    fn test_source_code_in_published_values() {
+        let code = "(define-module (demo controls)\n  (export gain))\n\n(define gain (output 'gain 'f64))\n(set! gain 50)";
+        let header = crate::scheme_engine::parse_module_header(code).unwrap();
+
+        // Simulate what auto_publish_node does
+        let mut values = HashMap::new();
+        values.insert("gain".to_string(), Value::F64(50.0));
+        values.insert("__source__".to_string(), Value::Str(code.to_string()));
+
+        // Extract source
+        let source = match values.get("__source__") {
+            Some(Value::Str(s)) => Some(s.clone()),
+            _ => None,
+        };
+        assert_eq!(source, Some(code.to_string()));
+
+        // Filter __source__ from node values (what phantom gets)
+        let node_values: HashMap<String, Value> = values.iter()
+            .filter(|(k, _)| !k.starts_with("__"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert!(!node_values.contains_key("__source__"));
+        assert_eq!(node_values.get("gain"), Some(&Value::F64(50.0)));
+
+        // Channel format
+        let channel = format!("{}/{}", header.canvas, header.name);
+        assert_eq!(channel, "demo/controls");
+    }
+
+    /// Remote template is created from __source__ and can be used to add a node.
+    #[test]
+    fn test_remote_template_from_source() {
+        let code = "(define-module (alice synth)\n  (export sound))\n\n(define sound (output 'sound 'f64))\n(set! sound 42)";
+
+        let template = NodeTemplate {
+            name: "synth".to_string(),
+            category: "alice".to_string(),
+            path: None,
+            inputs: Vec::new(),
+            outputs: vec![PortDef { name: "sound".to_string(), port_type: PortType::F64 }],
+            wasm_bytes: None,
+            builtin: None,
+            script_code: Some(code.to_string()),
+        };
+
+        // Double-click creates a node with this template
+        let mut graph = Graph::new();
+        let id = graph.add_node(&template, [100.0, 100.0]);
+        let node = graph.nodes.get(&id).unwrap();
+
+        // Node should have the source code from the remote template
+        assert_eq!(node.script_code, code);
+        assert_eq!(node.label, "synth");
+        assert!(!node.phantom);
     }
 }

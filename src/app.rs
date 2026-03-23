@@ -514,6 +514,10 @@ impl WasmCanvasApp {
                 if header.exports.is_empty() || header.name.is_empty() { return None; }
                 let mut values = node.output_values.clone();
                 for (k, v) in &node.widget_values { values.insert(k.clone(), v.clone()); }
+                // Include source code so peers can see/clone this node
+                if !node.script_code.is_empty() {
+                    values.insert("__source__".to_string(), Value::Str(node.script_code.clone()));
+                }
                 let canvas = if header.canvas.is_empty() { canvas_name.to_string() } else { header.canvas.clone() };
                 Some((canvas_name.to_string(), canvas, header.name.clone(), values))
             });
@@ -564,6 +568,18 @@ impl WasmCanvasApp {
     /// `peer` is the source canvas name (loopback) or peer ID (network).
     /// Creates/updates phantom node, registers R6RS libraries, recomputes downstream.
     fn deliver_values(&mut self, canvas_key: &str, peer: &str, module_name: &str, values: &HashMap<String, Value>) {
+        // Extract source code before filtering
+        let source_code = match values.get("__source__") {
+            Some(Value::Str(s)) => Some(s.clone()),
+            _ => None,
+        };
+
+        // Filter out __source__ from values that go into phantom node outputs
+        let node_values: HashMap<String, Value> = values.iter()
+            .filter(|(k, _)| !k.starts_with("__"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
         let graph = match self.all_graphs.get(canvas_key) {
             Some(g) => g,
             None => return,
@@ -576,6 +592,24 @@ impl WasmCanvasApp {
         });
         if has_local { return; }
 
+        // Register as a remote template in the Node Library
+        if let Some(ref code) = source_code {
+            let template_key = format!("{}/{}", peer, module_name);
+            let outputs: Vec<PortDef> = node_values.keys()
+                .map(|k| PortDef { name: k.clone(), port_type: PortType::F64 })
+                .collect();
+            self.registry.templates.insert(template_key, NodeTemplate {
+                name: module_name.to_string(),
+                category: peer.to_string(),
+                path: None,
+                inputs: Vec::new(),
+                outputs,
+                wasm_bytes: None,
+                builtin: None,
+                script_code: Some(code.clone()),
+            });
+        }
+
         let phantom_id = graph.nodes.iter()
             .find(|(_, n)| n.phantom && n.label == module_name)
             .map(|(&id, _)| id);
@@ -583,9 +617,9 @@ impl WasmCanvasApp {
         let graph = self.all_graphs.get_mut(canvas_key).unwrap();
         let pid = if let Some(id) = phantom_id {
             if let Some(n) = graph.nodes.get_mut(&id) {
-                n.output_values = values.clone();
+                n.output_values = node_values.clone();
                 n.remote_peer = Some(peer.to_string());
-                let mut sorted_keys: Vec<_> = values.keys().cloned().collect();
+                let mut sorted_keys: Vec<_> = node_values.keys().cloned().collect();
                 sorted_keys.sort();
                 n.script_outputs = sorted_keys.iter()
                     .map(|k| PortDef { name: k.clone(), port_type: PortType::F64 })
@@ -596,7 +630,7 @@ impl WasmCanvasApp {
             let id = graph.next_node_id;
             graph.next_node_id += 1;
             let phantom_count = graph.nodes.values().filter(|n| n.phantom).count();
-            let mut sorted_keys: Vec<_> = values.keys().cloned().collect();
+            let mut sorted_keys: Vec<_> = node_values.keys().cloned().collect();
             sorted_keys.sort();
             let node = Node {
                 id,
@@ -604,7 +638,7 @@ impl WasmCanvasApp {
                 label: module_name.to_string(),
                 pos: [900.0, 50.0 + phantom_count as f32 * 200.0],
                 input_values: HashMap::new(),
-                output_values: values.clone(),
+                output_values: node_values.clone(),
                 script_code: String::new(),
                 script_inputs: Vec::new(),
                 script_outputs: sorted_keys.iter()
@@ -627,7 +661,7 @@ impl WasmCanvasApp {
         };
 
         // Register R6RS library (peer module-name) for imports
-        self.actor_runtime.engine().register_node_library_named(pid, peer, module_name, values);
+        self.actor_runtime.engine().register_node_library_named(pid, peer, module_name, &node_values);
 
         // Recompute downstream nodes that import this module
         let module_str = module_name.to_string();
