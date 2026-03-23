@@ -367,7 +367,8 @@ impl SchemeEngine {
     pub fn new() -> Result<Self> {
         // Set up user library path (don't override if already set)
         if std::env::var("SCHEME_RS_LOAD_PATH").is_err() {
-            let lib_dir = dirs::home_dir()
+            let lib_dir = dirs::data_local_dir()
+                .or_else(|| dirs::home_dir())
                 .unwrap_or_default()
                 .join(".canvas")
                 .join("lib");

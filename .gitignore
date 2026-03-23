@@ -1,6 +1,9 @@
 /target
 /node-crates/target
 store.json
+db.json
+*.db.json
+.env*
 *.swp
 *.swo
 *~

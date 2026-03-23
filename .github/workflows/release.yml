@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: wasm-canvas
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev
+      - run: cargo build --release
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/${{ env.BINARY_NAME }} dist/
+          cp -r nodes dist/ 2>/dev/null || true
+          tar czf ${{ env.BINARY_NAME }}-linux-x86_64.tar.gz -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: ${{ env.BINARY_NAME }}-linux-x86_64.tar.gz
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/${{ env.BINARY_NAME }}.exe dist/
+          cp -r nodes dist/ 2>/dev/null || true
+          7z a ${{ env.BINARY_NAME }}-windows-x86_64.zip ./dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: ${{ env.BINARY_NAME }}-windows-x86_64.zip
+
+  build-macos-intel:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/${{ env.BINARY_NAME }} dist/
+          cp -r nodes dist/ 2>/dev/null || true
+          tar czf ${{ env.BINARY_NAME }}-macos-x86_64.tar.gz -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-x86_64
+          path: ${{ env.BINARY_NAME }}-macos-x86_64.tar.gz
+
+  build-macos-arm:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/${{ env.BINARY_NAME }} dist/
+          cp -r nodes dist/ 2>/dev/null || true
+          tar czf ${{ env.BINARY_NAME }}-macos-aarch64.tar.gz -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-aarch64
+          path: ${{ env.BINARY_NAME }}-macos-aarch64.tar.gz
+
+  release:
+    needs: [build-linux, build-windows, build-macos-intel, build-macos-arm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/linux-x86_64/${{ env.BINARY_NAME }}-linux-x86_64.tar.gz
+            artifacts/windows-x86_64/${{ env.BINARY_NAME }}-windows-x86_64.zip
+            artifacts/macos-x86_64/${{ env.BINARY_NAME }}-macos-x86_64.tar.gz
+            artifacts/macos-aarch64/${{ env.BINARY_NAME }}-macos-aarch64.tar.gz
+          generate_release_notes: true

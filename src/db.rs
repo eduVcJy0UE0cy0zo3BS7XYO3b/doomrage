@@ -71,6 +71,7 @@ impl Db {
         if let Some(info) = tables.first() {
             if let Some(tables_obj) = info.get("tables").and_then(|t| t.as_object()) {
                 for table_name in tables_obj.keys() {
+                    if !Self::is_safe_table_name(table_name) { continue; }
                     let rows = self.query(&format!("SELECT * FROM {}", table_name))?;
                     dump.insert(table_name.clone(), JsonValue::Array(rows));
                 }
@@ -80,12 +81,20 @@ impl Db {
         Ok(serde_json::to_string_pretty(&dump)?)
     }
 
+    /// Validate that a table name contains only safe characters (alphanumeric, underscore, hyphen).
+    fn is_safe_table_name(name: &str) -> bool {
+        !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    }
+
     /// Import data from JSON dump
     pub fn import(&self, json: &str) -> Result<()> {
         let data: serde_json::Map<String, JsonValue> = serde_json::from_str(json)?;
         for (table, rows) in &data {
+            if !Self::is_safe_table_name(table) {
+                log::warn!("Skipping invalid table name in import: {:?}", table);
+                continue;
+            }
             if let Some(arr) = rows.as_array() {
-                // Clear table first
                 self.run(&format!("DELETE {}", table))?;
                 for row in arr {
                     let content = serde_json::to_string(row)?;

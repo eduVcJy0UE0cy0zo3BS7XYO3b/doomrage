@@ -169,7 +169,7 @@ mod tests {
     fn builtin_registry() -> NodeRegistry {
         let mut reg = NodeRegistry {
             templates: HashMap::new(),
-            nodes_dir: std::path::PathBuf::from("/tmp/wasm-canvas-test-nodes"),
+            nodes_dir: std::env::temp_dir().join("wasm-canvas-test-nodes"),
         };
         reg.register_builtins();
         reg
