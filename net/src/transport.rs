@@ -4,7 +4,7 @@ use crate::protocol::Value;
 use crate::protocol::WireMessage;
 use libp2p::{
     dcutr, futures::StreamExt,
-    gossipsub, identify, mdns, noise, relay,
+    gossipsub, identify, mdns, noise, relay, rendezvous,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm,
@@ -104,6 +104,7 @@ struct NodeBehaviour {
     relay_client: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
     identify: identify::Behaviour,
+    rendezvous: rendezvous::client::Behaviour,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -167,6 +168,9 @@ async fn run_swarm(
     let mut latest_seq: HashMap<(String, String), u64> = HashMap::new();
     // Pending relay circuit listeners: relay PeerId → relay Multiaddr
     let mut pending_relay_circuits: HashMap<PeerId, Multiaddr> = HashMap::new();
+    // Rendezvous: relay peers to register/discover with
+    let mut rendezvous_peers: HashMap<PeerId, Multiaddr> = HashMap::new();
+    let rendezvous_ns = rendezvous::Namespace::from_static("wasm-canvas");
 
     loop {
         tokio::select! {
@@ -203,11 +207,33 @@ async fn run_swarm(
                                         None
                                     }
                                 });
-                                if let Err(e) = swarm.dial(maddr.clone()) {
+                                if let Some(relay_pid) = relay_peer {
+                                    rendezvous_peers.insert(relay_pid, maddr.clone());
+                                    // Check if already connected (e.g. via mDNS)
+                                    if swarm.is_connected(&relay_pid) {
+                                        log::info!("Already connected to relay, setting up circuit");
+                                        let circuit_addr = maddr.clone()
+                                            .with(libp2p::multiaddr::Protocol::P2pCircuit)
+                                            .with(libp2p::multiaddr::Protocol::P2p(local_peer_id));
+                                        let relay_listen = maddr.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                                        let _ = swarm.listen_on(relay_listen);
+                                        swarm.add_external_address(circuit_addr);
+                                        // Register + discover
+                                        if let Err(e) = swarm.behaviour_mut().rendezvous.register(
+                                            rendezvous_ns.clone(), relay_pid, None,
+                                        ) {
+                                            log::warn!("Rendezvous register failed: {}", e);
+                                        }
+                                        swarm.behaviour_mut().rendezvous.discover(
+                                            Some(rendezvous_ns.clone()), None, None, relay_pid,
+                                        );
+                                    } else if let Err(e) = swarm.dial(maddr.clone()) {
+                                        log::error!("Failed to dial relay: {}", e);
+                                    } else {
+                                        pending_relay_circuits.insert(relay_pid, maddr);
+                                    }
+                                } else if let Err(e) = swarm.dial(maddr.clone()) {
                                     log::error!("Failed to dial relay: {}", e);
-                                } else if let Some(relay_pid) = relay_peer {
-                                    // Defer circuit listen until connection is established
-                                    pending_relay_circuits.insert(relay_pid, maddr);
                                 }
                             }
                             Err(e) => log::error!("Invalid relay address '{}': {}", addr, e),
@@ -329,6 +355,15 @@ async fn run_swarm(
                         let _ = event_tx.send(NetEvent::PeerDiscovered(peer_id.to_string()));
                         ctx.request_repaint();
                         log::info!("Identified peer via relay: {}", peer_id);
+                        // Register + discover via rendezvous when we identify the relay
+                        if rendezvous_peers.contains_key(&peer_id) {
+                            log::info!("Registering with rendezvous on {}", peer_id);
+                            if let Err(e) = swarm.behaviour_mut().rendezvous.register(
+                                rendezvous_ns.clone(), peer_id, None,
+                            ) {
+                                log::warn!("Rendezvous register failed: {}", e);
+                            }
+                        }
                     }
                     SwarmEvent::Behaviour(NodeBehaviourEvent::Dcutr(
                         dcutr::Event { remote_peer_id, result },
@@ -339,12 +374,53 @@ async fn run_swarm(
                         }
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        log::info!("Connection established with {}", peer_id);
                         // If this is a relay we were waiting for, start circuit listener
                         if let Some(relay_maddr) = pending_relay_circuits.remove(&peer_id) {
+                            let circuit_addr = relay_maddr.clone()
+                                .with(libp2p::multiaddr::Protocol::P2pCircuit)
+                                .with(libp2p::multiaddr::Protocol::P2p(local_peer_id));
+                            log::info!("Relay connected, listening on circuit");
                             let relay_listen = relay_maddr.with(libp2p::multiaddr::Protocol::P2pCircuit);
-                            log::info!("Relay connected, listening on circuit: {}", relay_listen);
                             let _ = swarm.listen_on(relay_listen);
+                            // Add circuit address as external so rendezvous can register
+                            swarm.add_external_address(circuit_addr);
                         }
+                        // Discover via rendezvous immediately
+                        if rendezvous_peers.contains_key(&peer_id) {
+                            swarm.behaviour_mut().rendezvous.discover(
+                                Some(rendezvous_ns.clone()), None, None, peer_id,
+                            );
+                        }
+                    }
+                    SwarmEvent::Behaviour(NodeBehaviourEvent::Rendezvous(
+                        rendezvous::client::Event::Registered { rendezvous_node, .. },
+                    )) => {
+                        log::info!("Registered with rendezvous on {}", rendezvous_node);
+                    }
+                    SwarmEvent::Behaviour(NodeBehaviourEvent::Rendezvous(
+                        rendezvous::client::Event::Discovered { registrations, rendezvous_node, .. },
+                    )) => {
+                        for registration in registrations {
+                            let peer = registration.record.peer_id();
+                            if peer == local_peer_id { continue; }
+                            log::info!("Rendezvous discovered peer: {}", peer);
+                            // Dial via relay circuit
+                            if let Some(relay_maddr) = rendezvous_peers.get(&rendezvous_node) {
+                                let circuit_addr = relay_maddr.clone()
+                                    .with(libp2p::multiaddr::Protocol::P2pCircuit)
+                                    .with(libp2p::multiaddr::Protocol::P2p(peer));
+                                log::info!("Dialing discovered peer via circuit: {}", circuit_addr);
+                                if let Err(e) = swarm.dial(circuit_addr) {
+                                    log::warn!("Failed to dial discovered peer {}: {}", peer, e);
+                                }
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(NodeBehaviourEvent::Rendezvous(
+                        rendezvous::client::Event::RegisterFailed { error, .. },
+                    )) => {
+                        log::warn!("Rendezvous register failed: {:?}", error);
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         log::info!("Listening on {}/p2p/{}", address, local_peer_id);
@@ -420,7 +496,9 @@ pub fn build_swarm() -> Result<Swarm<NodeBehaviour>, Box<dyn std::error::Error>>
                 identify::Config::new("/wasm-canvas/1.0.0".to_string(), key.public()),
             );
 
-            Ok(NodeBehaviour { gossipsub, mdns, ocapn_rr, relay_client, dcutr, identify })
+            let rendezvous = rendezvous::client::Behaviour::new(key.clone());
+
+            Ok(NodeBehaviour { gossipsub, mdns, ocapn_rr, relay_client, dcutr, identify, rendezvous })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();

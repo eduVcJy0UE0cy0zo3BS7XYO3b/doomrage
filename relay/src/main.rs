@@ -1,7 +1,7 @@
 use clap::Parser;
 use libp2p::{
     futures::StreamExt,
-    identify, noise, relay,
+    identify, noise, relay, rendezvous,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr,
 };
@@ -19,6 +19,7 @@ struct Args {
 struct RelayBehaviour {
     relay: relay::Behaviour,
     identify: identify::Behaviour,
+    rendezvous: rendezvous::server::Behaviour,
 }
 
 #[tokio::main]
@@ -42,7 +43,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let identify = identify::Behaviour::new(
                 identify::Config::new("/wasm-canvas/1.0.0".to_string(), key.public()),
             );
-            Ok(RelayBehaviour { relay, identify })
+            let rendezvous = rendezvous::server::Behaviour::new(
+                rendezvous::server::Config::default(),
+            );
+            Ok(RelayBehaviour { relay, identify, rendezvous })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
@@ -93,6 +97,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id, .. },
             )) => {
                 log::info!("Circuit {} -> {}", src_peer_id, dst_peer_id);
+            }
+            SwarmEvent::Behaviour(RelayBehaviourEvent::Rendezvous(
+                rendezvous::server::Event::PeerRegistered { peer, registration },
+            )) => {
+                log::info!("Rendezvous: {} registered in namespace '{}'",
+                    peer, registration.namespace);
+            }
+            SwarmEvent::Behaviour(RelayBehaviourEvent::Rendezvous(
+                rendezvous::server::Event::DiscoverServed { enquirer, registrations },
+            )) => {
+                log::info!("Rendezvous: served {} registrations to {}",
+                    registrations.len(), enquirer);
             }
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                 let addr = match &endpoint {

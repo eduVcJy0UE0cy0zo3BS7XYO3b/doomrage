@@ -8,7 +8,7 @@ name = "wasm-canvas-net"
 path = "src/main.rs"
 
 [dependencies]
-libp2p = { version = "0.54", features = ["gossipsub", "mdns", "noise", "yamux", "tcp", "tokio", "macros", "request-response", "cbor", "relay", "dcutr", "identify"] }
+libp2p = { version = "0.54", features = ["gossipsub", "mdns", "noise", "yamux", "tcp", "tokio", "macros", "request-response", "cbor", "relay", "dcutr", "identify", "rendezvous"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "io-util", "io-std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
