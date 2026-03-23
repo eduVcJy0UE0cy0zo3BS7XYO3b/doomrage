@@ -190,7 +190,8 @@ impl WasmCanvasApp {
         undo_history.push(all_graphs.get(&current_canvas).unwrap());
 
         let session_manager: SharedSessionManager = Arc::new(Mutex::new(SessionManager::new()));
-        let net_handle = network::spawn_network(cc.egui_ctx.clone(), session_manager.clone());
+        let repaint: Arc<dyn crate::types::RepaintSignal> = Arc::new(crate::types::EguiRepaint(cc.egui_ctx.clone()));
+        let net_handle = network::spawn_network(repaint.clone(), session_manager.clone());
         let net_values: NetValues = Arc::new(Mutex::new(HashMap::new()));
         let ocapn_slots: OCapNSlotStore = Arc::new(Mutex::new(HashMap::new()));
         let connected_peers: crate::bridge::ConnectedPeers = Arc::new(Mutex::new(HashSet::new()));
@@ -207,7 +208,7 @@ impl WasmCanvasApp {
         actor_runtime.set_node_mailboxes(node_mailboxes.clone());
         actor_runtime.set_wasm_runner(resources.wasm.clone());
         actor_runtime.set_slot_owners(ocapn_slot_owners.clone());
-        actor_runtime.set_egui_ctx(cc.egui_ctx.clone());
+        actor_runtime.set_repaint_signal(repaint);
 
         Self {
             all_graphs,

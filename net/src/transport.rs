@@ -1,7 +1,7 @@
-use crate::bridge::SharedSessionManager;
 use crate::ocapn::session::SessionManager;
 use crate::ocapn::types::OCapNMessage;
-use crate::types::Value;
+use crate::protocol::Value;
+use crate::protocol::WireMessage;
 use libp2p::{
     dcutr, futures::StreamExt,
     gossipsub, identify, mdns, noise, relay,
@@ -10,9 +10,28 @@ use libp2p::{
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm,
 };
 use std::collections::HashMap;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
+
+// --- RepaintSignal ---
+
+/// Abstraction so network can signal the UI without depending on egui.
+pub trait RepaintSignal: Send + Sync + 'static {
+    fn request_repaint(&self);
+}
+
+/// No-op signal for headless mode.
+#[derive(Clone)]
+pub struct NoRepaint;
+
+impl RepaintSignal for NoRepaint {
+    fn request_repaint(&self) {}
+}
+
+// --- Shared types ---
+
+pub type SharedSessionManager = Arc<Mutex<SessionManager>>;
 
 // --- Public types ---
 
@@ -27,6 +46,9 @@ pub enum NetCommand {
         message: OCapNMessage,
     },
     ConnectRelay {
+        addr: String,
+    },
+    DialPeer {
         addr: String,
     },
 }
@@ -51,7 +73,7 @@ pub enum NetEvent {
     LocalPeerId(String),
 }
 
-/// Handle held by the main (eframe) thread.
+/// Handle held by the main thread.
 pub struct NetHandle {
     cmd_tx: tokio_mpsc::UnboundedSender<NetCommand>,
     event_rx: mpsc::Receiver<NetEvent>,
@@ -72,15 +94,6 @@ impl NetHandle {
     }
 }
 
-// --- Wire message ---
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct WireMessage {
-    channel: String,
-    values: HashMap<String, Value>,
-    seq: u64,
-}
-
 // --- libp2p behaviour ---
 
 #[derive(NetworkBehaviour)]
@@ -99,9 +112,9 @@ pub struct OCapNReq(pub Vec<u8>);
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OCapNResp(pub Vec<u8>);
 
-// --- Entry point: spawn network thread ---
+// --- Entry point ---
 
-pub fn spawn_network(ctx: egui::Context, session_manager: SharedSessionManager) -> NetHandle {
+pub fn spawn_network(ctx: Arc<dyn RepaintSignal>, session_manager: SharedSessionManager) -> NetHandle {
     let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::channel();
 
@@ -122,10 +135,9 @@ pub fn spawn_network(ctx: egui::Context, session_manager: SharedSessionManager) 
 async fn run_swarm(
     mut cmd_rx: tokio_mpsc::UnboundedReceiver<NetCommand>,
     event_tx: mpsc::Sender<NetEvent>,
-    ctx: egui::Context,
+    ctx: Arc<dyn RepaintSignal>,
     session_manager: SharedSessionManager,
 ) {
-    // Build swarm
     let mut swarm = match build_swarm() {
         Ok(s) => s,
         Err(e) => {
@@ -134,7 +146,6 @@ async fn run_swarm(
         }
     };
 
-    // Listen on all interfaces
     let listen_addr: Multiaddr = "/ip4/0.0.0.0/tcp/0".parse().unwrap();
     if let Err(e) = swarm.listen_on(listen_addr) {
         log::error!("Failed to listen: {}", e);
@@ -153,12 +164,12 @@ async fn run_swarm(
     ctx.request_repaint();
 
     let mut seq: u64 = 0;
-    // Track latest seq per (peer, channel) to discard stale
     let mut latest_seq: HashMap<(String, String), u64> = HashMap::new();
+    // Pending relay circuit listeners: relay PeerId → relay Multiaddr
+    let mut pending_relay_circuits: HashMap<PeerId, Multiaddr> = HashMap::new();
 
     loop {
         tokio::select! {
-            // Process commands from main thread
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     NetCommand::Publish { channel, values } => {
@@ -166,9 +177,7 @@ async fn run_swarm(
                         let msg = WireMessage { channel, values, seq };
                         if let Ok(data) = serde_json::to_vec(&msg) {
                             match swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
-                                Err(gossipsub::PublishError::InsufficientPeers) => {
-                                    // Expected when no remote peers connected yet
-                                }
+                                Err(gossipsub::PublishError::InsufficientPeers) => {}
                                 Err(e) => log::warn!("Gossipsub publish error: {}", e),
                                 Ok(_) => {}
                             }
@@ -186,28 +195,45 @@ async fn run_swarm(
                         match addr.parse::<Multiaddr>() {
                             Ok(maddr) => {
                                 log::info!("Connecting to relay: {}", maddr);
+                                // Extract relay PeerId from multiaddr
+                                let relay_peer = maddr.iter().find_map(|p| {
+                                    if let libp2p::multiaddr::Protocol::P2p(pid) = p {
+                                        Some(pid)
+                                    } else {
+                                        None
+                                    }
+                                });
                                 if let Err(e) = swarm.dial(maddr.clone()) {
                                     log::error!("Failed to dial relay: {}", e);
-                                } else {
-                                    let relay_listen = maddr.with(libp2p::multiaddr::Protocol::P2pCircuit);
-                                    let _ = swarm.listen_on(relay_listen);
+                                } else if let Some(relay_pid) = relay_peer {
+                                    // Defer circuit listen until connection is established
+                                    pending_relay_circuits.insert(relay_pid, maddr);
                                 }
                             }
                             Err(e) => log::error!("Invalid relay address '{}': {}", addr, e),
                         }
                     }
+                    NetCommand::DialPeer { addr } => {
+                        match addr.parse::<Multiaddr>() {
+                            Ok(maddr) => {
+                                log::info!("Dialing peer: {}", maddr);
+                                if let Err(e) = swarm.dial(maddr) {
+                                    log::error!("Failed to dial peer: {}", e);
+                                }
+                            }
+                            Err(e) => log::error!("Invalid peer address '{}': {}", addr, e),
+                        }
+                    }
                 }
             }
-            // Process swarm events
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(ev)) => {
-                        handle_mdns(&mut swarm, &event_tx, &ctx, ev);
+                        handle_mdns(&mut swarm, &event_tx, &*ctx, ev);
                     }
                     SwarmEvent::Behaviour(NodeBehaviourEvent::Gossipsub(
                         gossipsub::Event::Message { propagation_source, message, .. }
                     )) => {
-                        // Ignore our own messages
                         if propagation_source == local_peer_id {
                             continue;
                         }
@@ -233,7 +259,6 @@ async fn run_swarm(
                                 if let Ok(msg) = OCapNMessage::decode(&request.0) {
                                     match &msg {
                                         OCapNMessage::OpDeliver { to_desc: _, args, request_id } => {
-                                            // Handle OpDeliver: deliver and respond with result
                                             let response_data = if args.len() >= 2 {
                                                 if let (
                                                     crate::ocapn::syrup::SyrupValue::Symbol(method),
@@ -260,7 +285,6 @@ async fn run_swarm(
                                             } else { vec![] };
                                             let _ = swarm.behaviour_mut().ocapn_rr
                                                 .send_response(channel, OCapNResp(response_data));
-                                            // Also forward as event so main thread can log it
                                             let _ = event_tx.send(NetEvent::OCapNReceived {
                                                 peer: peer.to_string(),
                                                 message: msg,
@@ -273,7 +297,6 @@ async fn run_swarm(
                                                 message: msg,
                                             });
                                             ctx.request_repaint();
-                                            // Send empty ack response
                                             let _ = swarm.behaviour_mut().ocapn_rr
                                                 .send_response(channel, OCapNResp(vec![]));
                                         }
@@ -284,7 +307,6 @@ async fn run_swarm(
                                 }
                             }
                             request_response::Message::Response { response, .. } => {
-                                // Handle OpDeliverResult responses
                                 if !response.0.is_empty() {
                                     if let Ok(msg) = OCapNMessage::decode(&response.0) {
                                         if let OCapNMessage::OpDeliverResult { request_id, value } = msg {
@@ -303,7 +325,6 @@ async fn run_swarm(
                         identify::Event::Received { peer_id, .. },
                     )) => {
                         if peer_id == local_peer_id { continue; }
-                        // Peer discovered via relay — add to gossipsub
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                         let _ = event_tx.send(NetEvent::PeerDiscovered(peer_id.to_string()));
                         ctx.request_repaint();
@@ -315,6 +336,14 @@ async fn run_swarm(
                         match result {
                             Ok(_) => log::info!("DCUtR hole-punch success with {}", remote_peer_id),
                             Err(e) => log::warn!("DCUtR hole-punch failed with {}: {}", remote_peer_id, e),
+                        }
+                    }
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        // If this is a relay we were waiting for, start circuit listener
+                        if let Some(relay_maddr) = pending_relay_circuits.remove(&peer_id) {
+                            let relay_listen = relay_maddr.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                            log::info!("Relay connected, listening on circuit: {}", relay_listen);
+                            let _ = swarm.listen_on(relay_listen);
                         }
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
@@ -330,17 +359,14 @@ async fn run_swarm(
 fn handle_mdns(
     swarm: &mut Swarm<NodeBehaviour>,
     event_tx: &mpsc::Sender<NetEvent>,
-    ctx: &egui::Context,
+    ctx: &dyn RepaintSignal,
     event: mdns::Event,
 ) {
     match event {
         mdns::Event::Discovered(peers) => {
             for (peer_id, _addr) in peers {
                 log::info!("mDNS discovered: {}", peer_id);
-                swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .add_explicit_peer(&peer_id);
+                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                 let _ = event_tx.send(NetEvent::PeerDiscovered(peer_id.to_string()));
                 ctx.request_repaint();
             }
@@ -348,10 +374,7 @@ fn handle_mdns(
         mdns::Event::Expired(peers) => {
             for (peer_id, _addr) in peers {
                 log::info!("mDNS expired: {}", peer_id);
-                swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .remove_explicit_peer(&peer_id);
+                swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                 let _ = event_tx.send(NetEvent::PeerLost(peer_id.to_string()));
                 ctx.request_repaint();
             }
@@ -359,7 +382,7 @@ fn handle_mdns(
     }
 }
 
-fn build_swarm() -> Result<Swarm<NodeBehaviour>, Box<dyn std::error::Error>> {
+pub fn build_swarm() -> Result<Swarm<NodeBehaviour>, Box<dyn std::error::Error>> {
     let swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -372,7 +395,7 @@ fn build_swarm() -> Result<Swarm<NodeBehaviour>, Box<dyn std::error::Error>> {
             let gossipsub_config = gossipsub::ConfigBuilder::default()
                 .heartbeat_interval(Duration::from_secs(1))
                 .validation_mode(gossipsub::ValidationMode::Permissive)
-                .max_transmit_size(256 * 1024) // 256 KB
+                .max_transmit_size(256 * 1024)
                 .build()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
@@ -403,4 +426,126 @@ fn build_swarm() -> Result<Swarm<NodeBehaviour>, Box<dyn std::error::Error>> {
         .build();
 
     Ok(swarm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libp2p::futures::StreamExt;
+
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct TestPair {
+        swarm_a: Swarm<NodeBehaviour>,
+        swarm_b: Swarm<NodeBehaviour>,
+        topic: gossipsub::IdentTopic,
+        peer_a: PeerId,
+        peer_b: PeerId,
+    }
+
+    async fn setup_pair() -> TestPair {
+        let mut swarm_a = build_swarm().expect("swarm A");
+        let mut swarm_b = build_swarm().expect("swarm B");
+
+        let topic = gossipsub::IdentTopic::new("wasm-canvas/values");
+        swarm_a.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
+        swarm_b.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
+
+        swarm_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        swarm_b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+
+        let peer_a = *swarm_a.local_peer_id();
+        let peer_b = *swarm_b.local_peer_id();
+
+        let mut a_found_b = false;
+        let mut b_found_a = false;
+        let mut mesh_ready = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+
+        while !mesh_ready && tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                event = swarm_a.select_next_some() => {
+                    if let SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) = event {
+                        for (pid, _) in peers {
+                            swarm_a.behaviour_mut().gossipsub.add_explicit_peer(&pid);
+                            if pid == peer_b { a_found_b = true; }
+                        }
+                    }
+                }
+                event = swarm_b.select_next_some() => {
+                    if let SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) = event {
+                        for (pid, _) in peers {
+                            swarm_b.behaviour_mut().gossipsub.add_explicit_peer(&pid);
+                            if pid == peer_a { b_found_a = true; }
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                    if a_found_b && b_found_a {
+                        let probe = serde_json::to_vec(&WireMessage {
+                            channel: "__probe".into(), values: HashMap::new(), seq: 0,
+                        }).unwrap();
+                        if swarm_a.behaviour_mut().gossipsub.publish(topic.clone(), probe).is_ok() {
+                            mesh_ready = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(mesh_ready, "Gossipsub mesh did not form within timeout");
+
+        for _ in 0..10 {
+            tokio::select! {
+                _ = swarm_a.select_next_some() => {}
+                _ = swarm_b.select_next_some() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+
+        TestPair { swarm_a, swarm_b, topic, peer_a, peer_b }
+    }
+
+    fn val_f64(v: &Value) -> f64 {
+        match v { Value::F64(f) => *f, _ => panic!("expected F64") }
+    }
+
+    #[tokio::test]
+    async fn test_two_peers_exchange_values() {
+        let _lock = SERIAL.lock().unwrap();
+        let _ = env_logger::try_init();
+        let mut p = setup_pair().await;
+
+        let wire = WireMessage {
+            channel: "controls".to_string(),
+            values: HashMap::from([
+                ("gain".to_string(), Value::F64(42.0)),
+                ("freq".to_string(), Value::F64(7.5)),
+            ]),
+            seq: 1,
+        };
+        p.swarm_a.behaviour_mut().gossipsub
+            .publish(p.topic.clone(), serde_json::to_vec(&wire).unwrap()).unwrap();
+
+        let mut received: Option<WireMessage> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while received.is_none() && tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                event = p.swarm_b.select_next_some() => {
+                    if let SwarmEvent::Behaviour(NodeBehaviourEvent::Gossipsub(
+                        gossipsub::Event::Message { message, .. }
+                    )) = event {
+                        if let Ok(w) = serde_json::from_slice::<WireMessage>(&message.data) {
+                            if w.channel != "__probe" { received = Some(w); }
+                        }
+                    }
+                }
+                _ = p.swarm_a.select_next_some() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+
+        let msg = received.expect("B did not receive values from A");
+        assert_eq!(msg.channel, "controls");
+        assert_eq!(val_f64(msg.values.get("gain").unwrap()), 42.0);
+    }
 }

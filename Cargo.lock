@@ -9019,7 +9019,6 @@ dependencies = [
  "egui_plot",
  "env_logger",
  "inventory",
- "libp2p",
  "log",
  "notify",
  "notify-debouncer-mini",
@@ -9031,9 +9030,33 @@ dependencies = [
  "serde_json",
  "surrealdb",
  "tokio",
+ "wasm-canvas-net",
  "wasmtime",
  "wgpu",
  "wit-parser 0.245.1",
+]
+
+[[package]]
+name = "wasm-canvas-net"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "futures-util",
+ "libp2p",
+ "log",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "wasm-canvas-peer"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "log",
+ "wasm-canvas",
 ]
 
 [[package]]

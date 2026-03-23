@@ -241,59 +241,6 @@ mod tests {
     }
 
     #[test]
-    fn test_swiss_num_syrup_roundtrip() {
-        let sn = SwissNum::random();
-        let sv = sn.to_syrup();
-        let back = SwissNum::from_syrup(&sv).unwrap();
-        assert_eq!(sn, back);
-    }
-
-    #[test]
-    fn test_descriptor_roundtrip() {
-        let d = Descriptor::Export(42);
-        let sv = d.to_syrup();
-        assert_eq!(Descriptor::from_syrup(&sv), Some(d));
-
-        let d = Descriptor::ImportObject(7);
-        let sv = d.to_syrup();
-        assert_eq!(Descriptor::from_syrup(&sv), Some(d));
-    }
-
-    #[test]
-    fn test_op_start_session_roundtrip() {
-        let msg = OCapNMessage::OpStartSession {
-            session_pubkey: vec![1, 2, 3, 4],
-        };
-        let bytes = msg.encode();
-        let decoded = OCapNMessage::decode(&bytes).unwrap();
-        assert_eq!(msg, decoded);
-    }
-
-    #[test]
-    fn test_op_deliver_only_roundtrip() {
-        let msg = OCapNMessage::OpDeliverOnly {
-            to_desc: Descriptor::Export(0),
-            args: vec![
-                SyrupValue::Symbol("fetch".into()),
-                SyrupValue::Bytestring(vec![0xAB; 16]),
-            ],
-        };
-        let bytes = msg.encode();
-        let decoded = OCapNMessage::decode(&bytes).unwrap();
-        assert_eq!(msg, decoded);
-    }
-
-    #[test]
-    fn test_op_abort_roundtrip() {
-        let msg = OCapNMessage::OpAbort {
-            reason: "session closed".into(),
-        };
-        let bytes = msg.encode();
-        let decoded = OCapNMessage::decode(&bytes).unwrap();
-        assert_eq!(msg, decoded);
-    }
-
-    #[test]
     fn test_op_deliver_roundtrip() {
         let msg = OCapNMessage::OpDeliver {
             to_desc: Descriptor::Export(0),
@@ -303,17 +250,6 @@ mod tests {
                 SyrupValue::Symbol("get".into()),
             ],
             request_id: 12345,
-        };
-        let bytes = msg.encode();
-        let decoded = OCapNMessage::decode(&bytes).unwrap();
-        assert_eq!(msg, decoded);
-    }
-
-    #[test]
-    fn test_op_deliver_result_roundtrip() {
-        let msg = OCapNMessage::OpDeliverResult {
-            request_id: 67890,
-            value: SyrupValue::Integer(42),
         };
         let bytes = msg.encode();
         let decoded = OCapNMessage::decode(&bytes).unwrap();

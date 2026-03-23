@@ -1,0 +1,18 @@
+[package]
+name = "wasm-canvas-net"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wasm-canvas-net"
+path = "src/main.rs"
+
+[dependencies]
+libp2p = { version = "0.54", features = ["gossipsub", "mdns", "noise", "yamux", "tcp", "tokio", "macros", "request-response", "cbor", "relay", "dcutr", "identify"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "io-util", "io-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+rand = "0.8"
+futures-util = "0.3"

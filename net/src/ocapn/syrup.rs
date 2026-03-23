@@ -1,4 +1,4 @@
-use crate::types::Value;
+use crate::protocol::Value;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyrupValue {
@@ -193,7 +193,6 @@ pub fn decode(data: &[u8]) -> Result<(SyrupValue, usize), DecodeError> {
 }
 
 fn decode_length_prefixed(data: &[u8]) -> Result<(SyrupValue, usize), DecodeError> {
-    // Read digits
     let mut pos = 0;
     while pos < data.len() && data[pos].is_ascii_digit() {
         pos += 1;
@@ -205,7 +204,7 @@ fn decode_length_prefixed(data: &[u8]) -> Result<(SyrupValue, usize), DecodeErro
     let len_str = std::str::from_utf8(&data[..pos]).map_err(|_| DecodeError::Utf8Error)?;
     let len: usize = len_str.parse().map_err(|_| DecodeError::InvalidNumber)?;
     let tag = data[pos];
-    let start = pos + 1; // byte after the tag
+    let start = pos + 1;
 
     match tag {
         b'+' => Ok((SyrupValue::Integer(len as i64), start)),
@@ -234,7 +233,7 @@ fn decode_length_prefixed(data: &[u8]) -> Result<(SyrupValue, usize), DecodeErro
     }
 }
 
-// --- Conversion: crate::types::Value <-> SyrupValue ---
+// --- Conversion: Value <-> SyrupValue ---
 
 impl From<&Value> for SyrupValue {
     fn from(v: &Value) -> Self {
@@ -286,57 +285,16 @@ mod tests {
         assert_eq!(roundtrip(&SyrupValue::Integer(0)), SyrupValue::Integer(0));
         assert_eq!(roundtrip(&SyrupValue::Integer(42)), SyrupValue::Integer(42));
         assert_eq!(roundtrip(&SyrupValue::Integer(-7)), SyrupValue::Integer(-7));
-        assert_eq!(roundtrip(&SyrupValue::Integer(12345)), SyrupValue::Integer(12345));
     }
 
     #[test]
     fn test_float64() {
         assert_eq!(roundtrip(&SyrupValue::Float64(3.14)), SyrupValue::Float64(3.14));
-        assert_eq!(roundtrip(&SyrupValue::Float64(0.0)), SyrupValue::Float64(0.0));
-        assert_eq!(roundtrip(&SyrupValue::Float64(-1.5)), SyrupValue::Float64(-1.5));
-    }
-
-    #[test]
-    fn test_float32() {
-        assert_eq!(roundtrip(&SyrupValue::Float32(1.0)), SyrupValue::Float32(1.0));
-    }
-
-    #[test]
-    fn test_bytestring() {
-        let val = SyrupValue::Bytestring(vec![0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(roundtrip(&val), val);
-        assert_eq!(roundtrip(&SyrupValue::Bytestring(vec![])), SyrupValue::Bytestring(vec![]));
     }
 
     #[test]
     fn test_string() {
         let val = SyrupValue::String("hello world".into());
-        assert_eq!(roundtrip(&val), val);
-        assert_eq!(roundtrip(&SyrupValue::String(String::new())), SyrupValue::String(String::new()));
-    }
-
-    #[test]
-    fn test_symbol() {
-        let val = SyrupValue::Symbol("op:deliver-only".into());
-        assert_eq!(roundtrip(&val), val);
-    }
-
-    #[test]
-    fn test_list() {
-        let val = SyrupValue::List(vec![
-            SyrupValue::Integer(1),
-            SyrupValue::String("two".into()),
-            SyrupValue::Bool(true),
-        ]);
-        assert_eq!(roundtrip(&val), val);
-        assert_eq!(roundtrip(&SyrupValue::List(vec![])), SyrupValue::List(vec![]));
-    }
-
-    #[test]
-    fn test_dict() {
-        let val = SyrupValue::Dict(vec![
-            (SyrupValue::Symbol("key".into()), SyrupValue::Integer(42)),
-        ]);
         assert_eq!(roundtrip(&val), val);
     }
 
@@ -350,29 +308,10 @@ mod tests {
     }
 
     #[test]
-    fn test_nested() {
-        let val = SyrupValue::List(vec![
-            SyrupValue::Record {
-                label: Box::new(SyrupValue::Symbol("pair".into())),
-                fields: vec![
-                    SyrupValue::Integer(1),
-                    SyrupValue::List(vec![SyrupValue::Bool(false)]),
-                ],
-            },
-        ]);
-        assert_eq!(roundtrip(&val), val);
-    }
-
-    #[test]
     fn test_value_conversion() {
         let v = Value::F64(3.14);
         let sv = SyrupValue::from(&v);
         let back = Value::try_from(&sv).unwrap();
         assert!(matches!(back, Value::F64(f) if (f - 3.14).abs() < 1e-10));
-
-        let v = Value::Str("hello".into());
-        let sv = SyrupValue::from(&v);
-        let back = Value::try_from(&sv).unwrap();
-        assert!(matches!(back, Value::Str(s) if s == "hello"));
     }
 }

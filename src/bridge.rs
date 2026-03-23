@@ -586,7 +586,7 @@ fn bridge_net_value(_channel: &Value, key: &Value, default: &Value) -> Result<Ve
 use crate::ocapn::session::SessionManager;
 use crate::ocapn::syrup::SyrupValue;
 
-pub type SharedSessionManager = Arc<Mutex<SessionManager>>;
+pub use wasm_canvas_net::SharedSessionManager;
 
 fn with_session_mgr<R>(f: impl FnOnce(&mut SessionManager) -> R) -> Result<R, Exception> {
     crate::actor::with_actor_ctx(|ctx| {

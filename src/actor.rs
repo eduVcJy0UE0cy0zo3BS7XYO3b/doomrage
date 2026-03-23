@@ -186,7 +186,7 @@ struct SharedResources {
     node_mailboxes: Option<NodeMailboxes>,
     slot_owners: Option<OCapNSlotOwners>,
     wasm: Option<WasmRunner>,
-    egui_ctx: Option<egui::Context>,
+    egui_ctx: Option<std::sync::Arc<dyn crate::types::RepaintSignal>>,
 }
 
 /// Cached environment for a node.
@@ -279,7 +279,7 @@ impl ActorRuntime {
     pub fn set_node_mailboxes(&mut self, m: NodeMailboxes) { self.shared.node_mailboxes = Some(m); }
     pub fn set_wasm_runner(&mut self, w: WasmRunner) { self.shared.wasm = Some(w); }
     pub fn set_slot_owners(&mut self, o: OCapNSlotOwners) { self.shared.slot_owners = Some(o); }
-    pub fn set_egui_ctx(&mut self, ctx: egui::Context) { self.shared.egui_ctx = Some(ctx); }
+    pub fn set_repaint_signal(&mut self, signal: std::sync::Arc<dyn crate::types::RepaintSignal>) { self.shared.egui_ctx = Some(signal); }
 
     /// Compute a node immediately (for cascade, node-send, programmatic triggers).
     pub fn compute(

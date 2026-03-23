@@ -1,22 +1,3 @@
-mod actor;
-mod app;
-mod bridge;
-mod canvas;
-mod executor;
-mod panels;
-mod persistence;
-mod registry;
-mod render;
-mod db;
-mod debug_log;
-mod render_ui;
-mod scheme_convert;
-mod scheme_engine;
-mod theme;
-mod types;
-mod network;
-mod ocapn;
-
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(
         env_logger::Env::default()
@@ -36,6 +17,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "WASM Canvas",
         options,
-        Box::new(|cc| Ok(Box::new(app::WasmCanvasApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(wasm_canvas::app::WasmCanvasApp::new(cc)))),
     )
 }

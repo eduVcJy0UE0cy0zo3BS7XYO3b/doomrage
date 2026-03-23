@@ -1,32 +1,40 @@
 [workspace]
-members = [".", "relay"]
+members = [".", "relay", "peer", "net"]
 
 [package]
 name = "wasm-canvas"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:egui", "dep:egui_plot", "dep:wgpu", "dep:rfd", "dep:notify", "dep:notify-debouncer-mini"]
+
 [[bin]]
 name = "wasm-canvas"
 path = "src/main.rs"
+required-features = ["gui"]
 
 [dependencies]
-egui = "0.33.3"
-eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "default_fonts"] }
-wgpu = { version = "27.0.1", features = ["vulkan", "gles"] }
+# GUI-only (optional)
+egui = { version = "0.33.3", optional = true }
+eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "default_fonts"], optional = true }
+wgpu = { version = "27.0.1", features = ["vulkan", "gles"], optional = true }
+rfd = { version = "0.17.2", optional = true }
+egui_plot = { version = "0.34.1", optional = true }
+notify = { version = "8.2.0", optional = true }
+notify-debouncer-mini = { version = "0.7.0", optional = true }
+
+# Core (always)
 wasmtime = { version = "43.0.0", features = ["component-model"] }
 wit-parser = "0.245.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-notify = "8.2.0"
-notify-debouncer-mini = "0.7.0"
-rfd = "0.17.2"
-egui_plot = "0.34.1"
 scheme-rs = { version = "0.1.0", default-features = false, features = ["load-libraries-from-fs"] }
 inventory = "0.3"
 surrealdb = { version = "3.0.4", default-features = false, features = ["kv-mem"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
-libp2p = { version = "0.54", features = ["gossipsub", "mdns", "noise", "yamux", "tcp", "tokio", "macros", "request-response", "cbor", "relay", "dcutr", "identify"] }
+wasm-canvas-net = { path = "net" }
 rayon = "1"
 rand = "0.8"
 anyhow = "1.0.102"
@@ -35,4 +43,4 @@ log = "0.4.29"
 env_logger = "0.11.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.33.3", default-features = false, features = ["x11", "wayland"] }
+eframe = { version = "0.33.3", default-features = false, features = ["x11", "wayland"], optional = true }

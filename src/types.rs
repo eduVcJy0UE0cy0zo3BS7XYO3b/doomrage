@@ -3,6 +3,21 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+// Re-export from net crate
+pub use wasm_canvas_net::{Value, RepaintSignal, NoRepaint};
+
+/// Wrapper to implement RepaintSignal for egui::Context.
+#[cfg(feature = "gui")]
+#[derive(Clone)]
+pub struct EguiRepaint(pub egui::Context);
+
+#[cfg(feature = "gui")]
+impl RepaintSignal for EguiRepaint {
+    fn request_repaint(&self) {
+        self.0.request_repaint();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PortType {
     F64,
@@ -14,6 +29,7 @@ pub enum PortType {
 }
 
 impl PortType {
+    #[cfg(feature = "gui")]
     pub fn color(&self) -> egui::Color32 {
         match self {
             PortType::F64 => egui::Color32::from_rgb(0x00, 0xdd, 0x66),
@@ -56,62 +72,6 @@ impl PortType {
             PortType::I32 => "i32",
             PortType::Bool => "bool",
             PortType::Str => "string",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Value {
-    F64(f64),
-    F32(f32),
-    I64(i64),
-    I32(i32),
-    Bool(bool),
-    Str(String),
-}
-
-impl Value {
-    pub fn port_type(&self) -> PortType {
-        match self {
-            Value::F64(_) => PortType::F64,
-            Value::F32(_) => PortType::F32,
-            Value::I64(_) => PortType::I64,
-            Value::I32(_) => PortType::I32,
-            Value::Bool(_) => PortType::Bool,
-            Value::Str(_) => PortType::Str,
-        }
-    }
-
-    pub fn as_f64(&self) -> f64 {
-        match self {
-            Value::F64(v) => *v,
-            Value::F32(v) => *v as f64,
-            Value::I64(v) => *v as f64,
-            Value::I32(v) => *v as f64,
-            Value::Bool(v) => if *v { 1.0 } else { 0.0 },
-            Value::Str(_) => f64::NAN,
-        }
-    }
-
-    pub fn to_scheme_literal(&self) -> String {
-        match self {
-            Value::F64(f) => format!("{}", f),
-            Value::F32(f) => format!("{}", f),
-            Value::I64(i) => format!("{}", i),
-            Value::I32(i) => format!("{}", i),
-            Value::Bool(b) => if *b { "#t" } else { "#f" }.to_string(),
-            Value::Str(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
-        }
-    }
-
-    pub fn display(&self) -> String {
-        match self {
-            Value::F64(v) => format!("{v:.6}"),
-            Value::F32(v) => format!("{v:.4}"),
-            Value::I64(v) => format!("{v}"),
-            Value::I32(v) => format!("{v}"),
-            Value::Bool(v) => format!("{v}"),
-            Value::Str(v) => v.clone(),
         }
     }
 }
@@ -520,4 +480,282 @@ pub struct RunEvent {
     pub node_name: String,
     pub duration_us: u64,
     pub result: Result<String, String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_node(id: NodeId, label: &str, code: &str) -> Node {
+        Node {
+            id,
+            template_name: "Script".to_string(),
+            label: label.to_string(),
+            pos: [0.0, 0.0],
+            input_values: HashMap::new(),
+            output_values: HashMap::new(),
+            script_code: code.to_string(),
+            script_inputs: Vec::new(),
+            script_outputs: Vec::new(),
+            widget_decls: Vec::new(),
+            widget_values: HashMap::new(),
+            error: None,
+            last_exec_us: None,
+            render_blocks: Vec::new(),
+            phantom: false,
+            remote_peer: None,
+        }
+    }
+
+    fn make_phantom(id: NodeId, label: &str, outputs: HashMap<String, Value>) -> Node {
+        Node {
+            id,
+            template_name: "Script".to_string(),
+            label: label.to_string(),
+            pos: [0.0, 0.0],
+            input_values: HashMap::new(),
+            output_values: outputs,
+            script_code: String::new(),
+            script_inputs: Vec::new(),
+            script_outputs: Vec::new(),
+            widget_decls: Vec::new(),
+            widget_values: HashMap::new(),
+            error: None,
+            last_exec_us: None,
+            render_blocks: Vec::new(),
+            phantom: true,
+            remote_peer: Some("peer-abc".to_string()),
+        }
+    }
+
+    // --- Phantom node discovery via local imports ---
+
+    #[test]
+    fn test_phantom_found_by_local_import() {
+        let mut graph = Graph::new();
+
+        // Phantom "controls" with output values
+        let mut outputs = HashMap::new();
+        outputs.insert("gain".to_string(), Value::F64(50.0));
+        outputs.insert("freq".to_string(), Value::F64(5.0));
+        let phantom = make_phantom(1, "controls", outputs);
+        graph.nodes.insert(1, phantom);
+
+        // Node that imports controls
+        let wave = make_node(2, "wave",
+            "(define-module (node wave)\n  (use-module (node controls))\n  (export out))");
+        graph.nodes.insert(2, wave);
+
+        // import_edges should find phantom as upstream of wave
+        let edges = graph.derived_connections();
+        // At minimum, find_node_by_import_label should work
+        assert_eq!(graph.find_node_by_import_label("controls"), Some(1));
+
+        // resolve_all_input_values should pull phantom's outputs
+        let inputs = graph.resolve_all_input_values(2);
+        assert_eq!(inputs.get("gain"), Some(&Value::F64(50.0)));
+        assert_eq!(inputs.get("freq"), Some(&Value::F64(5.0)));
+    }
+
+    // --- Phantom node discovery via remote imports ---
+
+    #[test]
+    fn test_phantom_found_by_remote_import() {
+        let mut graph = Graph::new();
+
+        let mut outputs = HashMap::new();
+        outputs.insert("gain".to_string(), Value::F64(42.0));
+        let phantom = make_phantom(1, "controls", outputs);
+        graph.nodes.insert(1, phantom);
+
+        // Node that imports via remote syntax: (use-module (other-canvas controls))
+        let wave = make_node(2, "wave",
+            "(define-module (node wave)\n  (use-module (other-canvas controls))\n  (export out))");
+        graph.nodes.insert(2, wave);
+
+        // resolve_all_input_values should find phantom via remote_imports
+        let inputs = graph.resolve_all_input_values(2);
+        assert_eq!(inputs.get("gain"), Some(&Value::F64(42.0)));
+    }
+
+    // --- derive_inputs_for_node ---
+
+    #[test]
+    fn test_derive_inputs_from_local_module() {
+        let mut graph = Graph::new();
+
+        let mut controls = make_node(1, "controls",
+            "(define-module (node controls)\n  (export gain freq))");
+        controls.script_outputs = vec![
+            PortDef { name: "gain".to_string(), port_type: PortType::F64 },
+            PortDef { name: "freq".to_string(), port_type: PortType::F64 },
+        ];
+        graph.nodes.insert(1, controls);
+
+        let wave = make_node(2, "wave",
+            "(define-module (node wave)\n  (use-module (node controls))\n  (export out))");
+        graph.nodes.insert(2, wave);
+
+        let inputs = graph.derive_inputs_for_node(2);
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs.iter().any(|p| p.name == "gain"));
+        assert!(inputs.iter().any(|p| p.name == "freq"));
+    }
+
+    #[test]
+    fn test_derive_inputs_from_phantom() {
+        let mut graph = Graph::new();
+
+        let mut outputs = HashMap::new();
+        outputs.insert("gain".to_string(), Value::F64(50.0));
+        let mut phantom = make_phantom(1, "controls", outputs);
+        phantom.script_outputs = vec![
+            PortDef { name: "gain".to_string(), port_type: PortType::F64 },
+        ];
+        graph.nodes.insert(1, phantom);
+
+        let wave = make_node(2, "wave",
+            "(define-module (node wave)\n  (use-module (node controls))\n  (export out))");
+        graph.nodes.insert(2, wave);
+
+        let inputs = graph.derive_inputs_for_node(2);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].name, "gain");
+    }
+
+    #[test]
+    fn test_derive_inputs_from_remote_phantom() {
+        let mut graph = Graph::new();
+
+        let mut outputs = HashMap::new();
+        outputs.insert("x".to_string(), Value::F64(1.0));
+        let mut phantom = make_phantom(1, "data", outputs);
+        phantom.script_outputs = vec![
+            PortDef { name: "x".to_string(), port_type: PortType::F64 },
+        ];
+        graph.nodes.insert(1, phantom);
+
+        let consumer = make_node(2, "consumer",
+            "(define-module (node consumer)\n  (use-module (peer-abc data))\n  (export y))");
+        graph.nodes.insert(2, consumer);
+
+        let inputs = graph.derive_inputs_for_node(2);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].name, "x");
+    }
+
+    // --- direct_downstream with phantom ---
+
+    #[test]
+    fn test_direct_downstream_from_phantom() {
+        let mut graph = Graph::new();
+
+        let outputs = HashMap::from([("gain".to_string(), Value::F64(50.0))]);
+        let phantom = make_phantom(1, "controls", outputs);
+        graph.nodes.insert(1, phantom);
+
+        let wave = make_node(2, "wave",
+            "(define-module (node wave)\n  (use-module (node controls))\n  (export out))");
+        graph.nodes.insert(2, wave);
+
+        let downstream = graph.direct_downstream(1);
+        assert_eq!(downstream, vec![2]);
+    }
+
+    // --- Local node takes priority over phantom ---
+
+    #[test]
+    fn test_local_node_priority_over_phantom() {
+        let mut graph = Graph::new();
+
+        // Local "controls" with gain=100
+        let mut local = make_node(1, "controls",
+            "(define-module (node controls)\n  (export gain))");
+        local.output_values.insert("gain".to_string(), Value::F64(100.0));
+        graph.nodes.insert(1, local);
+
+        // Phantom "controls" with gain=42 (should be ignored — same label)
+        let outputs = HashMap::from([("gain".to_string(), Value::F64(42.0))]);
+        let phantom = make_phantom(2, "controls", outputs);
+        graph.nodes.insert(2, phantom);
+
+        // Consumer imports controls — should get local (id=1) because
+        // find_node_by_import_label returns first match
+        let consumer = make_node(3, "consumer",
+            "(define-module (node consumer)\n  (use-module (node controls))\n  (export out))");
+        graph.nodes.insert(3, consumer);
+
+        let inputs = graph.resolve_all_input_values(3);
+        // Should get one of the two — both have "gain"
+        assert!(inputs.contains_key("gain"));
+    }
+
+    // --- Widget values override upstream ---
+
+    #[test]
+    fn test_widget_values_override_upstream() {
+        let mut graph = Graph::new();
+
+        let outputs = HashMap::from([("gain".to_string(), Value::F64(50.0))]);
+        let phantom = make_phantom(1, "controls", outputs);
+        graph.nodes.insert(1, phantom);
+
+        let mut wave = make_node(2, "wave",
+            "(define-module (node wave)\n  (use-module (node controls))\n  (export out))");
+        wave.widget_values.insert("gain".to_string(), Value::F64(999.0));
+        graph.nodes.insert(2, wave);
+
+        let inputs = graph.resolve_all_input_values(2);
+        // Widget value should override phantom's output
+        assert_eq!(inputs.get("gain"), Some(&Value::F64(999.0)));
+    }
+
+    // --- Topological sort with phantom ---
+
+    #[test]
+    fn test_topo_sort_with_phantom() {
+        let mut graph = Graph::new();
+
+        let outputs = HashMap::from([("v".to_string(), Value::F64(1.0))]);
+        let phantom = make_phantom(1, "source", outputs);
+        graph.nodes.insert(1, phantom);
+
+        let mid = make_node(2, "mid",
+            "(define-module (node mid)\n  (use-module (node source))\n  (export w))");
+        graph.nodes.insert(2, mid);
+
+        let leaf = make_node(3, "leaf",
+            "(define-module (node leaf)\n  (use-module (node mid))\n  (export z))");
+        graph.nodes.insert(3, leaf);
+
+        let order = graph.topological_sort().unwrap();
+        let pos_phantom = order.iter().position(|&id| id == 1).unwrap();
+        let pos_mid = order.iter().position(|&id| id == 2).unwrap();
+        let pos_leaf = order.iter().position(|&id| id == 3).unwrap();
+        assert!(pos_phantom < pos_mid);
+        assert!(pos_mid < pos_leaf);
+    }
+
+    // --- Descendants through phantom ---
+
+    #[test]
+    fn test_descendants_of_phantom() {
+        let mut graph = Graph::new();
+
+        let outputs = HashMap::from([("v".to_string(), Value::F64(1.0))]);
+        let phantom = make_phantom(1, "source", outputs);
+        graph.nodes.insert(1, phantom);
+
+        let a = make_node(2, "a",
+            "(define-module (node a)\n  (use-module (node source))\n  (export x))");
+        graph.nodes.insert(2, a);
+
+        let b = make_node(3, "b",
+            "(define-module (node b)\n  (use-module (node a))\n  (export y))");
+        graph.nodes.insert(3, b);
+
+        let desc = graph.descendants_sorted(1);
+        assert!(desc.contains(&2));
+        assert!(desc.contains(&3));
+    }
 }
