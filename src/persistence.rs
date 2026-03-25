@@ -105,8 +105,8 @@ pub fn init_project(dir: &Path) -> Result<()> {
     if !dotenv.exists() {
         std::fs::write(&dotenv, "\
 LLM_API_BASE=http://localhost:4000
-LLM_MODEL=anthropic/claude-sonnet-4-20250514
-LLM_API_KEY=
+LLM_MODEL=claude-sonnet
+LLM_API_KEY=sk-litellm-master-key-local
 ")?;
     }
 
