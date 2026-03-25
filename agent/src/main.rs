@@ -35,6 +35,29 @@ fn main() {
         std::process::exit(1);
     });
 
+    // Load .env from project dir (if exists)
+    let env_file = project_dir.as_ref()
+        .map(|d| d.join(".env"))
+        .or_else(|| std::env::current_dir().ok().map(|d| d.join(".env")));
+    if let Some(ref path) = env_file {
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') { continue; }
+                    if let Some((key, val)) = line.split_once('=') {
+                        let key = key.trim();
+                        let val = val.trim();
+                        // Don't override existing env vars
+                        if !val.is_empty() && std::env::var(key).is_err() {
+                            std::env::set_var(key, val);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let api_key = std::env::var("LLM_API_KEY").unwrap_or_else(|_| {
         eprintln!("Set LLM_API_KEY environment variable");
         std::process::exit(1);

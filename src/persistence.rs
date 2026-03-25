@@ -98,7 +98,16 @@ pub fn init_project(dir: &Path) -> Result<()> {
 
     let gitignore = dir.join(".gitignore");
     if !gitignore.exists() {
-        std::fs::write(&gitignore, "*.bak\n")?;
+        std::fs::write(&gitignore, "*.bak\n.env\n")?;
+    }
+
+    let dotenv = dir.join(".env");
+    if !dotenv.exists() {
+        std::fs::write(&dotenv, "\
+LLM_API_BASE=http://localhost:4000
+LLM_MODEL=anthropic/claude-sonnet-4-20250514
+LLM_API_KEY=
+")?;
     }
 
     log::info!("Initialized project at {}", dir.display());
