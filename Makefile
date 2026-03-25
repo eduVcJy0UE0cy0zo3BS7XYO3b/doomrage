@@ -1,4 +1,4 @@
-.PHONY: run peer repl agent build nodes clean
+.PHONY: run peer repl agent mock build nodes clean
 
 run: nodes
 	cargo run
@@ -11,6 +11,9 @@ repl:
 
 agent:
 	cargo run -p canvas-agent --
+
+mock:
+	python3 mock-llm/server.py
 
 build: nodes
 	cargo build --release
