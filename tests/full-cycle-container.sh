@@ -53,15 +53,9 @@ assert ".gitignore exists" test -f "$PROJECT_DIR/.gitignore"
 assert_file_contains ".env has LLM_API_BASE" "$PROJECT_DIR/.env" "LLM_API_BASE"
 assert_file_contains ".gitignore has .env" "$PROJECT_DIR/.gitignore" ".env"
 
-# --- Step 2: Start mock LLM ---
-echo ""
-echo "--- Step 2: Start mock LLM ---"
-python3 /opt/mock-llm/server.py &
-MOCK_PID=$!
-sleep 1
-assert "mock server running" kill -0 "$MOCK_PID"
+# (Mock LLM runs as a separate container in litellm-net, started by run-in-container.sh)
 
-# --- Step 3: Start peer ---
+# --- Step 2: Start peer ---
 echo ""
 echo "--- Step 3: Start peer ---"
 peer --project "$PROJECT_DIR" > /tmp/peer.log 2>&1 &
@@ -76,7 +70,7 @@ echo "  nREPL port: $NREPL_PORT"
 # --- Step 4: Run agent ---
 echo ""
 echo "--- Step 4: Run agent ---"
-LLM_API_BASE=http://localhost:9999 LLM_MODEL=mock-agent LLM_API_KEY=fake \
+LLM_API_BASE=http://localhost:4000 LLM_MODEL=mock-agent LLM_API_KEY=sk-litellm-master-key-local \
     canvas-agent --project "$PROJECT_DIR" "Build an oscillator" 2>&1 | tail -5
 
 sleep 2

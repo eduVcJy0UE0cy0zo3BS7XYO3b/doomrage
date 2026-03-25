@@ -153,29 +153,33 @@ fn find_nrepl_port(project_dir: Option<&std::path::Path>) -> Option<u16> {
     None
 }
 
+/// Call LLM via OpenAI-compatible API (works with litellm proxy).
+/// Sends OpenAI format, parses OpenAI response, converts to our internal format.
 fn call_claude(api_key: &str, messages: &[Value], tools: &Value) -> Result<Value, String> {
     let base_url = std::env::var("LLM_API_BASE").unwrap_or_else(|_| {
         eprintln!("Set LLM_API_BASE (e.g. http://localhost:4000)");
         std::process::exit(1);
     });
     let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| {
-        eprintln!("Set LLM_MODEL (e.g. anthropic/claude-sonnet-4-20250514)");
+        eprintln!("Set LLM_MODEL (e.g. claude-sonnet)");
         std::process::exit(1);
     });
+
+    // Convert Anthropic-style messages to OpenAI format
+    let oai_messages = convert_messages_to_openai(messages);
+    let oai_tools = convert_tools_to_openai(tools);
 
     let client = reqwest::blocking::Client::new();
     let body = json!({
         "model": model,
         "max_tokens": 4096,
-        "system": SYSTEM_PROMPT,
-        "tools": tools,
-        "messages": messages,
+        "messages": oai_messages,
+        "tools": oai_tools,
     });
 
     let resp = client
-        .post(format!("{}/v1/messages", base_url))
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
+        .post(format!("{}/v1/chat/completions", base_url))
+        .header("Authorization", format!("Bearer {}", api_key))
         .header("content-type", "application/json")
         .json(&body)
         .send()
@@ -188,5 +192,116 @@ fn call_claude(api_key: &str, messages: &[Value], tools: &Value) -> Result<Value
         return Err(format!("API {} : {}", status, &text[..text.len().min(500)]));
     }
 
-    serde_json::from_str(&text).map_err(|e| format!("JSON error: {}", e))
+    let oai_resp: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("JSON error: {} — body: {}", e, &text[..text.len().min(200)]))?;
+
+    // Convert OpenAI response back to Anthropic-like format for our agent loop
+    Ok(convert_response_from_openai(&oai_resp))
+}
+
+fn convert_messages_to_openai(messages: &[Value]) -> Vec<Value> {
+    let mut result = vec![json!({"role": "system", "content": SYSTEM_PROMPT})];
+    for msg in messages {
+        let role = msg["role"].as_str().unwrap_or("user");
+        let content = &msg["content"];
+
+        if role == "user" {
+            if let Some(text) = content.as_str() {
+                result.push(json!({"role": "user", "content": text}));
+            } else if let Some(arr) = content.as_array() {
+                // Tool results
+                for item in arr {
+                    if item["type"] == "tool_result" {
+                        result.push(json!({
+                            "role": "tool",
+                            "tool_call_id": item["tool_use_id"],
+                            "content": item["content"],
+                        }));
+                    }
+                }
+            }
+        } else if role == "assistant" {
+            if let Some(arr) = content.as_array() {
+                let mut text_parts = Vec::new();
+                let mut tool_calls = Vec::new();
+                for item in arr {
+                    match item["type"].as_str() {
+                        Some("text") => {
+                            text_parts.push(item["text"].as_str().unwrap_or("").to_string());
+                        }
+                        Some("tool_use") => {
+                            tool_calls.push(json!({
+                                "id": item["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": item["name"],
+                                    "arguments": serde_json::to_string(&item["input"]).unwrap_or_default(),
+                                }
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                let mut msg = json!({"role": "assistant"});
+                if !text_parts.is_empty() {
+                    msg["content"] = json!(text_parts.join("\n"));
+                }
+                if !tool_calls.is_empty() {
+                    msg["tool_calls"] = json!(tool_calls);
+                }
+                result.push(msg);
+            }
+        }
+    }
+    result
+}
+
+fn convert_tools_to_openai(tools: &Value) -> Vec<Value> {
+    tools.as_array().map(|arr| {
+        arr.iter().map(|t| json!({
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["input_schema"],
+            }
+        })).collect()
+    }).unwrap_or_default()
+}
+
+fn convert_response_from_openai(resp: &Value) -> Value {
+    let choice = &resp["choices"][0];
+    let message = &choice["message"];
+    let finish_reason = choice["finish_reason"].as_str().unwrap_or("stop");
+
+    let mut content = Vec::new();
+
+    if let Some(text) = message["content"].as_str() {
+        if !text.is_empty() {
+            content.push(json!({"type": "text", "text": text}));
+        }
+    }
+
+    if let Some(tool_calls) = message["tool_calls"].as_array() {
+        for tc in tool_calls {
+            let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
+            let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+            content.push(json!({
+                "type": "tool_use",
+                "id": tc["id"],
+                "name": tc["function"]["name"],
+                "input": args,
+            }));
+        }
+    }
+
+    let stop_reason = match finish_reason {
+        "tool_calls" | "function_call" => "tool_use",
+        _ => "end_turn",
+    };
+
+    json!({
+        "stop_reason": stop_reason,
+        "content": content,
+    })
 }
