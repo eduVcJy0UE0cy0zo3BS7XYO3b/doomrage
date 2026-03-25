@@ -2,6 +2,8 @@ use crate::actor::ActorRuntime;
 use crate::bridge::NetValues;
 use crate::db::Db;
 use crate::network::{NetCommand, NetHandle};
+use crate::nrepl_commands::{NreplCommand, CommandReceiver};
+use crate::persistence;
 use crate::registry::NodeRegistry;
 use crate::scheme_engine::{SchemeEngine, ScriptResult};
 use crate::types::*;
@@ -454,5 +456,127 @@ impl GraphRuntime {
                 }
             }
         }
+    }
+
+    /// Process nREPL commands from the command channel.
+    pub fn poll_nrepl_commands(&mut self, rx: &CommandReceiver) {
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                NreplCommand::CreateNode { canvas, label, code, exports, imports, reply } => {
+                    let result = self.cmd_create_node(&canvas, &label, &code, exports, imports);
+                    let _ = reply.send(result);
+                }
+                NreplCommand::DeleteNode { canvas, label, reply } => {
+                    let result = self.cmd_delete_node(&canvas, &label);
+                    let _ = reply.send(result);
+                }
+                NreplCommand::UpdateNode { canvas, label, code, exports, imports, reply } => {
+                    let result = self.cmd_update_node(&canvas, &label, code, exports, imports);
+                    let _ = reply.send(result);
+                }
+                NreplCommand::NodeState { canvas, label, reply } => {
+                    let result = self.cmd_node_state(&canvas, &label);
+                    let _ = reply.send(result);
+                }
+                NreplCommand::ComputeNode { canvas, label, reply } => {
+                    let result = self.cmd_compute_node(&canvas, &label);
+                    let _ = reply.send(result);
+                }
+            }
+        }
+    }
+
+    fn cmd_create_node(&mut self, canvas: &str, label: &str, code: &str,
+                       exports: Vec<String>, imports: Vec<(String, String)>) -> Result<String, String> {
+        let graph = self.all_graphs.get_mut(canvas)
+            .ok_or_else(|| format!("canvas '{}' not found", canvas))?;
+        let id = graph.next_node_id;
+        graph.next_node_id += 1;
+        let mut node = Node {
+            id,
+            template_name: "Script".to_string(),
+            label: label.to_string(),
+            pos: [100.0, 100.0],
+            input_values: HashMap::new(),
+            output_values: HashMap::new(),
+            script_code: code.to_string(),
+            script_inputs: Vec::new(),
+            script_outputs: Vec::new(),
+            widget_decls: Vec::new(),
+            widget_values: HashMap::new(),
+            exports,
+            imports,
+            code_hash: 0,
+            error: None,
+            last_exec_us: None,
+            render_blocks: Vec::new(),
+            phantom: false,
+            remote_peer: None,
+        };
+        node.recompute_hash();
+        let _ = persistence::save_node_file(canvas, &node);
+        graph.nodes.insert(id, node);
+        log::info!("nREPL: created node #{} '{}' on '{}'", id, label, canvas);
+        Ok(id.to_string())
+    }
+
+    fn cmd_delete_node(&mut self, canvas: &str, label: &str) -> Result<(), String> {
+        let graph = self.all_graphs.get_mut(canvas)
+            .ok_or_else(|| format!("canvas '{}' not found", canvas))?;
+        let node_id = graph.nodes.iter()
+            .find(|(_, n)| n.label.replace(' ', "-") == label && !n.phantom)
+            .map(|(&id, _)| id)
+            .ok_or_else(|| format!("node '{}' not found on '{}'", label, canvas))?;
+        persistence::delete_node_file(canvas, label);
+        graph.nodes.remove(&node_id);
+        log::info!("nREPL: deleted node '{}' from '{}'", label, canvas);
+        Ok(())
+    }
+
+    fn cmd_update_node(&mut self, canvas: &str, label: &str,
+                       code: Option<String>, exports: Option<Vec<String>>,
+                       imports: Option<Vec<(String, String)>>) -> Result<(), String> {
+        let graph = self.all_graphs.get_mut(canvas)
+            .ok_or_else(|| format!("canvas '{}' not found", canvas))?;
+        let node = graph.nodes.values_mut()
+            .find(|n| n.label.replace(' ', "-") == label && !n.phantom)
+            .ok_or_else(|| format!("node '{}' not found on '{}'", label, canvas))?;
+        if let Some(code) = code {
+            node.set_code(code);
+            let _ = persistence::save_node_file(canvas, node);
+        }
+        if let Some(exports) = exports {
+            node.exports = exports;
+        }
+        if let Some(imports) = imports {
+            node.imports = imports;
+        }
+        Ok(())
+    }
+
+    fn cmd_node_state(&self, canvas: &str, label: &str) -> Option<nrepl::NodeState> {
+        let graph = self.all_graphs.get(canvas)?;
+        let node = graph.nodes.values()
+            .find(|n| n.label.replace(' ', "-") == label)?;
+        Some(nrepl::NodeState {
+            code: node.script_code.clone(),
+            exports: node.exports.clone(),
+            imports: node.imports.clone(),
+            outputs: node.output_values.iter()
+                .map(|(k, v)| (k.clone(), format!("{:?}", v)))
+                .collect(),
+            error: node.error.clone(),
+        })
+    }
+
+    fn cmd_compute_node(&mut self, canvas: &str, label: &str) -> Result<(), String> {
+        let graph = self.all_graphs.get(canvas)
+            .ok_or_else(|| format!("canvas '{}' not found", canvas))?;
+        let node_id = graph.nodes.iter()
+            .find(|(_, n)| n.label.replace(' ', "-") == label && !n.phantom)
+            .map(|(&id, _)| id)
+            .ok_or_else(|| format!("node '{}' not found on '{}'", label, canvas))?;
+        self.compute_if_ready(node_id);
+        Ok(())
     }
 }

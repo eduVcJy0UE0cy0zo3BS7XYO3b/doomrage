@@ -1,10 +1,11 @@
+use crate::nrepl_commands::{NreplCommand, CommandSender};
 use crate::scheme_engine::SchemeEngine;
 use crate::db::Db;
 use crate::persistence;
 use crate::types::*;
-use nrepl::{Evaluator, EvalResult, Completion, SymbolInfo, LoadFileResult};
+use nrepl::{Evaluator, EvalResult, Completion, SymbolInfo, LoadFileResult, NodeState};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use scheme_rs::env::TopLevelEnvironment;
 
 /// Session state: env + optional node context.
@@ -21,8 +22,9 @@ pub struct SchemeEvaluator {
     db: Db,
     sessions: Mutex<HashMap<String, SessionState>>,
     /// Shared access to the graph for ns-list, completions, info, load-file.
-    /// Set from app/peer after construction via set_graphs().
     graphs: Arc<RwLock<Option<GraphsRef>>>,
+    /// Channel to send mutation commands to main loop.
+    commands: Mutex<Option<CommandSender>>,
 }
 
 /// Shared read access to all graphs + current canvas name.
@@ -69,7 +71,22 @@ impl SchemeEvaluator {
             db,
             sessions: Mutex::new(HashMap::new()),
             graphs: Arc::new(RwLock::new(None)),
+            commands: Mutex::new(None),
         }
+    }
+
+    /// Set the command channel for graph mutations.
+    pub fn set_command_sender(&self, sender: CommandSender) {
+        *self.commands.lock().unwrap() = Some(sender);
+    }
+
+    /// Send a command and wait for reply (with timeout).
+    fn send_command<T>(&self, make_cmd: impl FnOnce(mpsc::Sender<T>) -> NreplCommand) -> Option<T> {
+        let sender = self.commands.lock().unwrap().clone()?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let cmd = make_cmd(reply_tx);
+        sender.send(cmd).ok()?;
+        reply_rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
     }
 
     /// Set shared graph reference for ns-list, completions, info.
@@ -345,5 +362,54 @@ impl Evaluator for SchemeEvaluator {
             }
         }
         false
+    }
+
+    fn create_node(&self, canvas: &str, label: &str, code: &str,
+                   exports: &[String], imports: &[(String, String)]) -> Result<String, String> {
+        self.send_command(|reply| NreplCommand::CreateNode {
+            canvas: canvas.to_string(),
+            label: label.to_string(),
+            code: code.to_string(),
+            exports: exports.to_vec(),
+            imports: imports.to_vec(),
+            reply,
+        }).unwrap_or(Err("command channel unavailable".into()))
+    }
+
+    fn delete_node(&self, canvas: &str, label: &str) -> Result<(), String> {
+        self.send_command(|reply| NreplCommand::DeleteNode {
+            canvas: canvas.to_string(),
+            label: label.to_string(),
+            reply,
+        }).unwrap_or(Err("command channel unavailable".into()))
+    }
+
+    fn update_node(&self, canvas: &str, label: &str,
+                   code: Option<&str>, exports: Option<&[String]>,
+                   imports: Option<&[(String, String)]>) -> Result<(), String> {
+        self.send_command(|reply| NreplCommand::UpdateNode {
+            canvas: canvas.to_string(),
+            label: label.to_string(),
+            code: code.map(|s| s.to_string()),
+            exports: exports.map(|e| e.to_vec()),
+            imports: imports.map(|i| i.to_vec()),
+            reply,
+        }).unwrap_or(Err("command channel unavailable".into()))
+    }
+
+    fn node_state(&self, canvas: &str, label: &str) -> Option<NodeState> {
+        self.send_command(|reply| NreplCommand::NodeState {
+            canvas: canvas.to_string(),
+            label: label.to_string(),
+            reply,
+        }).flatten()
+    }
+
+    fn compute_node(&self, canvas: &str, label: &str) -> Result<(), String> {
+        self.send_command(|reply| NreplCommand::ComputeNode {
+            canvas: canvas.to_string(),
+            label: label.to_string(),
+            reply,
+        }).unwrap_or(Err("command channel unavailable".into()))
     }
 }

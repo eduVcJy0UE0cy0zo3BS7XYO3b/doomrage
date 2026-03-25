@@ -93,12 +93,13 @@ fn main() {
 
     runtime.compute_all();
 
-    // Start nREPL server
+    // Start nREPL server with command channel
+    let (cmd_tx, cmd_rx) = wasm_canvas::nrepl_commands::channel();
     let evaluator = Arc::new(wasm_canvas::nrepl_eval::SchemeEvaluator::new(
         runtime.actor_runtime.engine_arc(),
         resources.db.clone(),
     ));
-    // Give evaluator access to the graph for ns-list, completions, info
+    evaluator.set_command_sender(cmd_tx);
     unsafe {
         evaluator.set_graphs(
             &runtime.all_graphs as *const HashMap<String, Graph>,
@@ -139,6 +140,9 @@ fn main() {
                 wasm_canvas::file_watcher::apply_file_events(&mut runtime, events);
             }
         }
+
+        // Poll nREPL commands (create-node, delete-node, etc.)
+        runtime.poll_nrepl_commands(&cmd_rx);
 
         // Poll actor results
         while let Some(result) = runtime.actor_runtime.poll() {

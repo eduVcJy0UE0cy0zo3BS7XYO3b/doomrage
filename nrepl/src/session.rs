@@ -62,6 +62,48 @@ pub trait Evaluator: Send + Sync {
         let _ = (session_id, ns);
         false
     }
+
+    /// Create a new node on a canvas. Returns node id or error.
+    fn create_node(&self, canvas: &str, label: &str, code: &str,
+                   exports: &[String], imports: &[(String, String)]) -> Result<String, String> {
+        let _ = (canvas, label, code, exports, imports);
+        Err("create-node not implemented".into())
+    }
+
+    /// Delete a node by canvas/label.
+    fn delete_node(&self, canvas: &str, label: &str) -> Result<(), String> {
+        let _ = (canvas, label);
+        Err("delete-node not implemented".into())
+    }
+
+    /// Update a node's code, exports, and/or imports.
+    fn update_node(&self, canvas: &str, label: &str,
+                   code: Option<&str>, exports: Option<&[String]>,
+                   imports: Option<&[(String, String)]>) -> Result<(), String> {
+        let _ = (canvas, label, code, exports, imports);
+        Err("update-node not implemented".into())
+    }
+
+    /// Read a node's current state: code, exports, imports, outputs, error.
+    fn node_state(&self, canvas: &str, label: &str) -> Option<NodeState> {
+        let _ = (canvas, label);
+        None
+    }
+
+    /// Trigger compute for a node. Returns immediately; poll results via node-state.
+    fn compute_node(&self, canvas: &str, label: &str) -> Result<(), String> {
+        let _ = (canvas, label);
+        Err("compute not implemented".into())
+    }
+}
+
+/// Full state of a node, returned by node-state op.
+pub struct NodeState {
+    pub code: String,
+    pub exports: Vec<String>,
+    pub imports: Vec<(String, String)>,
+    pub outputs: Vec<(String, String)>, // (name, stringified value)
+    pub error: Option<String>,
 }
 
 /// A simple evaluator that echoes code back (for testing).
@@ -161,6 +203,11 @@ pub fn handle_message(
                     ("load-file", Value::dict(vec![])),
                     ("ns-list", Value::dict(vec![])),
                     ("switch-ns", Value::dict(vec![])),
+                    ("create-node", Value::dict(vec![])),
+                    ("delete-node", Value::dict(vec![])),
+                    ("update-node", Value::dict(vec![])),
+                    ("node-state", Value::dict(vec![])),
+                    ("compute", Value::dict(vec![])),
                 ])),
                 ("status", Value::List(vec![Value::string("done")])),
                 ("versions", Value::dict(vec![
@@ -323,6 +370,135 @@ pub fn handle_message(
                 ("session", Value::string(session_id)),
                 ("status", status),
             ])]
+        }
+        "create-node" => {
+            let canvas = msg.get_str("canvas").unwrap_or("");
+            let label = msg.get_str("label").unwrap_or("");
+            let code = msg.get_str("code").unwrap_or("");
+            let exports: Vec<String> = msg.get("exports")
+                .and_then(|v| v.as_list())
+                .map(|l| l.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
+            let imports: Vec<(String, String)> = msg.get("imports")
+                .and_then(|v| v.as_list())
+                .map(|l| l.iter().filter_map(|v| {
+                    let pair = v.as_list()?;
+                    if pair.len() == 2 {
+                        Some((pair[0].as_str()?.to_string(), pair[1].as_str()?.to_string()))
+                    } else { None }
+                }).collect())
+                .unwrap_or_default();
+            match evaluator.create_node(canvas, label, code, &exports, &imports) {
+                Ok(node_id) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("node-id", Value::string(&node_id)),
+                    ("status", Value::List(vec![Value::string("done")])),
+                ])],
+                Err(e) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("ex", Value::string(&e)),
+                    ("status", Value::List(vec![Value::string("error"), Value::string("done")])),
+                ])],
+            }
+        }
+        "delete-node" => {
+            let canvas = msg.get_str("canvas").unwrap_or("");
+            let label = msg.get_str("label").unwrap_or("");
+            match evaluator.delete_node(canvas, label) {
+                Ok(()) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("status", Value::List(vec![Value::string("done")])),
+                ])],
+                Err(e) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("ex", Value::string(&e)),
+                    ("status", Value::List(vec![Value::string("error"), Value::string("done")])),
+                ])],
+            }
+        }
+        "update-node" => {
+            let canvas = msg.get_str("canvas").unwrap_or("");
+            let label = msg.get_str("label").unwrap_or("");
+            let code = msg.get_str("code");
+            let exports: Option<Vec<String>> = msg.get("exports")
+                .and_then(|v| v.as_list())
+                .map(|l| l.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect());
+            let imports: Option<Vec<(String, String)>> = msg.get("imports")
+                .and_then(|v| v.as_list())
+                .map(|l| l.iter().filter_map(|v| {
+                    let pair = v.as_list()?;
+                    if pair.len() == 2 {
+                        Some((pair[0].as_str()?.to_string(), pair[1].as_str()?.to_string()))
+                    } else { None }
+                }).collect());
+            match evaluator.update_node(canvas, label, code,
+                    exports.as_deref(), imports.as_deref()) {
+                Ok(()) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("status", Value::List(vec![Value::string("done")])),
+                ])],
+                Err(e) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("ex", Value::string(&e)),
+                    ("status", Value::List(vec![Value::string("error"), Value::string("done")])),
+                ])],
+            }
+        }
+        "node-state" => {
+            let canvas = msg.get_str("canvas").unwrap_or("");
+            let label = msg.get_str("label").unwrap_or("");
+            match evaluator.node_state(canvas, label) {
+                Some(state) => {
+                    let exports_val = Value::List(state.exports.iter().map(|e| Value::string(e)).collect());
+                    let imports_val = Value::List(state.imports.iter().map(|(c, m)| {
+                        Value::List(vec![Value::string(c), Value::string(m)])
+                    }).collect());
+                    let outputs_val = Value::dict(
+                        state.outputs.iter().map(|(k, v)| (k.as_str(), Value::string(v))).collect()
+                    );
+                    let mut pairs = vec![
+                        ("id", Value::string(id)),
+                        ("session", Value::string(session_id)),
+                        ("code", Value::string(&state.code)),
+                        ("exports", exports_val),
+                        ("imports", imports_val),
+                        ("outputs", outputs_val),
+                        ("status", Value::List(vec![Value::string("done")])),
+                    ];
+                    if let Some(ref err) = state.error {
+                        pairs.push(("error", Value::string(err)));
+                    }
+                    vec![Value::dict(pairs)]
+                }
+                None => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("status", Value::List(vec![Value::string("error"), Value::string("no-such-node"), Value::string("done")])),
+                ])],
+            }
+        }
+        "compute" => {
+            let canvas = msg.get_str("canvas").unwrap_or("");
+            let label = msg.get_str("label").unwrap_or("");
+            match evaluator.compute_node(canvas, label) {
+                Ok(()) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("status", Value::List(vec![Value::string("done")])),
+                ])],
+                Err(e) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("ex", Value::string(&e)),
+                    ("status", Value::List(vec![Value::string("error"), Value::string("done")])),
+                ])],
+            }
         }
         _ => {
             vec![Value::dict(vec![
