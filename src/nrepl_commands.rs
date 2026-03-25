@@ -44,6 +44,24 @@ pub enum NreplCommand {
         label: String,
         reply: mpsc::Sender<Result<(), String>>,
     },
+    AddHashImport {
+        canvas: String,
+        label: String,
+        hash: String,
+        local_name: String,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    MigrateImports {
+        canvas: String,
+        label: String,
+        reply: mpsc::Sender<Result<Vec<(String, String)>, String>>,
+    },
+    RenameDef {
+        canvas: String,
+        old_name: String,
+        new_name: String,
+        reply: mpsc::Sender<Result<u32, String>>,
+    },
 }
 
 /// Sender half — cloned into SchemeEvaluator.

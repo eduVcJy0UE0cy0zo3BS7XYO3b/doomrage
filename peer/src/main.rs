@@ -95,7 +95,8 @@ fn main() {
     }
 
     // Build runtime
-    let registry = wasm_canvas::registry::NodeRegistry::new(PathBuf::from("./nodes"));
+    let mut registry = wasm_canvas::registry::NodeRegistry::new(PathBuf::from("./nodes"));
+    registry.register_builtins();
     let mut runtime = GraphRuntime {
         all_graphs,
         actor_runtime: wasm_canvas::actor::ActorRuntime::new(Arc::clone(&resources.scheme)),
@@ -121,6 +122,7 @@ fn main() {
     }
 
     runtime.compute_all();
+    runtime.request_missing_defs();
 
     // Start nREPL server with command channel
     let (cmd_tx, cmd_rx) = wasm_canvas::nrepl_commands::channel();
@@ -206,11 +208,17 @@ fn main() {
             match event {
                 NetEvent::PeerDiscovered(peer) => {
                     log::info!("Peer: +{}...", &peer[..12.min(peer.len())]);
+                    runtime.request_missing_defs();
                 }
                 NetEvent::PeerLost(peer) => {
                     log::info!("Peer: -{}...", &peer[..12.min(peer.len())]);
                 }
                 NetEvent::ValuesReceived { peer, channel, values } => {
+                    // Handle definition request/response channels
+                    if runtime.handle_def_network_message(&channel, &values) {
+                        continue;
+                    }
+
                     log::info!("Recv \"{}\": {:?}", channel, values.keys().collect::<Vec<_>>());
                     runtime.net_values.lock().unwrap().insert(
                         (peer.clone(), channel.clone()), values.clone(),

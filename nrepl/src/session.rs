@@ -21,6 +21,8 @@ pub struct SymbolInfo {
     pub name: String,
     pub ns: Option<String>,
     pub file: Option<String>,
+    pub line: Option<u32>,
+    pub hash: Option<u64>,
     pub doc: Option<String>,
 }
 
@@ -106,6 +108,56 @@ pub trait Evaluator: Send + Sync {
         let _ = (canvas, label);
         Err("compute not implemented".into())
     }
+
+    /// List all definitions for a canvas (from Name DB).
+    fn list_defs(&self, canvas: &str) -> Vec<DefEntry> {
+        let _ = canvas;
+        Vec::new()
+    }
+
+    /// Get canonical definition body by content hash.
+    fn def_source(&self, hash: &str) -> Option<String> {
+        let _ = hash;
+        None
+    }
+
+    /// Add a hash-based import to a node.
+    fn add_hash_import(&self, canvas: &str, label: &str, hash: &str, local_name: &str) -> Result<(), String> {
+        let _ = (canvas, label, hash, local_name);
+        Err("add-hash-import not implemented".into())
+    }
+
+    /// Get full history of a definition (all versions, including superseded).
+    fn def_history(&self, name: &str, canvas: &str) -> Vec<DefEntry> {
+        let _ = (name, canvas);
+        Vec::new()
+    }
+
+    /// Migrate legacy module imports to hash-based imports for a node.
+    fn migrate_imports(&self, canvas: &str, label: &str) -> Result<Vec<(String, String)>, String> {
+        let _ = (canvas, label);
+        Err("migrate-imports not implemented".into())
+    }
+
+    /// Structural diff between two definitions by content hash.
+    fn def_diff(&self, hash_a: &str, hash_b: &str) -> Option<String> {
+        let _ = (hash_a, hash_b);
+        None
+    }
+
+    /// Rename a definition: update Name DB, source code, exports, and consumer hash_imports.
+    fn rename_def(&self, canvas: &str, old_name: &str, new_name: &str) -> Result<u32, String> {
+        let _ = (canvas, old_name, new_name);
+        Err("rename-def not implemented".into())
+    }
+}
+
+/// Definition entry returned by list_defs.
+pub struct DefEntry {
+    pub name: String,
+    pub hash: String,
+    pub node_label: String,
+    pub form: String,
 }
 
 /// Full state of a node, returned by node-state op.
@@ -113,7 +165,8 @@ pub struct NodeState {
     pub code: String,
     pub exports: Vec<String>,
     pub imports: Vec<(String, String)>,
-    pub outputs: Vec<(String, String)>, // (name, stringified value)
+    pub hash_imports: Vec<(String, String)>, // (hash, local_name)
+    pub outputs: Vec<(String, String)>,      // (name, stringified value)
     pub error: Option<String>,
 }
 
@@ -221,6 +274,14 @@ pub fn handle_message(
                     ("update-node", Value::dict(vec![])),
                     ("node-state", Value::dict(vec![])),
                     ("compute", Value::dict(vec![])),
+                    ("defs", Value::dict(vec![])),
+                    ("def-source", Value::dict(vec![])),
+                    ("add-hash-import", Value::dict(vec![])),
+                    ("def-history", Value::dict(vec![])),
+                    ("migrate-imports", Value::dict(vec![])),
+                    ("def-history", Value::dict(vec![])),
+                    ("def-diff", Value::dict(vec![])),
+                    ("rename-def", Value::dict(vec![])),
                 ])),
                 ("status", Value::List(vec![Value::string("done")])),
                 ("versions", Value::dict(vec![
@@ -324,6 +385,12 @@ pub fn handle_message(
                     }
                     if let Some(ref file) = info.file {
                         pairs.push(("file", Value::string(file.as_str())));
+                    }
+                    if let Some(line) = info.line {
+                        pairs.push(("line", Value::Int(line as i64)));
+                    }
+                    if let Some(hash) = info.hash {
+                        pairs.push(("hash", Value::string(&format!("{:016x}", hash))));
                     }
                     if let Some(ref doc) = info.doc {
                         pairs.push(("doc", Value::string(doc.as_str())));
@@ -498,6 +565,9 @@ pub fn handle_message(
                     let imports_val = Value::List(state.imports.iter().map(|(c, m)| {
                         Value::List(vec![Value::string(c), Value::string(m)])
                     }).collect());
+                    let hash_imports_val = Value::List(state.hash_imports.iter().map(|(h, n)| {
+                        Value::dict(vec![("hash", Value::string(h)), ("name", Value::string(n))])
+                    }).collect());
                     let outputs_val = Value::dict(
                         state.outputs.iter().map(|(k, v)| (k.as_str(), Value::string(v))).collect()
                     );
@@ -507,6 +577,7 @@ pub fn handle_message(
                         ("code", Value::string(&state.code)),
                         ("exports", exports_val),
                         ("imports", imports_val),
+                        ("hash-imports", hash_imports_val),
                         ("outputs", outputs_val),
                         ("status", Value::List(vec![Value::string("done")])),
                     ];
@@ -529,6 +600,137 @@ pub fn handle_message(
                 Ok(()) => vec![Value::dict(vec![
                     ("id", Value::string(id)),
                     ("session", Value::string(session_id)),
+                    ("status", Value::List(vec![Value::string("done")])),
+                ])],
+                Err(e) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("ex", Value::string(&e)),
+                    ("status", Value::List(vec![Value::string("error"), Value::string("done")])),
+                ])],
+            }
+        }
+        "defs" => {
+            let canvas = msg.get_str("canvas").unwrap_or("");
+            let entries = evaluator.list_defs(canvas);
+            let defs_list = Value::List(entries.iter().map(|e| {
+                Value::dict(vec![
+                    ("name", Value::string(&e.name)),
+                    ("hash", Value::string(&e.hash)),
+                    ("node", Value::string(&e.node_label)),
+                    ("form", Value::string(&e.form)),
+                ])
+            }).collect());
+            vec![Value::dict(vec![
+                ("id", Value::string(id)),
+                ("session", Value::string(session_id)),
+                ("defs", defs_list),
+                ("status", Value::List(vec![Value::string("done")])),
+            ])]
+        }
+        "def-source" => {
+            let hash = msg.get_str("hash").unwrap_or("");
+            match evaluator.def_source(hash) {
+                Some(source) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("source", Value::string(&source)),
+                    ("status", Value::List(vec![Value::string("done")])),
+                ])],
+                None => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("status", Value::List(vec![Value::string("no-source"), Value::string("done")])),
+                ])],
+            }
+        }
+        "def-history" => {
+            let name = msg.get_str("name").unwrap_or("");
+            let canvas = msg.get_str("canvas").unwrap_or("");
+            let entries = evaluator.def_history(name, canvas);
+            let history_list = Value::List(entries.iter().map(|e| {
+                Value::dict(vec![
+                    ("name", Value::string(&e.name)),
+                    ("hash", Value::string(&e.hash)),
+                    ("node", Value::string(&e.node_label)),
+                    ("form", Value::string(&e.form)),
+                ])
+            }).collect());
+            vec![Value::dict(vec![
+                ("id", Value::string(id)),
+                ("session", Value::string(session_id)),
+                ("history", history_list),
+                ("status", Value::List(vec![Value::string("done")])),
+            ])]
+        }
+        "migrate-imports" => {
+            let canvas = msg.get_str("canvas").unwrap_or("");
+            let label = msg.get_str("label").unwrap_or("");
+            match evaluator.migrate_imports(canvas, label) {
+                Ok(migrated) => {
+                    let list = Value::List(migrated.iter().map(|(h, n)| {
+                        Value::dict(vec![("hash", Value::string(h)), ("name", Value::string(n))])
+                    }).collect());
+                    vec![Value::dict(vec![
+                        ("id", Value::string(id)),
+                        ("session", Value::string(session_id)),
+                        ("migrated", list),
+                        ("status", Value::List(vec![Value::string("done")])),
+                    ])]
+                }
+                Err(e) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("ex", Value::string(&e)),
+                    ("status", Value::List(vec![Value::string("error"), Value::string("done")])),
+                ])],
+            }
+        }
+        "add-hash-import" => {
+            let canvas = msg.get_str("canvas").unwrap_or("");
+            let label = msg.get_str("label").unwrap_or("");
+            let hash = msg.get_str("hash").unwrap_or("");
+            let local_name = msg.get_str("local-name").unwrap_or("");
+            match evaluator.add_hash_import(canvas, label, hash, local_name) {
+                Ok(()) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("status", Value::List(vec![Value::string("done")])),
+                ])],
+                Err(e) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("ex", Value::string(&e)),
+                    ("status", Value::List(vec![Value::string("error"), Value::string("done")])),
+                ])],
+            }
+        }
+        "def-diff" => {
+            let hash_a = msg.get_str("hash-a").unwrap_or("");
+            let hash_b = msg.get_str("hash-b").unwrap_or("");
+            match evaluator.def_diff(hash_a, hash_b) {
+                Some(diff) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("diff", Value::string(&diff)),
+                    ("status", Value::List(vec![Value::string("done")])),
+                ])],
+                None => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("status", Value::List(vec![Value::string("no-diff"), Value::string("done")])),
+                ])],
+            }
+        }
+        "rename-def" => {
+            let canvas = msg.get_str("canvas").unwrap_or("");
+            let old_name = msg.get_str("old-name").unwrap_or("");
+            let new_name = msg.get_str("new-name").unwrap_or("");
+            match evaluator.rename_def(canvas, old_name, new_name) {
+                Ok(count) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("updated", Value::Int(count as i64)),
                     ("status", Value::List(vec![Value::string("done")])),
                 ])],
                 Err(e) => vec![Value::dict(vec![

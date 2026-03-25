@@ -109,6 +109,44 @@ impl GraphRuntime {
     }
 }
 
+// --- Hash import resolution ---
+
+/// Channel names for hash-based definition sharing over the network.
+pub const DEF_REQUEST_CHANNEL: &str = "__def/request";
+pub const DEF_RESPONSE_CHANNEL: &str = "__def/response";
+
+/// Resolve hash imports for a node: look up each hash in Name DB,
+/// find source node's output value. Returns (resolved, unresolved_hashes).
+pub fn resolve_hash_imports(
+    node: &Node,
+    graphs: &HashMap<String, Graph>,
+    db: &Db,
+) -> HashMap<String, Value> {
+    let mut resolved = HashMap::new();
+    for hi in &node.hash_imports {
+        if let Some(entry) = db.lookup_by_hash_first(&hi.hash) {
+            if let Some(graph) = graphs.get(&entry.canvas) {
+                let source = graph.nodes.values()
+                    .find(|n| n.label.replace(' ', "-") == entry.node_label);
+                if let Some(src) = source {
+                    if let Some(val) = src.output_values.get(&entry.name) {
+                        resolved.insert(hi.local_name.clone(), val.clone());
+                    }
+                }
+            }
+        }
+    }
+    resolved
+}
+
+/// Collect unresolved hash imports (hashes not found in local Name DB).
+pub fn unresolved_hash_imports(node: &Node, db: &Db) -> Vec<String> {
+    node.hash_imports.iter()
+        .filter(|hi| db.lookup_by_hash_first(&hi.hash).is_none())
+        .map(|hi| hi.hash.clone())
+        .collect()
+}
+
 // --- Compute ---
 
 impl GraphRuntime {
@@ -146,6 +184,7 @@ impl GraphRuntime {
     }
 
     /// Register a node's outputs as an R6RS library (canvas module-name).
+    /// Also saves per-definition content hashes to Name DB and disk.
     pub fn register_node_libraries(&self, node_id: NodeId) {
         if let Some((canvas_name, node)) = self.find_node_canvas(node_id) {
             let module_name = node.label.replace(' ', "-");
@@ -154,6 +193,8 @@ impl GraphRuntime {
                     node_id, canvas_name, &module_name, &node.output_values,
                 );
             }
+            // Register definitions in Name DB and content-addressed storage
+            crate::persistence::save_node_definitions(canvas_name, node, Some(&self.db));
         }
     }
 
@@ -215,10 +256,89 @@ impl GraphRuntime {
                     let template = self.registry.templates.get(&n.template_name).cloned();
                     let inputs = self.all_graphs.get(&canvas_name).unwrap().resolve_all_input_values(did);
                     self.pending_nodes.insert(did);
-                    self.actor_runtime.compute(did, n.clone(), template, inputs, self.db.clone());
+                    let hr = resolve_hash_imports(n, &self.all_graphs, &self.db);
+                    self.actor_runtime.compute(did, n.clone(), template, inputs, hr, self.db.clone());
                 }
             }
         }
+    }
+
+    /// Request missing definitions from the network.
+    /// For each unresolved hash_import across all nodes, publishes a request.
+    pub fn request_missing_defs(&self) {
+        let mut requested = std::collections::HashSet::new();
+        for graph in self.all_graphs.values() {
+            for node in graph.nodes.values() {
+                for hash in unresolved_hash_imports(node, &self.db) {
+                    if requested.insert(hash.clone()) {
+                        let mut values = HashMap::new();
+                        values.insert("hash".to_string(), Value::Str(hash));
+                        self.net_handle.send(crate::network::NetCommand::Publish {
+                            channel: DEF_REQUEST_CHANNEL.to_string(),
+                            values,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle a network message on the definition request/response channels.
+    /// Returns true if the message was handled (caller should skip normal processing).
+    pub fn handle_def_network_message(&mut self, channel: &str, values: &HashMap<String, Value>) -> bool {
+        if channel == DEF_REQUEST_CHANNEL {
+            // Someone is requesting a definition by hash — check if we have it
+            if let Some(Value::Str(hash)) = values.get("hash") {
+                if let Some(hash_u64) = u64::from_str_radix(hash, 16).ok() {
+                    if let Some(body) = crate::persistence::load_definition(hash_u64) {
+                        // We have it — publish the response
+                        let name = self.db.lookup_by_hash_first(hash)
+                            .map(|e| e.name)
+                            .unwrap_or_default();
+                        let form = self.db.lookup_by_hash_first(hash)
+                            .map(|e| e.form)
+                            .unwrap_or_default();
+                        let mut resp = HashMap::new();
+                        resp.insert("hash".to_string(), Value::Str(hash.clone()));
+                        resp.insert("body".to_string(), Value::Str(body));
+                        resp.insert("name".to_string(), Value::Str(name));
+                        resp.insert("form".to_string(), Value::Str(form));
+                        self.net_handle.send(crate::network::NetCommand::Publish {
+                            channel: DEF_RESPONSE_CHANNEL.to_string(),
+                            values: resp,
+                        });
+                        log::info!("Served definition #{}", hash);
+                    }
+                }
+            }
+            return true;
+        }
+        if channel == DEF_RESPONSE_CHANNEL {
+            // Received a definition from a peer — store it locally
+            if let (Some(Value::Str(hash)), Some(Value::Str(body))) =
+                (values.get("hash"), values.get("body"))
+            {
+                let name = match values.get("name") {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                let form = match values.get("form") {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => "Simple".to_string(),
+                };
+                if let Ok(hash_u64) = u64::from_str_radix(hash, 16) {
+                    // Save to content-addressed storage
+                    let _ = crate::persistence::save_definition(hash_u64, body);
+                    // Register in Name DB (as remote definition)
+                    if !name.is_empty() {
+                        self.db.register_def(hash, &name, "__remote__", "__network__", &form);
+                    }
+                    log::info!("Received definition #{} ({})", hash, name);
+                }
+            }
+            return true;
+        }
+        false
     }
 
     /// Deliver values to a specific canvas as if from a peer.
@@ -313,7 +433,8 @@ impl GraphRuntime {
                 widget_values: HashMap::new(),
                 exports: Vec::new(),
                 imports: Vec::new(),
-                code_hash: 0,
+                hash_imports: Vec::new(),
+                definitions: Vec::new(), code_hash: 0,
                 error: None,
                 last_exec_us: None,
                 render_blocks: Vec::new(),
@@ -346,7 +467,8 @@ impl GraphRuntime {
                     let template = self.registry.templates.get(&n.template_name).cloned();
                     let inputs = self.all_graphs.get(canvas_key).unwrap().resolve_all_input_values(did);
                     self.pending_nodes.insert(did);
-                    self.actor_runtime.compute(did, n.clone(), template, inputs, self.db.clone());
+                    let hr = resolve_hash_imports(n, &self.all_graphs, &self.db);
+                    self.actor_runtime.compute(did, n.clone(), template, inputs, hr, self.db.clone());
                 }
             }
         }
@@ -425,7 +547,8 @@ impl GraphRuntime {
         self.ensure_imports(node_id);
         if let Some((node, template, inputs)) = self.resolve_node(node_id) {
             self.pending_nodes.insert(node_id);
-            self.actor_runtime.compute(node_id, node, template, inputs, self.db.clone());
+            let hr = resolve_hash_imports(&node, &self.all_graphs, &self.db);
+            self.actor_runtime.compute(node_id, node, template, inputs, hr, self.db.clone());
         }
     }
 
@@ -452,7 +575,8 @@ impl GraphRuntime {
                 self.ensure_imports(node_id);
                 if let Some((node, template, inputs)) = self.resolve_node(node_id) {
                     self.pending_nodes.insert(node_id);
-                    self.actor_runtime.compute(node_id, node, template, inputs, self.db.clone());
+                    let hr = resolve_hash_imports(&node, &self.all_graphs, &self.db);
+                    self.actor_runtime.compute(node_id, node, template, inputs, hr, self.db.clone());
                 }
             }
         }
@@ -496,6 +620,18 @@ impl GraphRuntime {
                     let result = self.cmd_compute_node(&canvas, &label);
                     let _ = reply.send(result);
                 }
+                NreplCommand::AddHashImport { canvas, label, hash, local_name, reply } => {
+                    let result = self.cmd_add_hash_import(&canvas, &label, &hash, &local_name);
+                    let _ = reply.send(result);
+                }
+                NreplCommand::MigrateImports { canvas, label, reply } => {
+                    let result = self.cmd_migrate_imports(&canvas, &label);
+                    let _ = reply.send(result);
+                }
+                NreplCommand::RenameDef { canvas, old_name, new_name, reply } => {
+                    let result = self.cmd_rename_def(&canvas, &old_name, &new_name);
+                    let _ = reply.send(result);
+                }
             }
         }
     }
@@ -520,7 +656,8 @@ impl GraphRuntime {
             widget_values: HashMap::new(),
             exports,
             imports,
-            code_hash: 0,
+            hash_imports: Vec::new(),
+            definitions: Vec::new(), code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -529,6 +666,7 @@ impl GraphRuntime {
         };
         node.recompute_hash();
         let _ = persistence::save_node_file(canvas, &node);
+        persistence::save_node_definitions(canvas, &node, Some(&self.db));
         graph.nodes.insert(id, node);
         log::info!("nREPL: created node #{} '{}' on '{}'", id, label, canvas);
         Ok(id.to_string())
@@ -558,6 +696,7 @@ impl GraphRuntime {
         if let Some(code) = code {
             node.set_code(code);
             let _ = persistence::save_node_file(canvas, node);
+            persistence::save_node_definitions(canvas, node, Some(&self.db));
         }
         if let Some(exports) = exports {
             node.exports = exports;
@@ -576,6 +715,9 @@ impl GraphRuntime {
             code: node.script_code.clone(),
             exports: node.exports.clone(),
             imports: node.imports.clone(),
+            hash_imports: node.hash_imports.iter()
+                .map(|hi| (hi.hash.clone(), hi.local_name.clone()))
+                .collect(),
             outputs: node.output_values.iter()
                 .map(|(k, v)| (k.clone(), format!("{:?}", v)))
                 .collect(),
@@ -593,4 +735,203 @@ impl GraphRuntime {
         self.compute_if_ready(node_id);
         Ok(())
     }
+
+    fn cmd_add_hash_import(&mut self, canvas: &str, label: &str, hash: &str, local_name: &str) -> Result<(), String> {
+        let graph = self.all_graphs.get_mut(canvas)
+            .ok_or_else(|| format!("canvas '{}' not found", canvas))?;
+        let node = graph.nodes.values_mut()
+            .find(|n| n.label.replace(' ', "-") == label && !n.phantom)
+            .ok_or_else(|| format!("node '{}' not found on '{}'", label, canvas))?;
+        // Remove existing import with same hash (update name), then add
+        node.hash_imports.retain(|hi| hi.hash != hash);
+        node.hash_imports.push(crate::types::HashImport {
+            hash: hash.to_string(),
+            local_name: local_name.to_string(),
+        });
+        let _ = persistence::save_node_file(canvas, node);
+        Ok(())
+    }
+
+    /// Migrate legacy module imports to hash-based imports.
+    /// For each (canvas, module) import, find the source node's exported definitions,
+    /// look up their hashes, and create HashImport entries.
+    fn cmd_migrate_imports(&mut self, canvas: &str, label: &str) -> Result<Vec<(String, String)>, String> {
+        let graph = self.all_graphs.get(canvas)
+            .ok_or_else(|| format!("canvas '{}' not found", canvas))?;
+        let node = graph.nodes.values()
+            .find(|n| n.label.replace(' ', "-") == label && !n.phantom)
+            .ok_or_else(|| format!("node '{}' not found on '{}'", label, canvas))?;
+
+        let mut migrated = Vec::new();
+        let mut new_hash_imports = node.hash_imports.clone();
+
+        for (_imp_canvas, imp_module) in &node.imports {
+            // Find source node
+            if let Some(src) = graph.nodes.values()
+                .find(|n| n.label.replace(' ', "-") == *imp_module)
+            {
+                for def in &src.definitions {
+                    if src.exports.contains(&def.name) {
+                        let hash_hex = format!("{:016x}", def.hash);
+                        // Avoid duplicates
+                        if !new_hash_imports.iter().any(|hi| hi.hash == hash_hex) {
+                            new_hash_imports.push(crate::types::HashImport {
+                                hash: hash_hex.clone(),
+                                local_name: def.name.clone(),
+                            });
+                            migrated.push((hash_hex, def.name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply: clear legacy imports, set hash_imports
+        let graph = self.all_graphs.get_mut(canvas).unwrap();
+        let node = graph.nodes.values_mut()
+            .find(|n| n.label.replace(' ', "-") == label && !n.phantom)
+            .unwrap();
+        node.imports.clear();
+        node.hash_imports = new_hash_imports;
+        let _ = persistence::save_node_file(canvas, node);
+        Ok(migrated)
+    }
+
+    /// Rename a definition across the canvas.
+    /// 1. Find definition hash by old_name in Name DB
+    /// 2. Update Name DB entry
+    /// 3. Replace (define old_name ...) → (define new_name ...) in source node code
+    /// 4. Update exports list
+    /// 5. Update hash_imports.local_name in all consumer nodes
+    /// 6. Update output_values key
+    /// Returns count of updated nodes.
+    fn cmd_rename_def(&mut self, canvas: &str, old_name: &str, new_name: &str) -> Result<u32, String> {
+        // 1. Find in Name DB
+        let entry = self.db.lookup_by_name(old_name, canvas)
+            .ok_or_else(|| format!("definition '{}' not found on canvas '{}'", old_name, canvas))?;
+        let hash = entry.hash.clone();
+        let source_label = entry.node_label.clone();
+
+        // 2. Update Name DB
+        self.db.rename_def(&hash, old_name, new_name, canvas);
+
+        let graph = self.all_graphs.get_mut(canvas)
+            .ok_or_else(|| format!("canvas '{}' not found", canvas))?;
+
+        let mut updated: u32 = 0;
+
+        // 3. Update source node: code + exports + output_values
+        if let Some(source) = graph.nodes.values_mut()
+            .find(|n| n.label.replace(' ', "-") == source_label && !n.phantom)
+        {
+            // Replace in code: (define old_name → (define new_name
+            let new_code = source.script_code
+                .replace(&format!("(define {} ", old_name), &format!("(define {} ", new_name))
+                .replace(&format!("(define ({} ", old_name), &format!("(define ({} ", new_name));
+            source.set_code(new_code);
+
+            // Update exports
+            if let Some(pos) = source.exports.iter().position(|e| e == old_name) {
+                source.exports[pos] = new_name.to_string();
+            }
+
+            // Update output_values key
+            if let Some(val) = source.output_values.remove(old_name) {
+                source.output_values.insert(new_name.to_string(), val);
+            }
+
+            let _ = persistence::save_node_file(canvas, source);
+            persistence::save_node_definitions(canvas, source, Some(&self.db));
+            updated += 1;
+        }
+
+        // 5. Update hash_imports.local_name in consumer nodes
+        let hash_clone = hash.clone();
+        for node in graph.nodes.values_mut() {
+            let mut changed = false;
+            for hi in &mut node.hash_imports {
+                if hi.hash == hash_clone && hi.local_name == old_name {
+                    hi.local_name = new_name.to_string();
+                    changed = true;
+                }
+            }
+            if changed {
+                // Also update references in code: simple text replace for the identifier
+                let new_code = rename_identifier_in_code(&node.script_code, old_name, new_name);
+                if new_code != node.script_code {
+                    node.set_code(new_code);
+                }
+                let _ = persistence::save_node_file(canvas, node);
+                updated += 1;
+            }
+        }
+
+        log::info!("Renamed '{}' → '{}' on canvas '{}' ({} nodes updated)", old_name, new_name, canvas, updated);
+        Ok(updated)
+    }
+}
+
+/// Replace identifier occurrences in Scheme code, respecting word boundaries.
+/// Does NOT replace inside strings or as part of longer identifiers.
+pub fn rename_identifier_in_code(code: &str, old: &str, new: &str) -> String {
+    let mut result = String::with_capacity(code.len());
+    let chars: Vec<char> = code.chars().collect();
+    let old_chars: Vec<char> = old.chars().collect();
+    let mut i = 0;
+    let mut in_string = false;
+    let mut in_comment = false;
+
+    while i < chars.len() {
+        if in_comment {
+            result.push(chars[i]);
+            if chars[i] == '\n' { in_comment = false; }
+            i += 1;
+            continue;
+        }
+        if chars[i] == ';' && !in_string {
+            in_comment = true;
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        if chars[i] == '"' {
+            in_string = !in_string;
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        if in_string {
+            if chars[i] == '\\' && i + 1 < chars.len() {
+                result.push(chars[i]);
+                result.push(chars[i + 1]);
+                i += 2;
+            } else {
+                result.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+
+        // Check for identifier match
+        if i + old_chars.len() <= chars.len()
+            && chars[i..i + old_chars.len()] == old_chars[..]
+        {
+            // Check word boundaries
+            let before_ok = i == 0 || !is_ident_char(chars[i - 1]);
+            let after_ok = i + old_chars.len() >= chars.len()
+                || !is_ident_char(chars[i + old_chars.len()]);
+            if before_ok && after_ok {
+                result.push_str(new);
+                i += old_chars.len();
+                continue;
+            }
+        }
+        result.push(chars[i]);
+        i += 1;
+    }
+    result
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_' || c == '!' || c == '?' || c == '*' || c == '+'
 }

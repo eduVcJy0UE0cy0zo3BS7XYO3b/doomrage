@@ -127,7 +127,43 @@ pub fn node_file_path(canvas_name: &str, label: &str) -> PathBuf {
     nodes_dir().join(canvas_name).join(format!("{}.scm", safe_label))
 }
 
-/// Write a Script node's code to its .scm file.
+/// Format hash import pragmas for writing to .scm file.
+pub fn write_hash_import_pragmas(hash_imports: &[crate::types::HashImport]) -> String {
+    let mut out = String::new();
+    for hi in hash_imports {
+        out.push_str(&format!(";;; @import {} {}\n", hi.hash, hi.local_name));
+    }
+    out
+}
+
+/// Parse hash import pragmas from the beginning of .scm file content.
+/// Returns (parsed imports, remaining code without pragmas).
+pub fn parse_hash_import_pragmas(content: &str) -> (Vec<crate::types::HashImport>, String) {
+    let mut imports = Vec::new();
+    let mut code_start = 0;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix(";;; @import ") {
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                imports.push(crate::types::HashImport {
+                    hash: parts[0].to_string(),
+                    local_name: parts[1].to_string(),
+                });
+            }
+            code_start += line.len() + 1; // +1 for newline
+        } else {
+            break;
+        }
+    }
+    let code = if code_start < content.len() {
+        content[code_start..].to_string()
+    } else {
+        String::new()
+    };
+    (imports, code)
+}
+
+/// Write a Script node's code to its .scm file (with hash import pragmas).
 pub fn save_node_file(canvas_name: &str, node: &Node) -> Result<()> {
     if node.template_name != "Script" || node.phantom {
         return Ok(());
@@ -136,7 +172,9 @@ pub fn save_node_file(canvas_name: &str, node: &Node) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, &node.script_code)?;
+    let mut content = write_hash_import_pragmas(&node.hash_imports);
+    content.push_str(&node.script_code);
+    std::fs::write(&path, content)?;
     Ok(())
 }
 
@@ -158,19 +196,98 @@ pub fn rename_node_file(canvas_name: &str, old_label: &str, new_label: &str) {
     }
 }
 
-/// Load script_code from .scm file into a node. Returns true if loaded from file.
+/// Load script_code from .scm file into a node (parsing hash import pragmas).
+/// Returns true if loaded from file.
 pub fn load_node_file(canvas_name: &str, node: &mut Node) -> bool {
     if node.template_name != "Script" || node.phantom {
         return false;
     }
     let path = node_file_path(canvas_name, &node.label);
     if path.exists() {
-        if let Ok(code) = std::fs::read_to_string(&path) {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let (hash_imports, code) = parse_hash_import_pragmas(&content);
+            node.hash_imports = hash_imports;
             node.set_code(code);
             return true;
         }
     }
     false
+}
+
+// --- Content-addressed definition storage ---
+
+/// Root directory for content-addressed definitions.
+pub fn defs_dir() -> PathBuf {
+    project_dir().join("defs")
+}
+
+/// Save a definition body by its content hash. Write-once: skips if file already exists.
+pub fn save_definition(hash: u64, canonical_body: &str) -> Result<()> {
+    let dir = defs_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{:016x}.sexp", hash));
+    if !path.exists() {
+        std::fs::write(&path, canonical_body)?;
+    }
+    Ok(())
+}
+
+/// Load a definition body by its content hash.
+pub fn load_definition(hash: u64) -> Option<String> {
+    let path = defs_dir().join(format!("{:016x}.sexp", hash));
+    std::fs::read_to_string(&path).ok()
+}
+
+/// Check if a definition exists in content-addressed storage.
+pub fn definition_exists(hash: u64) -> bool {
+    defs_dir().join(format!("{:016x}.sexp", hash)).exists()
+}
+
+/// Save all definitions from a node to content-addressed storage.
+/// Also registers them in the name DB.
+pub fn save_node_definitions(canvas_name: &str, node: &Node, db: Option<&crate::db::Db>) {
+    // Clear old entries for this node and re-register
+    if let Some(db) = db {
+        db.clear_node_defs(canvas_name, &node.label);
+    }
+    for def in &node.definitions {
+        // Save canonical body to content-addressed storage
+        // We need to extract the body again for storage
+        let hash_hex = format!("{:016x}", def.hash);
+        if let Some(db) = db {
+            let form_str = match def.form {
+                crate::types::DefForm::Simple => "Simple",
+                crate::types::DefForm::Function => "Function",
+                crate::types::DefForm::Syntax => "Syntax",
+                crate::types::DefForm::RecordType => "RecordType",
+            };
+            db.register_def(&hash_hex, &def.name, canvas_name, &node.label, form_str);
+        }
+    }
+    // Save canonical bodies to disk
+    save_node_def_bodies(node);
+}
+
+/// Extract and save canonical definition bodies from node code.
+fn save_node_def_bodies(node: &Node) {
+    let forms = crate::types::split_toplevel_forms_with_offsets(&node.script_code);
+    for (_, form) in forms {
+        let trimmed = form.trim();
+        if let Some((_name, body, _kind)) = crate::types::parse_define(trimmed) {
+            let hash = crate::sexp::canonical_hash_str(body);
+            // Save canonical form of the body
+            if let Ok(sexps) = crate::sexp::parse_sexp(body.trim()) {
+                let canonical = sexps.iter()
+                    .map(|s| crate::sexp::canonical(s))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let _ = save_definition(hash, &canonical);
+            } else {
+                // Fallback: save raw body
+                let _ = save_definition(hash, body);
+            }
+        }
+    }
 }
 
 // --- DB graph persistence (multi-canvas) ---
@@ -351,7 +468,8 @@ fn parse_node_row(row: &serde_json::Value) -> Option<Node> {
         widget_values,
         exports,
         imports,
-        code_hash: 0,
+        hash_imports: Vec::new(),
+        definitions: Vec::new(), code_hash: 0,
         error: None,
         last_exec_us: None,
         render_blocks: Vec::new(),
@@ -727,7 +845,8 @@ fn parse_node_form(src: &str, form_start: usize, form_end: usize) -> Result<Node
         widget_values,
         exports,
         imports,
-        code_hash: 0,
+        hash_imports: Vec::new(),
+        definitions: Vec::new(), code_hash: 0,
         error: None,
         last_exec_us: None,
         render_blocks: Vec::new(),
@@ -1135,8 +1254,8 @@ mod tests {
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
             exports: Vec::new(),
-            imports: Vec::new(),
-            code_hash: 0,
+            imports: Vec::new(), hash_imports: Vec::new(),
+            definitions: Vec::new(), code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -1199,8 +1318,8 @@ mod tests {
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
             exports: Vec::new(),
-            imports: Vec::new(),
-            code_hash: 0,
+            imports: Vec::new(), hash_imports: Vec::new(),
+            definitions: Vec::new(), code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -1221,8 +1340,8 @@ mod tests {
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
             exports: Vec::new(),
-            imports: Vec::new(),
-            code_hash: 0,
+            imports: Vec::new(), hash_imports: Vec::new(),
+            definitions: Vec::new(), code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -1256,8 +1375,8 @@ mod tests {
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
             exports: Vec::new(),
-            imports: Vec::new(),
-            code_hash: 0,
+            imports: Vec::new(), hash_imports: Vec::new(),
+            definitions: Vec::new(), code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -1284,8 +1403,8 @@ mod tests {
             pos: [0.0, 0.0], input_values: HashMap::new(), output_values: HashMap::new(),
             script_code: "(define a 1)".to_string(), script_inputs: Vec::new(),
             script_outputs: Vec::new(), widget_decls: Vec::new(), widget_values: HashMap::new(),
-            exports: Vec::new(), imports: Vec::new(),
-            code_hash: 0, error: None, last_exec_us: None, render_blocks: Vec::new(),
+            exports: Vec::new(), imports: Vec::new(), hash_imports: Vec::new(),
+            definitions: Vec::new(), code_hash: 0, error: None, last_exec_us: None, render_blocks: Vec::new(),
             phantom: false, remote_peer: None,
         });
         g1.next_node_id = 2;
@@ -1296,8 +1415,8 @@ mod tests {
             pos: [100.0, 100.0], input_values: HashMap::new(), output_values: HashMap::new(),
             script_code: "(define b 2)".to_string(), script_inputs: Vec::new(),
             script_outputs: Vec::new(), widget_decls: Vec::new(), widget_values: HashMap::new(),
-            exports: Vec::new(), imports: Vec::new(),
-            code_hash: 0, error: None, last_exec_us: None, render_blocks: Vec::new(),
+            exports: Vec::new(), imports: Vec::new(), hash_imports: Vec::new(),
+            definitions: Vec::new(), code_hash: 0, error: None, last_exec_us: None, render_blocks: Vec::new(),
             phantom: false, remote_peer: None,
         });
         g2.next_node_id = 2;
@@ -1322,5 +1441,39 @@ mod tests {
         let names = list_canvases(&db);
         assert_eq!(names, vec!["project-b"]);
         assert!(load_canvas_from_db("project-a", &db).unwrap().is_none());
+    }
+
+    // --- Hash import pragma tests ---
+
+    #[test]
+    fn test_pragma_write_parse_roundtrip() {
+        let imports = vec![
+            crate::types::HashImport { hash: "1a2b3c4d5e6f7890".into(), local_name: "gain".into() },
+            crate::types::HashImport { hash: "fed9876543210abc".into(), local_name: "freq".into() },
+        ];
+        let pragmas = write_hash_import_pragmas(&imports);
+        assert_eq!(pragmas, ";;; @import 1a2b3c4d5e6f7890 gain\n;;; @import fed9876543210abc freq\n");
+
+        let (parsed, code) = parse_hash_import_pragmas(&format!("{}(define x 1)", pragmas));
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].hash, "1a2b3c4d5e6f7890");
+        assert_eq!(parsed[0].local_name, "gain");
+        assert_eq!(parsed[1].hash, "fed9876543210abc");
+        assert_eq!(parsed[1].local_name, "freq");
+        assert_eq!(code, "(define x 1)");
+    }
+
+    #[test]
+    fn test_pragma_parse_no_pragmas() {
+        let (imports, code) = parse_hash_import_pragmas("(define x 1)");
+        assert!(imports.is_empty());
+        assert_eq!(code, "(define x 1)");
+    }
+
+    #[test]
+    fn test_pragma_parse_empty() {
+        let (imports, code) = parse_hash_import_pragmas("");
+        assert!(imports.is_empty());
+        assert_eq!(code, "");
     }
 }

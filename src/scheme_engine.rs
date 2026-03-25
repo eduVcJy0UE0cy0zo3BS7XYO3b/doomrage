@@ -669,7 +669,7 @@ impl SchemeEngine {
         db: Option<&crate::db::Db>,
         code: &str,
     ) -> Result<ScriptResult> {
-        let (result, _env, _preprocessed) = self.execute_script_cached(None, available_inputs, db, code, &[], &[])?;
+        let (result, _env, _preprocessed) = self.execute_script_cached(None, available_inputs, db, code, &[], &[], &HashMap::new())?;
         Ok(result)
     }
 
@@ -687,22 +687,28 @@ impl SchemeEngine {
         code: &str,
         exports: &[String],
         imports: &[(String, String)],
+        hash_resolved: &HashMap<String, crate::types::Value>,
     ) -> Result<(ScriptResult, TopLevelEnvironment, String)> {
 
-        // Nodes with module imports need fresh env each time —
+        // Nodes with module or hash imports need fresh env each time —
         // R6RS library imports are static, so cached env has stale bindings.
-        let has_imports = !imports.is_empty();
+        let has_imports = !imports.is_empty() || !hash_resolved.is_empty();
         let env = if has_imports {
             self.make_env()
         } else {
             cached_env.unwrap_or_else(|| self.make_env())
         };
 
-        // Generate (import ...) statements from structured imports, prepend to code
-        let eval_code = if !imports.is_empty() {
+        // Generate (import ...) and (define ...) statements, prepend to code
+        let eval_code = if has_imports {
             let mut full = String::new();
+            // Legacy module imports
             for (canvas, module) in imports {
                 full.push_str(&format!("(import ({} {}))\n", canvas, module));
+            }
+            // Hash-resolved imports: inject as (define name value)
+            for (name, val) in hash_resolved {
+                full.push_str(&format!("(define {} {})\n", name, val.to_scheme_literal()));
             }
             full.push_str(code);
             full
@@ -993,6 +999,7 @@ mod tests {
             "(define x 5)\n(define r 0)\n(set! r (* x 2))\n(define gain (store-get \"gain\"))\n(set! r (* r gain))",
             &exports,
             &[],
+            &HashMap::new(),
         ).unwrap();
         // x=5, r=5*2=10, gain=2, r=10*2=20
         assert!(matches!(result.output_values.get("r"), Some(crate::types::Value::F64(v)) if (*v - 20.0).abs() < 1e-10));
@@ -1040,6 +1047,7 @@ mod tests {
             "(define x 7)\n(define y 3)\n(define result (* x y))",
             &exports,
             &[],
+            &HashMap::new(),
         ).unwrap();
         match result.output_values.get("result") {
             Some(crate::types::Value::F64(v)) => assert!((*v - 21.0).abs() < 1e-10),
@@ -1287,6 +1295,7 @@ mod tests {
             "(import (mylib))\n(define msg (greet \"World\"))",
             &exports,
             &[],
+            &HashMap::new(),
         );
         // Clean up
         std::fs::remove_file(&lib_file).ok();
@@ -1356,6 +1365,7 @@ mod tests {
             code,
             &exports,
             &[],
+            &HashMap::new(),
         ).unwrap();
         assert!(matches!(result.output_values.get("result"),
             Some(crate::types::Value::F64(v)) if (*v - 10.0).abs() < f64::EPSILON));

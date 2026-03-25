@@ -11,6 +11,147 @@ pub fn content_hash(code: &str) -> u64 {
     hasher.finish()
 }
 
+/// Kind of Scheme definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DefForm {
+    Simple,
+    Function,
+    Syntax,
+    RecordType,
+}
+
+/// Per-definition info: name, content hash (Unison-style, body only), source line.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefInfo {
+    pub name: String,
+    pub hash: u64,
+    pub line: u32,
+    pub form: DefForm,
+}
+
+/// Hash-based import: references a definition by its content hash.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HashImport {
+    pub hash: String,       // hex content hash of the definition body
+    pub local_name: String, // name bound in the importing node's scope
+}
+
+/// Extract individual define forms from Scheme code.
+/// Returns DefInfo for each top-level define/define-syntax/define-record-type.
+/// Hash covers the body only (not the name) — Unison-style content addressing.
+pub fn extract_definitions(code: &str) -> Vec<DefInfo> {
+    let mut defs = Vec::new();
+    // Track byte offset → line number
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(code.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let byte_to_line = |byte_offset: usize| -> u32 {
+        match line_starts.binary_search(&byte_offset) {
+            Ok(i) => (i + 1) as u32,
+            Err(i) => i as u32,
+        }
+    };
+
+    // Split into top-level forms with byte offsets
+    let forms = split_toplevel_forms_with_offsets(code);
+
+    for (offset, form) in forms {
+        let trimmed = form.trim();
+        if let Some(def) = parse_define(trimmed) {
+            defs.push(DefInfo {
+                name: def.0,
+                hash: crate::sexp::canonical_hash_str(def.1),
+                line: byte_to_line(offset),
+                form: def.2,
+            });
+        }
+    }
+    defs
+}
+
+/// Split code into top-level S-expressions, returning (byte_offset, form_string).
+pub fn split_toplevel_forms_with_offsets(code: &str) -> Vec<(usize, String)> {
+    let mut forms = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = None;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut in_line_comment = false;
+
+    for (i, c) in code.char_indices() {
+        if in_line_comment {
+            if c == '\n' { in_line_comment = false; }
+            continue;
+        }
+        if escape { escape = false; continue; }
+        if c == '\\' && in_string { escape = true; continue; }
+        if c == '"' { in_string = !in_string; continue; }
+        if in_string { continue; }
+        if c == ';' { in_line_comment = true; continue; }
+
+        if c == '(' {
+            if depth == 0 { start = Some(i); }
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+            if depth == 0 {
+                if let Some(s) = start {
+                    forms.push((s, code[s..=i].to_string()));
+                    start = None;
+                }
+            }
+        }
+    }
+    forms
+}
+
+/// Parse a single top-level form. Returns (name, body_for_hashing, form_kind) if it's a define.
+pub fn parse_define(form: &str) -> Option<(String, &str, DefForm)> {
+    let inner = form.strip_prefix('(')?.strip_suffix(')')?;
+    let trimmed = inner.trim_start();
+
+    if let Some(rest) = trimmed.strip_prefix("define-record-type") {
+        let rest = rest.trim_start();
+        let name = rest.split_whitespace().next().unwrap_or("").to_string();
+        // Hash everything after "define-record-type"
+        let body_start = form.find("define-record-type").unwrap() + "define-record-type".len();
+        return Some((name, &form[body_start..], DefForm::RecordType));
+    }
+    if let Some(rest) = trimmed.strip_prefix("define-syntax") {
+        let rest = rest.trim_start();
+        let name = rest.split_whitespace().next().unwrap_or("").to_string();
+        let body_start = form.find("define-syntax").unwrap() + "define-syntax".len();
+        return Some((name, &form[body_start..], DefForm::Syntax));
+    }
+    if let Some(rest) = trimmed.strip_prefix("define") {
+        let rest = rest.trim_start();
+        if rest.starts_with('(') {
+            // (define (f x y) body...) — function form
+            // Find the closing paren of the parameter list
+            let mut depth = 0;
+            let mut param_end = 0;
+            for (i, c) in rest.char_indices() {
+                if c == '(' { depth += 1; }
+                if c == ')' { depth -= 1; if depth == 0 { param_end = i; break; } }
+            }
+            // Name is the first symbol inside parens
+            let params = &rest[1..param_end];
+            let name = params.split_whitespace().next().unwrap_or("").to_string();
+            // Body = everything after the param list (hash includes params minus name)
+            let body = &rest[param_end + 1..];
+            return Some((name, body, DefForm::Function));
+        } else {
+            // (define x body...) — simple form
+            let name = rest.split_whitespace().next().unwrap_or("").to_string();
+            // Body = everything after name
+            let name_end = rest.find(&name).unwrap() + name.len();
+            let body = &rest[name_end..];
+            return Some((name, body, DefForm::Simple));
+        }
+    }
+    None
+}
+
 // Re-export from net crate
 pub use wasm_canvas_net::{Value, RepaintSignal, NoRepaint};
 
@@ -134,9 +275,15 @@ pub struct Node {
     /// Module exports declared by this node (e.g. ["gain", "freq"])
     #[serde(default)]
     pub exports: Vec<String>,
-    /// Module imports: (canvas_name, module_name) pairs
+    /// Module imports: (canvas_name, module_name) pairs (legacy)
     #[serde(default)]
     pub imports: Vec<(String, String)>,
+    /// Hash-based imports: individual definitions by content hash
+    #[serde(default)]
+    pub hash_imports: Vec<HashImport>,
+    /// Per-definition content hashes (Unison-style)
+    #[serde(default)]
+    pub definitions: Vec<DefInfo>,
     /// Content hash of script_code — same code = same hash regardless of name/position
     #[serde(skip)]
     pub code_hash: u64,
@@ -172,15 +319,17 @@ impl Node {
         }
     }
 
-    /// Update script_code and recompute content hash.
+    /// Update script_code and recompute content hash + per-definition hashes.
     pub fn set_code(&mut self, code: String) {
         self.code_hash = content_hash(&code);
+        self.definitions = extract_definitions(&code);
         self.script_code = code;
     }
 
-    /// Recompute code_hash from current script_code.
+    /// Recompute code_hash and definitions from current script_code.
     pub fn recompute_hash(&mut self) {
         self.code_hash = content_hash(&self.script_code);
+        self.definitions = extract_definitions(&self.script_code);
     }
 }
 
@@ -246,8 +395,8 @@ impl Graph {
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
             exports: Vec::new(),
-            imports: Vec::new(),
-            code_hash: 0,
+            imports: Vec::new(), hash_imports: Vec::new(),
+            definitions: Vec::new(), code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -518,8 +667,8 @@ mod tests {
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
             exports: Vec::new(),
-            imports: Vec::new(),
-            code_hash: 0,
+            imports: Vec::new(), hash_imports: Vec::new(),
+            definitions: Vec::new(), code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -542,8 +691,8 @@ mod tests {
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
             exports: Vec::new(),
-            imports: Vec::new(),
-            code_hash: 0,
+            imports: Vec::new(), hash_imports: Vec::new(),
+            definitions: Vec::new(), code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -1027,7 +1176,7 @@ mod tests {
         let exports = vec!["result".to_string()];
         let imports = vec![("alice".to_string(), "controls".to_string())];
         let inputs = HashMap::new();
-        let (result, _, _) = engine.execute_script_cached(None, &inputs, None, code, &exports, &imports).unwrap();
+        let (result, _, _) = engine.execute_script_cached(None, &inputs, None, code, &exports, &imports, &HashMap::new()).unwrap();
         // gain=50 from library, result=50*2=100
         match result.output_values.get("result") {
             Some(Value::F64(v)) => assert!((*v - 100.0).abs() < f64::EPSILON),
@@ -1172,5 +1321,78 @@ mod tests {
         assert_eq!(node.exports, vec!["sound".to_string()]);
         assert_eq!(node.label, "synth");
         assert!(!node.phantom);
+    }
+
+    // --- extract_definitions tests ---
+
+    #[test]
+    fn test_extract_simple_define() {
+        let defs = extract_definitions("(define x 42)");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "x");
+        assert_eq!(defs[0].form, DefForm::Simple);
+        assert_eq!(defs[0].line, 1);
+    }
+
+    #[test]
+    fn test_extract_function_define() {
+        let defs = extract_definitions("(define (square x) (* x x))");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "square");
+        assert_eq!(defs[0].form, DefForm::Function);
+    }
+
+    #[test]
+    fn test_extract_multiple_defines() {
+        let code = "(define a 1)\n(define b 2)\n(define (f x) x)";
+        let defs = extract_definitions(code);
+        assert_eq!(defs.len(), 3);
+        assert_eq!(defs[0].name, "a");
+        assert_eq!(defs[0].line, 1);
+        assert_eq!(defs[1].name, "b");
+        assert_eq!(defs[1].line, 2);
+        assert_eq!(defs[2].name, "f");
+        assert_eq!(defs[2].line, 3);
+        assert_eq!(defs[2].form, DefForm::Function);
+    }
+
+    #[test]
+    fn test_extract_skips_non_defines() {
+        let code = "(import (rnrs))\n(define x 1)\n(display x)";
+        let defs = extract_definitions(code);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "x");
+    }
+
+    #[test]
+    fn test_extract_define_syntax() {
+        let code = "(define-syntax my-macro\n  (syntax-rules () ((my-macro x) x)))";
+        let defs = extract_definitions(code);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "my-macro");
+        assert_eq!(defs[0].form, DefForm::Syntax);
+    }
+
+    #[test]
+    fn test_same_body_same_hash() {
+        let defs1 = extract_definitions("(define a (* 2 3))");
+        let defs2 = extract_definitions("(define b (* 2 3))");
+        assert_eq!(defs1[0].hash, defs2[0].hash, "Same body should produce same hash regardless of name");
+    }
+
+    #[test]
+    fn test_different_body_different_hash() {
+        let defs1 = extract_definitions("(define x 1)");
+        let defs2 = extract_definitions("(define x 2)");
+        assert_ne!(defs1[0].hash, defs2[0].hash);
+    }
+
+    #[test]
+    fn test_set_code_populates_definitions() {
+        let mut node = make_node(1, "test", "(define foo 42)\n(define (bar x) x)");
+        node.set_code("(define foo 42)\n(define (bar x) x)".to_string());
+        assert_eq!(node.definitions.len(), 2);
+        assert_eq!(node.definitions[0].name, "foo");
+        assert_eq!(node.definitions[1].name, "bar");
     }
 }

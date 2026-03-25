@@ -144,6 +144,8 @@ struct ActorMsg {
     node: crate::types::Node,
     template: Option<NodeTemplate>,
     available_inputs: HashMap<String, Value>,
+    /// Pre-resolved hash imports: local_name → value
+    hash_resolved: HashMap<String, Value>,
     db: Db,
     immediate: bool,
     fast_message_path: bool,
@@ -284,9 +286,10 @@ impl ActorRuntime {
         node: crate::types::Node,
         template: Option<NodeTemplate>,
         available_inputs: HashMap<String, Value>,
+        hash_resolved: HashMap<String, Value>,
         db: Db,
     ) {
-        self.enqueue(node_id, node, template, available_inputs, db, true);
+        self.enqueue(node_id, node, template, available_inputs, hash_resolved, db, true);
     }
 
     /// Compute a node with debounce (for slider/widget user interaction).
@@ -296,9 +299,10 @@ impl ActorRuntime {
         node: crate::types::Node,
         template: Option<NodeTemplate>,
         available_inputs: HashMap<String, Value>,
+        hash_resolved: HashMap<String, Value>,
         db: Db,
     ) {
-        self.enqueue(node_id, node, template, available_inputs, db, false);
+        self.enqueue(node_id, node, template, available_inputs, hash_resolved, db, false);
     }
 
     fn enqueue(
@@ -307,6 +311,7 @@ impl ActorRuntime {
         node: crate::types::Node,
         template: Option<NodeTemplate>,
         available_inputs: HashMap<String, Value>,
+        hash_resolved: HashMap<String, Value>,
         db: Db,
         immediate: bool,
     ) {
@@ -314,7 +319,7 @@ impl ActorRuntime {
         let fast_message_path = self.should_fast_path(node_id, &node);
 
         let msg = ActorMsg {
-            node, template, available_inputs, db,
+            node, template, available_inputs, hash_resolved, db,
             immediate, fast_message_path,
         };
 
@@ -583,7 +588,7 @@ fn execute_on_thread(
             let result = with_actor_context(&mut ctx, || {
                 engine.execute_script_cached(
                     cached_env, &msg.available_inputs, Some(&msg.db), code,
-                    &msg.node.exports, &msg.node.imports,
+                    &msg.node.exports, &msg.node.imports, &msg.hash_resolved,
                 )
             });
 

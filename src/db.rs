@@ -179,6 +179,124 @@ impl Db {
             .collect()
     }
 
+    // --- Definition name registry (Unison-style name DB) ---
+
+    /// Register a definition in the name database.
+    /// Old entries for the same canvas+node+name are marked superseded (not deleted).
+    pub fn register_def(&self, hash: &str, name: &str, canvas: &str, node_label: &str, form: &str) {
+        let esc = |s: &str| Self::escape_surql(s);
+        // Mark previous entries as superseded (immutable history)
+        let _ = self.run(&format!(
+            "UPDATE def_names SET superseded = true WHERE canvas = '{}' AND node_label = '{}' AND name = '{}' AND superseded = false",
+            esc(canvas), esc(node_label), esc(name)
+        ));
+        // Check if this exact hash+name+canvas+node already exists (avoid duplicates)
+        let existing = self.query(&format!(
+            "SELECT * FROM def_names WHERE hash = '{}' AND name = '{}' AND canvas = '{}' AND node_label = '{}' AND superseded = false",
+            esc(hash), esc(name), esc(canvas), esc(node_label)
+        )).unwrap_or_default();
+        if existing.is_empty() {
+            let _ = self.run(&format!(
+                "CREATE def_names SET hash = '{}', name = '{}', canvas = '{}', node_label = '{}', form = '{}', superseded = false",
+                esc(hash), esc(name), esc(canvas), esc(node_label), esc(form)
+            ));
+        }
+    }
+
+    /// Look up all current (non-superseded) names/locations for a given content hash.
+    pub fn lookup_by_hash(&self, hash: &str) -> Vec<NameEntry> {
+        self.query(&format!(
+            "SELECT * FROM def_names WHERE hash = '{}' AND superseded = false",
+            Self::escape_surql(hash)
+        ))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(NameEntry::from_json)
+        .collect()
+    }
+
+    /// Look up the first name/location for a given content hash.
+    pub fn lookup_by_hash_first(&self, hash: &str) -> Option<NameEntry> {
+        self.lookup_by_hash(hash).into_iter().next()
+    }
+
+    /// Look up current definition by name within a canvas.
+    pub fn lookup_by_name(&self, name: &str, canvas: &str) -> Option<NameEntry> {
+        self.query(&format!(
+            "SELECT * FROM def_names WHERE name = '{}' AND canvas = '{}' AND superseded = false",
+            Self::escape_surql(name),
+            Self::escape_surql(canvas)
+        ))
+        .ok()?
+        .into_iter()
+        .find_map(NameEntry::from_json)
+    }
+
+    /// Get all current definitions for a canvas.
+    pub fn all_definitions(&self, canvas: &str) -> Vec<NameEntry> {
+        self.query(&format!(
+            "SELECT * FROM def_names WHERE canvas = '{}' AND superseded = false",
+            Self::escape_surql(canvas)
+        ))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(NameEntry::from_json)
+        .collect()
+    }
+
+    /// Mark all definitions for a node as superseded (before re-registering after code change).
+    pub fn clear_node_defs(&self, canvas: &str, node_label: &str) {
+        let _ = self.run(&format!(
+            "UPDATE def_names SET superseded = true WHERE canvas = '{}' AND node_label = '{}' AND superseded = false",
+            Self::escape_surql(canvas),
+            Self::escape_surql(node_label)
+        ));
+    }
+
+    /// Rename a definition in the Name DB: update the name for a given hash.
+    pub fn rename_def(&self, hash: &str, old_name: &str, new_name: &str, canvas: &str) {
+        let esc = |s: &str| Self::escape_surql(s);
+        let _ = self.run(&format!(
+            "UPDATE def_names SET name = '{}' WHERE hash = '{}' AND name = '{}' AND canvas = '{}' AND superseded = false",
+            esc(new_name), esc(hash), esc(old_name), esc(canvas)
+        ));
+    }
+
+    /// Get full history of a definition by name (all versions, including superseded).
+    /// Returns entries ordered with current first, then superseded.
+    pub fn def_history(&self, name: &str, canvas: &str) -> Vec<NameEntry> {
+        self.query(&format!(
+            "SELECT * FROM def_names WHERE name = '{}' AND canvas = '{}' ORDER BY superseded ASC",
+            Self::escape_surql(name),
+            Self::escape_surql(canvas)
+        ))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(NameEntry::from_json)
+        .collect()
+    }
+}
+
+/// Entry in the definition name database.
+#[derive(Debug, Clone)]
+pub struct NameEntry {
+    pub hash: String,
+    pub name: String,
+    pub canvas: String,
+    pub node_label: String,
+    pub form: String,
+}
+
+impl NameEntry {
+    fn from_json(v: JsonValue) -> Option<Self> {
+        Some(NameEntry {
+            hash: v.get("hash")?.as_str()?.to_string(),
+            name: v.get("name")?.as_str()?.to_string(),
+            canvas: v.get("canvas")?.as_str()?.to_string(),
+            node_label: v.get("node_label")?.as_str()?.to_string(),
+            form: v.get("form")?.as_str()?.to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -404,5 +522,119 @@ mod tests {
 
         db1.kv_set("shared", json!("yes"));
         assert_eq!(db2.kv_get("shared"), Some(json!("yes")));
+    }
+
+    // --- Name DB ---
+
+    #[test]
+    fn test_register_and_lookup_by_hash() {
+        let db = fresh_db();
+        db.register_def("abc123", "gain", "main", "controls", "Simple");
+        let entries = db.lookup_by_hash("abc123");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "gain");
+        assert_eq!(entries[0].canvas, "main");
+        assert_eq!(entries[0].node_label, "controls");
+    }
+
+    #[test]
+    fn test_lookup_by_name() {
+        let db = fresh_db();
+        db.register_def("def456", "freq", "main", "controls", "Simple");
+        let entry = db.lookup_by_name("freq", "main").unwrap();
+        assert_eq!(entry.hash, "def456");
+        assert_eq!(entry.form, "Simple");
+    }
+
+    #[test]
+    fn test_same_hash_different_names() {
+        let db = fresh_db();
+        db.register_def("same_hash", "a", "main", "node1", "Simple");
+        db.register_def("same_hash", "b", "main", "node2", "Simple");
+        let entries = db.lookup_by_hash("same_hash");
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn test_all_definitions() {
+        let db = fresh_db();
+        db.register_def("h1", "x", "main", "n1", "Simple");
+        db.register_def("h2", "y", "main", "n2", "Function");
+        db.register_def("h3", "z", "other", "n3", "Simple");
+        let defs = db.all_definitions("main");
+        assert_eq!(defs.len(), 2);
+    }
+
+    #[test]
+    fn test_clear_node_defs() {
+        let db = fresh_db();
+        db.register_def("h1", "a", "main", "controls", "Simple");
+        db.register_def("h2", "b", "main", "controls", "Function");
+        db.register_def("h3", "c", "main", "synth", "Simple");
+        db.clear_node_defs("main", "controls");
+        let defs = db.all_definitions("main");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "c");
+    }
+
+    #[test]
+    fn test_register_overwrites_same_name() {
+        let db = fresh_db();
+        db.register_def("old_hash", "x", "main", "n1", "Simple");
+        db.register_def("new_hash", "x", "main", "n1", "Simple");
+        let entry = db.lookup_by_name("x", "main").unwrap();
+        assert_eq!(entry.hash, "new_hash");
+    }
+
+    #[test]
+    fn test_name_db_survives_export_import() {
+        let db1 = fresh_db();
+        db1.register_def("h1", "gain", "main", "controls", "Simple");
+        let dump = db1.export().unwrap();
+
+        let db2 = fresh_db();
+        db2.import(&dump).unwrap();
+        let entry = db2.lookup_by_name("gain", "main").unwrap();
+        assert_eq!(entry.hash, "h1");
+    }
+
+    #[test]
+    fn test_immutable_history() {
+        let db = fresh_db();
+        // Version 1
+        db.register_def("hash_v1", "x", "main", "n1", "Simple");
+        assert_eq!(db.lookup_by_name("x", "main").unwrap().hash, "hash_v1");
+
+        // Version 2: old entry becomes superseded, not deleted
+        db.register_def("hash_v2", "x", "main", "n1", "Simple");
+        assert_eq!(db.lookup_by_name("x", "main").unwrap().hash, "hash_v2");
+
+        // History shows both versions
+        let history = db.def_history("x", "main");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].hash, "hash_v2"); // current first
+        assert_eq!(history[1].hash, "hash_v1"); // superseded second
+
+        // Version 3
+        db.register_def("hash_v3", "x", "main", "n1", "Simple");
+        let history = db.def_history("x", "main");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].hash, "hash_v3");
+    }
+
+    #[test]
+    fn test_clear_node_defs_preserves_history() {
+        let db = fresh_db();
+        db.register_def("h1", "a", "main", "controls", "Simple");
+        db.register_def("h2", "b", "main", "controls", "Function");
+
+        // clear marks as superseded, not deleted
+        db.clear_node_defs("main", "controls");
+        assert!(db.all_definitions("main").is_empty()); // no current defs
+
+        // But history preserved
+        let hist_a = db.def_history("a", "main");
+        assert_eq!(hist_a.len(), 1);
+        assert_eq!(hist_a[0].hash, "h1");
     }
 }

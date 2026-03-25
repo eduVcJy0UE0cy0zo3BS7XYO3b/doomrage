@@ -23,6 +23,11 @@
   (cond
    ((stringp obj) (format "%d:%s" (string-bytes obj) obj))
    ((integerp obj) (format "i%de" obj))
+   ((vectorp obj)
+    ;; Vector = list (use vectors to force list encoding)
+    (concat "l"
+            (mapconcat #'canvas--bencode-encode (append obj nil) "")
+            "e"))
    ((listp obj)
     (if (and (consp (car obj)) (stringp (caar obj)))
         ;; Alist = dict
@@ -304,22 +309,188 @@
   (interactive)
   (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
   (let* ((symbol (thing-at-point 'symbol t))
-         (responses (canvas--sync-request "info" "symbol" (or symbol "")))
+         (responses (apply #'canvas--sync-request "info" "symbol" (or symbol "")
+                          (when canvas--current-ns (list "ns" canvas--current-ns))))
          (resp (car (last responses)))
          (name (cdr (assoc "name" resp)))
          (ns (cdr (assoc "ns" resp)))
          (file (cdr (assoc "file" resp)))
+         (line (cdr (assoc "line" resp)))
+         (hash (cdr (assoc "hash" resp)))
          (doc (cdr (assoc "doc" resp))))
     (if (not name)
         (message "No info for '%s'" symbol)
       (if (and current-prefix-arg file (file-exists-p file))
-          ;; With prefix arg: jump to file
-          (find-file file)
+          ;; With prefix arg: jump to definition
+          (progn
+            (find-file file)
+            (when line (goto-char (point-min)) (forward-line (1- line))))
         ;; Without: show info in minibuffer
-        (message "%s%s%s"
+        (message "%s%s%s%s"
                  (if ns (format "[%s] " ns) "")
                  name
+                 (if hash (format " #%s" hash) "")
                  (if doc (format " -- %s" doc) ""))))))
+
+;;;###autoload
+(defun canvas-create-node (canvas label)
+  "Create a new Script node and open its .scm file."
+  (interactive (list (read-string "Canvas: " "default")
+                     (read-string "Node label: ")))
+  (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
+  (let ((resp (car (last (canvas--sync-request "create-node"
+                                               "canvas" canvas
+                                               "label" label
+                                               "code" ""
+                                               "exports" '()
+                                               )))))
+    (if (not (canvas--ok-p resp))
+        (message "Error: %s" (cdr (assoc "ex" resp)))
+      (let ((file (expand-file-name
+                   (format "~/.canvas/nodes/%s/%s.scm" canvas (replace-regexp-in-string " " "-" label)))))
+        (find-file file)
+        (canvas--send-op "switch-ns" "ns" (format "%s/%s" canvas (replace-regexp-in-string " " "-" label)))
+        (setq canvas--current-ns (format "%s/%s" canvas (replace-regexp-in-string " " "-" label)))
+        (message "Created node '%s' on canvas '%s'" label canvas)))))
+
+(defun canvas--ok-p (resp)
+  (let ((s (cdr (assoc "status" resp))))
+    (and (listp s) (member "done" s) (not (member "error" s)))))
+
+;;;###autoload
+(defun canvas-delete-node (canvas label)
+  "Delete a node from the canvas."
+  (interactive
+   (let* ((canvas (read-string "Canvas: " "default"))
+          (label (read-string "Node label: ")))
+     (list canvas label)))
+  (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
+  (when (yes-or-no-p (format "Delete node '%s' from '%s'?" label canvas))
+    (let ((resp (car (last (canvas--sync-request "delete-node" "canvas" canvas "label" label)))))
+      (if (canvas--ok-p resp)
+          (message "Deleted node '%s'" label)
+        (message "Error: %s" (cdr (assoc "ex" resp)))))))
+
+;;;###autoload
+(defun canvas-set-exports (exports-str)
+  "Set exports for the current node. EXPORTS is a space-separated list of names."
+  (interactive "sExports (space-separated): ")
+  (unless canvas--session (error "Not connected"))
+  (unless canvas--current-ns (error "Not in a node namespace. Use M-x canvas-switch-ns"))
+  (let* ((parts (split-string canvas--current-ns "/"))
+         (canvas (car parts))
+         (label (cadr parts))
+         (exports (split-string exports-str)))
+    (let ((resp (car (last (canvas--sync-request "update-node"
+                                                 "canvas" canvas
+                                                 "label" label
+                                                 "exports" exports)))))
+      (if (canvas--ok-p resp)
+          (message "Exports set: %s" exports-str)
+        (message "Error: %s" (cdr (assoc "ex" resp)))))))
+
+;;;###autoload
+(defun canvas-compute ()
+  "Compute the current node."
+  (interactive)
+  (unless canvas--session (error "Not connected"))
+  (unless canvas--current-ns (error "Not in a node namespace. Use M-x canvas-switch-ns"))
+  (let* ((parts (split-string canvas--current-ns "/"))
+         (canvas (car parts))
+         (label (cadr parts)))
+    ;; Save buffer first if visiting the .scm file
+    (when (and buffer-file-name (buffer-modified-p))
+      (save-buffer)
+      (canvas-load-file))
+    (let ((resp (car (last (canvas--sync-request "compute" "canvas" canvas "label" label)))))
+      (if (canvas--ok-p resp)
+          (message "Computing '%s'..." label)
+        (message "Error: %s" (cdr (assoc "ex" resp)))))))
+
+;;;###autoload
+(defun canvas-node-state ()
+  "Show the current node's state: exports, imports, outputs, errors."
+  (interactive)
+  (unless canvas--session (error "Not connected"))
+  (unless canvas--current-ns (error "Not in a node namespace"))
+  (let* ((parts (split-string canvas--current-ns "/"))
+         (canvas (car parts))
+         (label (cadr parts))
+         (resp (car (last (canvas--sync-request "node-state" "canvas" canvas "label" label)))))
+    (if (not (canvas--ok-p resp))
+        (message "Error: %s" (cdr (assoc "ex" resp)))
+      (with-current-buffer (get-buffer-create "*canvas-node*")
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (format "Node: %s/%s\n\n" canvas label))
+          ;; Error
+          (when-let ((err (cdr (assoc "error" resp))))
+            (insert (propertize (format "ERROR: %s\n\n" err) 'face 'error)))
+          ;; Exports
+          (let ((exports (cdr (assoc "exports" resp))))
+            (insert (format "Exports: %s\n" (if exports (mapconcat #'identity exports " ") "(none)"))))
+          ;; Hash imports
+          (let ((his (cdr (assoc "hash-imports" resp))))
+            (insert (format "Hash imports: %d\n" (length his)))
+            (dolist (hi his)
+              (insert (format "  %s <- #%s\n"
+                              (cdr (assoc "name" hi))
+                              (substring (cdr (assoc "hash" hi)) 0 12)))))
+          ;; Legacy imports
+          (let ((imports (cdr (assoc "imports" resp))))
+            (when (> (length imports) 0)
+              (insert (format "Legacy imports: %d\n" (length imports)))
+              (dolist (imp imports)
+                (insert (format "  (%s %s)\n" (car imp) (cadr imp))))))
+          ;; Outputs
+          (let ((outputs (cdr (assoc "outputs" resp))))
+            (insert "\nOutputs:\n")
+            (if outputs
+                (dolist (pair outputs)
+                  (insert (format "  %s = %s\n" (car pair) (cdr pair))))
+              (insert "  (none)\n"))))
+        (goto-char (point-min))
+        (special-mode)
+        (display-buffer (current-buffer))))))
+
+;;;###autoload
+(defun canvas-add-import ()
+  "Interactively add a hash import: pick from available definitions."
+  (interactive)
+  (unless canvas--session (error "Not connected"))
+  (unless canvas--current-ns (error "Not in a node namespace"))
+  (let* ((parts (split-string canvas--current-ns "/"))
+         (canvas (car parts))
+         (label (cadr parts))
+         ;; Get all defs
+         (defs-resp (car (last (canvas--sync-request "defs" "canvas" canvas))))
+         (defs (cdr (assoc "defs" defs-resp))))
+    (if (or (null defs) (= (length defs) 0))
+        (message "No definitions available on canvas '%s'" canvas)
+      ;; Build completion candidates: "name (from node) #hash"
+      (let* ((candidates (mapcar (lambda (d)
+                                   (let ((name (cdr (assoc "name" d)))
+                                         (node (cdr (assoc "node" d)))
+                                         (hash (cdr (assoc "hash" d))))
+                                     (cons (format "%s  (from %s)  #%s" name node (substring hash 0 12))
+                                           d)))
+                                 defs))
+             (choice (completing-read "Import definition: " candidates nil t))
+             (entry (cdr (assoc choice candidates)))
+             (hash (cdr (assoc "hash" entry)))
+             (name (cdr (assoc "name" entry)))
+             (local-name (read-string "Local name: " name)))
+        (let ((resp (car (last (canvas--sync-request "add-hash-import"
+                                                     "canvas" canvas
+                                                     "label" label
+                                                     "hash" hash
+                                                     "local-name" local-name)))))
+          (if (canvas--ok-p resp)
+              (progn
+                (message "Imported '%s' as '%s'" name local-name)
+                (when (and buffer-file-name (file-exists-p buffer-file-name))
+                  (revert-buffer t t t)))
+            (message "Error: %s" (cdr (assoc "ex" resp)))))))))
 
 ;;;###autoload
 (defun canvas-repl ()
@@ -336,6 +507,192 @@
         (insert (propertize (concat "> " code "\n") 'face 'font-lock-comment-face)))
       (canvas-eval code))))
 
+;;;###autoload
+(defun canvas-list-defs (canvas)
+  "List all content-addressed definitions for CANVAS."
+  (interactive (list (read-string "Canvas: " "main")))
+  (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
+  (let* ((responses (canvas--sync-request "defs" "canvas" canvas))
+         (resp (car (last responses)))
+         (defs (cdr (assoc "defs" resp))))
+    (if (or (null defs) (= (length defs) 0))
+        (message "No definitions for canvas '%s'" canvas)
+      (with-current-buffer (get-buffer-create "*canvas-defs*")
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (format "Definitions for canvas '%s':\n\n" canvas))
+          (insert (format "%-20s %-18s %-15s %s\n" "NAME" "HASH" "NODE" "FORM"))
+          (insert (make-string 70 ?-) "\n")
+          (dolist (def defs)
+            (let ((name (cdr (assoc "name" def)))
+                  (hash (cdr (assoc "hash" def)))
+                  (node (cdr (assoc "node" def)))
+                  (form (cdr (assoc "form" def))))
+              (insert (format "%-20s %-18s %-15s %s\n" name hash node form)))))
+        (goto-char (point-min))
+        (special-mode)
+        (display-buffer (current-buffer))))))
+
+;;;###autoload
+(defun canvas-def-source (hash)
+  "Show canonical source of a definition by its content HASH."
+  (interactive "sHash: ")
+  (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
+  (let* ((responses (canvas--sync-request "def-source" "hash" hash))
+         (resp (car (last responses)))
+         (source (cdr (assoc "source" resp))))
+    (if source
+        (with-current-buffer (get-buffer-create (format "*def:%s*" (substring hash 0 (min 8 (length hash)))))
+          (let ((inhibit-read-only t))
+            (erase-buffer)
+            (insert source))
+          (scheme-mode)
+          (goto-char (point-min))
+          (display-buffer (current-buffer)))
+      (message "No source found for hash %s" hash))))
+
+;;;###autoload
+(defun canvas-def-history (name canvas)
+  "Show version history of definition NAME on CANVAS."
+  (interactive (list (read-string "Definition name: " (thing-at-point 'symbol t))
+                     (read-string "Canvas: " "main")))
+  (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
+  (let* ((responses (canvas--sync-request "def-history" "name" name "canvas" canvas))
+         (resp (car (last responses)))
+         (history (cdr (assoc "history" resp))))
+    (if (or (null history) (= (length history) 0))
+        (message "No history for '%s'" name)
+      (with-current-buffer (get-buffer-create "*canvas-history*")
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (format "History of '%s' on canvas '%s':\n\n" name canvas))
+          (insert (format "%-4s %-18s %-15s %s\n" "#" "HASH" "NODE" "FORM"))
+          (insert (make-string 55 ?-) "\n")
+          (let ((i 0))
+            (dolist (entry history)
+              (let ((hash (cdr (assoc "hash" entry)))
+                    (node (cdr (assoc "node" entry)))
+                    (form (cdr (assoc "form" entry))))
+                (insert (format "%-4d %-18s %-15s %s\n"
+                                i hash node form))
+                (setq i (1+ i))))))
+        (goto-char (point-min))
+        (special-mode)
+        (display-buffer (current-buffer))))))
+
+;;;###autoload
+(defun canvas-def-diff (hash-a hash-b)
+  "Show structural diff between two definitions by their content hashes."
+  (interactive "sHash A: \nsHash B: ")
+  (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
+  (let* ((responses (canvas--sync-request "def-diff" "hash-a" hash-a "hash-b" hash-b))
+         (resp (car (last responses)))
+         (diff (cdr (assoc "diff" resp))))
+    (if diff
+        (with-current-buffer (get-buffer-create "*canvas-diff*")
+          (let ((inhibit-read-only t))
+            (erase-buffer)
+            (insert (format "Diff: %s..  %s..\n\n"
+                            (substring hash-a 0 (min 12 (length hash-a)))
+                            (substring hash-b 0 (min 12 (length hash-b)))))
+            (insert diff)
+            ;; Colorize diff
+            (goto-char (point-min))
+            (while (re-search-forward "^\\(- .*\\)$" nil t)
+              (put-text-property (match-beginning 1) (match-end 1) 'face '(:foreground "red")))
+            (goto-char (point-min))
+            (while (re-search-forward "^\\(\\+ .*\\)$" nil t)
+              (put-text-property (match-beginning 1) (match-end 1) 'face '(:foreground "green"))))
+          (goto-char (point-min))
+          (special-mode)
+          (display-buffer (current-buffer)))
+      (message "Could not diff (missing source for one or both hashes)"))))
+
+;;;###autoload
+(defun canvas-migrate-imports (canvas label)
+  "Migrate legacy module imports to hash-based imports for a node."
+  (interactive (list (read-string "Canvas: " "main")
+                     (read-string "Node label: ")))
+  (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
+  (let* ((responses (canvas--sync-request "migrate-imports" "canvas" canvas "label" label))
+         (resp (car (last responses)))
+         (migrated (cdr (assoc "migrated" resp)))
+         (status (cdr (assoc "status" resp))))
+    (if (member "error" status)
+        (message "Error: %s" (cdr (assoc "ex" resp)))
+      (message "Migrated %d imports to hash-based" (length migrated)))))
+
+;;;###autoload
+(defun canvas-rename-def (old-name new-name canvas)
+  "Rename a definition across the canvas.
+Updates source code, exports, Name DB, and all hash_imports in consumers."
+  (interactive
+   (let* ((sym (thing-at-point 'symbol t))
+          (old (read-string "Old name: " sym))
+          (new (read-string (format "Rename '%s' to: " old)))
+          (canvas (read-string "Canvas: " "main")))
+     (list old new canvas)))
+  (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
+  (let* ((responses (canvas--sync-request "rename-def"
+                                          "canvas" canvas
+                                          "old-name" old-name
+                                          "new-name" new-name))
+         (resp (car (last responses)))
+         (status (cdr (assoc "status" resp))))
+    (if (member "error" status)
+        (message "Error: %s" (cdr (assoc "ex" resp)))
+      (let ((updated (cdr (assoc "updated" resp))))
+        (message "Renamed '%s' → '%s' (%s nodes updated)" old-name new-name updated)
+        ;; Revert buffer if visiting a .scm file that may have changed
+        (when buffer-file-name
+          (revert-buffer t t t))))))
+
+;;;###autoload
+(defun canvas-add-hash-import (canvas label hash local-name)
+  "Add a hash-based import to a node.
+Import definition HASH as LOCAL-NAME into node LABEL on CANVAS."
+  (interactive
+   (let* ((canvas (read-string "Canvas: " "main"))
+          (label (read-string "Node label: "))
+          (hash (read-string "Definition hash: "))
+          (local-name (read-string "Local name: ")))
+     (list canvas label hash local-name)))
+  (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
+  (let* ((responses (canvas--sync-request "add-hash-import"
+                                          "canvas" canvas
+                                          "label" label
+                                          "hash" hash
+                                          "local-name" local-name))
+         (resp (car (last responses)))
+         (status (cdr (assoc "status" resp))))
+    (if (member "error" status)
+        (message "Error: %s" (cdr (assoc "ex" resp)))
+      (message "Added hash import: %s -> %s" (substring hash 0 (min 16 (length hash))) local-name))))
+
+;; Pretty-print hash import pragmas: resolve hashes to human-readable names
+(defun canvas--prettify-hash-imports ()
+  "Add overlays to ;;; @import lines showing resolved names."
+  (when (and canvas--session buffer-file-name)
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward "^;;; @import \\([0-9a-f]+\\) \\(\\S-+\\)" nil t)
+        (let* ((hash (match-string 1))
+               (local-name (match-string 2))
+               (responses (ignore-errors
+                            (canvas--sync-request "def-source" "hash" hash)))
+               (resp (and responses (car (last responses))))
+               (source (and resp (cdr (assoc "source" resp))))
+               (ov (make-overlay (match-beginning 0) (match-end 0))))
+          (overlay-put ov 'canvas-hash-import t)
+          (when source
+            (overlay-put ov 'after-string
+                         (propertize (format "  ; %s" (truncate-string-to-width source 40))
+                                     'face 'font-lock-comment-face))))))))
+
+(defun canvas--clear-hash-import-overlays ()
+  "Remove hash import overlays."
+  (remove-overlays (point-min) (point-max) 'canvas-hash-import t))
+
 ;; --- Minor mode ---
 
 (defvar canvas-mode-map
@@ -347,6 +704,14 @@
     (define-key map (kbd "C-c C-n") #'canvas-switch-ns)
     (define-key map (kbd "C-c C-d") #'canvas-info-at-point)
     (define-key map (kbd "C-c C-z") #'canvas-repl)
+    (define-key map (kbd "C-c C-c") #'canvas-compute)
+    (define-key map (kbd "C-c C-s") #'canvas-node-state)
+    (define-key map (kbd "C-c C-x e") #'canvas-set-exports)
+    (define-key map (kbd "C-c C-x i") #'canvas-add-import)
+    (define-key map (kbd "C-c C-x r") #'canvas-rename-def)
+    (define-key map (kbd "C-c C-x m") #'canvas-migrate-imports)
+    (define-key map (kbd "C-c C-x d") #'canvas-list-defs)
+    (define-key map (kbd "C-c C-x h") #'canvas-def-history)
     map))
 
 ;;;###autoload
@@ -361,7 +726,9 @@
           (when (canvas--port)
             (condition-case err
                 (canvas-connect)
-              (error (message "Canvas: %s" (error-message-string err)))))))
+              (error (message "Canvas: %s" (error-message-string err))))))
+        (canvas--prettify-hash-imports))
+    (canvas--clear-hash-import-overlays)
     (remove-hook 'completion-at-point-functions #'canvas-completions-at-point t)))
 
 ;; Auto-activate for .scm files under ~/.canvas/nodes/

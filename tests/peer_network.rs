@@ -405,3 +405,224 @@ fn test_trust_list_filters_untrusted() {
     assert!(visible_alice);
     assert!(!visible_mallory);
 }
+
+// ---------------------------------------------------------------------------
+// Full phantom node + hash import integration via GraphRuntime
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_deliver_values_creates_phantom_and_registers_library() {
+    use wasm_canvas::executor::AppResources;
+    use wasm_canvas::graph_runtime::GraphRuntime;
+    use wasm_canvas::actor::ActorRuntime;
+    use std::sync::Arc;
+    use std::collections::HashSet;
+
+    let resources = AppResources::new().expect("resources");
+    let net_handle = wasm_canvas::network::spawn_network(
+        Arc::new(NoRepaint),
+        Arc::new(std::sync::Mutex::new(wasm_canvas::ocapn::session::SessionManager::new())),
+    );
+    let registry = wasm_canvas::registry::NodeRegistry::new(std::path::PathBuf::from("/tmp/nonexistent"));
+
+    let mut runtime = GraphRuntime {
+        all_graphs: HashMap::new(),
+        actor_runtime: ActorRuntime::new(Arc::clone(&resources.scheme)),
+        pending_nodes: HashSet::new(),
+        net_handle,
+        net_values: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        user_name: String::new(),
+        registry,
+        db: resources.db.clone(),
+        peer_names: HashMap::new(),
+    };
+    runtime.all_graphs.insert("main".to_string(), Graph::new());
+
+    // Simulate receiving values from a remote peer
+    let mut values = HashMap::new();
+    values.insert("gain".to_string(), Value::F64(42.0));
+    values.insert("freq".to_string(), Value::F64(440.0));
+    values.insert("__source__".to_string(), Value::Str("(define gain 42)\n(define freq 440)".to_string()));
+
+    runtime.deliver_values("main", "alice", "controls", &values);
+
+    // Phantom node should exist
+    let graph = runtime.all_graphs.get("main").unwrap();
+    let phantom = graph.nodes.values().find(|n| n.phantom && n.label == "controls");
+    assert!(phantom.is_some(), "phantom node should be created");
+
+    let phantom = phantom.unwrap();
+    assert_eq!(phantom.output_values.get("gain"), Some(&Value::F64(42.0)));
+    assert_eq!(phantom.output_values.get("freq"), Some(&Value::F64(440.0)));
+    assert!(phantom.remote_peer.is_some());
+}
+
+#[test]
+fn test_hash_import_resolve_from_phantom_node() {
+    use wasm_canvas::graph_runtime::resolve_hash_imports;
+    use wasm_canvas::types::{HashImport, DefInfo, DefForm};
+
+    let db = wasm_canvas::db::Db::new().expect("db");
+
+    // Create a source node with definitions
+    let mut source = Node {
+        id: 1,
+        template_name: "Script".to_string(),
+        label: "controls".to_string(),
+        pos: [0.0, 0.0],
+        input_values: HashMap::new(),
+        output_values: HashMap::from([("gain".to_string(), Value::F64(42.0))]),
+        script_code: "(define gain 42)".to_string(),
+        script_inputs: Vec::new(),
+        script_outputs: Vec::new(),
+        widget_decls: Vec::new(),
+        widget_values: HashMap::new(),
+        exports: vec!["gain".to_string()],
+        imports: Vec::new(),
+        hash_imports: Vec::new(),
+        definitions: Vec::new(),
+        code_hash: 0,
+        error: None,
+        last_exec_us: None,
+        render_blocks: Vec::new(),
+        phantom: false,
+        remote_peer: None,
+    };
+    source.recompute_hash();
+
+    // Register definition in Name DB
+    let hash_hex = format!("{:016x}", source.definitions[0].hash);
+    db.register_def(&hash_hex, "gain", "main", "controls", "Simple");
+
+    // Create consumer node with hash import
+    let consumer = Node {
+        id: 2,
+        template_name: "Script".to_string(),
+        label: "synth".to_string(),
+        pos: [0.0, 0.0],
+        input_values: HashMap::new(),
+        output_values: HashMap::new(),
+        script_code: "(define result (* gain 2))".to_string(),
+        script_inputs: Vec::new(),
+        script_outputs: Vec::new(),
+        widget_decls: Vec::new(),
+        widget_values: HashMap::new(),
+        exports: vec!["result".to_string()],
+        imports: Vec::new(),
+        hash_imports: vec![HashImport {
+            hash: hash_hex.clone(),
+            local_name: "gain".to_string(),
+        }],
+        definitions: Vec::new(),
+        code_hash: 0,
+        error: None,
+        last_exec_us: None,
+        render_blocks: Vec::new(),
+        phantom: false,
+        remote_peer: None,
+    };
+
+    let mut graphs = HashMap::new();
+    let mut graph = Graph::new();
+    graph.nodes.insert(1, source);
+    graph.nodes.insert(2, consumer);
+    graphs.insert("main".to_string(), graph);
+
+    // Resolve hash imports
+    let resolved = resolve_hash_imports(&graphs["main"].nodes[&2], &graphs, &db);
+    assert_eq!(resolved.get("gain"), Some(&Value::F64(42.0)),
+        "hash import should resolve to source node's output value");
+}
+
+#[test]
+fn test_def_network_response_stores_definition() {
+    use wasm_canvas::executor::AppResources;
+    use wasm_canvas::graph_runtime::{GraphRuntime, DEF_RESPONSE_CHANNEL};
+    use wasm_canvas::actor::ActorRuntime;
+    use std::sync::Arc;
+    use std::collections::HashSet;
+
+    let resources = AppResources::new().expect("resources");
+    let net_handle = wasm_canvas::network::spawn_network(
+        Arc::new(NoRepaint),
+        Arc::new(std::sync::Mutex::new(wasm_canvas::ocapn::session::SessionManager::new())),
+    );
+    let registry = wasm_canvas::registry::NodeRegistry::new(std::path::PathBuf::from("/tmp/nonexistent"));
+
+    let mut runtime = GraphRuntime {
+        all_graphs: HashMap::new(),
+        actor_runtime: ActorRuntime::new(Arc::clone(&resources.scheme)),
+        pending_nodes: HashSet::new(),
+        net_handle,
+        net_values: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        user_name: String::new(),
+        registry,
+        db: resources.db.clone(),
+        peer_names: HashMap::new(),
+    };
+
+    // Simulate receiving a def response from the network
+    let test_hash = "00000000deadbeef";
+    let mut values = HashMap::new();
+    values.insert("hash".to_string(), Value::Str(test_hash.to_string()));
+    values.insert("body".to_string(), Value::Str("(* x 2)".to_string()));
+    values.insert("name".to_string(), Value::Str("double".to_string()));
+    values.insert("form".to_string(), Value::Str("Simple".to_string()));
+
+    let handled = runtime.handle_def_network_message(DEF_RESPONSE_CHANNEL, &values);
+    assert!(handled, "should handle def response");
+
+    // Check it was registered in Name DB
+    let entry = runtime.db.lookup_by_hash_first(test_hash);
+    assert!(entry.is_some(), "definition should be registered in Name DB");
+    let entry = entry.unwrap();
+    assert_eq!(entry.name, "double");
+    assert_eq!(entry.canvas, "__remote__");
+    assert_eq!(entry.node_label, "__network__");
+
+    // Check content-addressed storage
+    let hash_u64 = u64::from_str_radix(test_hash, 16).unwrap();
+    let body = wasm_canvas::persistence::load_definition(hash_u64);
+    assert_eq!(body, Some("(* x 2)".to_string()));
+}
+
+#[test]
+fn test_rename_identifier_in_code() {
+    use wasm_canvas::graph_runtime::rename_identifier_in_code;
+
+    // Simple rename
+    assert_eq!(
+        rename_identifier_in_code("(define result (* gain 2))", "gain", "volume"),
+        "(define result (* volume 2))"
+    );
+
+    // Don't rename inside strings
+    assert_eq!(
+        rename_identifier_in_code("(define x \"gain is here\")", "gain", "volume"),
+        "(define x \"gain is here\")"
+    );
+
+    // Don't rename partial matches
+    assert_eq!(
+        rename_identifier_in_code("(define gain-control 1)", "gain", "volume"),
+        "(define gain-control 1)"
+    );
+
+    // Rename at boundaries
+    assert_eq!(
+        rename_identifier_in_code("(+ gain)", "gain", "vol"),
+        "(+ vol)"
+    );
+
+    // Don't rename in comments
+    assert_eq!(
+        rename_identifier_in_code("; gain is old name\n(define x gain)", "gain", "vol"),
+        "; gain is old name\n(define x vol)"
+    );
+
+    // Multiple occurrences
+    assert_eq!(
+        rename_identifier_in_code("(+ gain gain)", "gain", "vol"),
+        "(+ vol vol)"
+    );
+}

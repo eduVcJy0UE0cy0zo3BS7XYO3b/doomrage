@@ -29,7 +29,8 @@ fn make_test_runtime(nodes_dir: &std::path::Path) -> (GraphRuntime, AppResources
         widget_values: HashMap::new(),
         exports: vec!["x".to_string()],
         imports: Vec::new(),
-        code_hash: 0,
+        hash_imports: Vec::new(),
+        definitions: Vec::new(), code_hash: 0,
         error: None,
         last_exec_us: None,
         render_blocks: Vec::new(),
@@ -224,7 +225,7 @@ fn full_cycle_file_change_recomputes_output() {
             script_code: None,
         };
         runtime.actor_runtime.compute(
-            1, node.clone(), Some(script_template), inputs, runtime.db.clone(),
+            1, node.clone(), Some(script_template), inputs, std::collections::HashMap::new(), runtime.db.clone(),
         );
     }
 

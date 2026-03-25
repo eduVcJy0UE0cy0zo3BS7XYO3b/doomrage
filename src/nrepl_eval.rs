@@ -3,7 +3,7 @@ use crate::scheme_engine::SchemeEngine;
 use crate::db::Db;
 use crate::persistence;
 use crate::types::*;
-use nrepl::{Evaluator, EvalResult, Completion, SymbolInfo, LoadFileResult, NodeState};
+use nrepl::{Evaluator, EvalResult, Completion, SymbolInfo, LoadFileResult, NodeState, DefEntry};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use scheme_rs::env::TopLevelEnvironment;
@@ -216,7 +216,7 @@ impl Evaluator for SchemeEvaluator {
             .collect()
     }
 
-    fn info(&self, session_id: &str, symbol: &str, _ns: Option<&str>) -> Option<SymbolInfo> {
+    fn info(&self, session_id: &str, symbol: &str, ns_param: Option<&str>) -> Option<SymbolInfo> {
         // Check builtins
         for (name, kind) in BUILTIN_SYMBOLS {
             if *name == symbol {
@@ -224,29 +224,59 @@ impl Evaluator for SchemeEvaluator {
                     name: name.to_string(),
                     ns: Some("canvas".into()),
                     file: None,
+                    line: None,
+                    hash: None,
                     doc: Some(format!("Built-in {} from canvas libraries", kind)),
                 });
             }
         }
 
-        // Check if symbol comes from an imported node
-        if let Some(ns) = self.session_ns(session_id) {
+        // Use explicit ns param if provided, otherwise session ns
+        if let Some(ns) = ns_param.map(|s| s.to_string()).or_else(|| self.session_ns(session_id)) {
             if let Some(parts) = ns.split_once('/') {
                 let (canvas, label) = parts;
                 let result = self.with_graphs(|graphs, _| {
                     let graph = graphs.get(canvas)?;
                     let module_name = label.replace(' ', "-");
                     let node = graph.nodes.values().find(|n| n.label.replace(' ', "-") == module_name)?;
+
+                    // Check legacy module imports
                     for (_, imp_module) in &node.imports {
                         if let Some(src) = graph.nodes.values().find(|n| n.label.replace(' ', "-") == *imp_module) {
                             if src.exports.contains(&symbol.to_string()) {
                                 let file = persistence::node_file_path(canvas, &src.label);
+                                let def = src.definitions.iter().find(|d| d.name == symbol);
                                 return Some(SymbolInfo {
                                     name: symbol.to_string(),
                                     ns: Some(imp_module.clone()),
                                     file: Some(file.to_string_lossy().into_owned()),
+                                    line: def.map(|d| d.line),
+                                    hash: def.map(|d| d.hash),
                                     doc: Some(format!("Exported from node \"{}\"", src.label)),
                                 });
+                            }
+                        }
+                    }
+
+                    // Check hash-based imports: collect matching hash_import info
+                    let hash_match = node.hash_imports.iter()
+                        .find(|hi| hi.local_name == symbol)
+                        .map(|hi| hi.hash.clone());
+                    if let Some(hash_hex) = hash_match {
+                        // Find source node by hash in all graphs
+                        for (gname, g) in graphs {
+                            for src in g.nodes.values() {
+                                if let Some(def) = src.definitions.iter().find(|d| format!("{:016x}", d.hash) == hash_hex) {
+                                    let file = persistence::node_file_path(gname, &src.label);
+                                    return Some(SymbolInfo {
+                                        name: symbol.to_string(),
+                                        ns: Some(src.label.clone()),
+                                        file: Some(file.to_string_lossy().into_owned()),
+                                        line: Some(def.line),
+                                        hash: Some(def.hash),
+                                        doc: Some(format!("Hash import from \"{}\" (#{})", src.label, &hash_hex[..12.min(hash_hex.len())])),
+                                    });
+                                }
                             }
                         }
                     }
@@ -335,7 +365,6 @@ impl Evaluator for SchemeEvaluator {
             }
             false
         }).unwrap_or(false);
-
         if exists {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(state) = sessions.get_mut(session_id) {
@@ -421,6 +450,62 @@ impl Evaluator for SchemeEvaluator {
         self.send_command(|reply| NreplCommand::ComputeNode {
             canvas: canvas.to_string(),
             label: label.to_string(),
+            reply,
+        }).unwrap_or(Err("command channel unavailable".into()))
+    }
+
+    fn list_defs(&self, canvas: &str) -> Vec<DefEntry> {
+        self.db.all_definitions(canvas).into_iter().map(|e| DefEntry {
+            name: e.name,
+            hash: e.hash,
+            node_label: e.node_label,
+            form: e.form,
+        }).collect()
+    }
+
+    fn def_source(&self, hash: &str) -> Option<String> {
+        let hash_u64 = u64::from_str_radix(hash, 16).ok()?;
+        persistence::load_definition(hash_u64)
+    }
+
+    fn add_hash_import(&self, canvas: &str, label: &str, hash: &str, local_name: &str) -> Result<(), String> {
+        self.send_command(|reply| NreplCommand::AddHashImport {
+            canvas: canvas.to_string(),
+            label: label.to_string(),
+            hash: hash.to_string(),
+            local_name: local_name.to_string(),
+            reply,
+        }).unwrap_or(Err("command channel unavailable".into()))
+    }
+
+    fn def_history(&self, name: &str, canvas: &str) -> Vec<DefEntry> {
+        self.db.def_history(name, canvas).into_iter().map(|e| DefEntry {
+            name: e.name,
+            hash: e.hash,
+            node_label: e.node_label,
+            form: e.form,
+        }).collect()
+    }
+
+    fn def_diff(&self, hash_a: &str, hash_b: &str) -> Option<String> {
+        let a = u64::from_str_radix(hash_a, 16).ok()?;
+        let b = u64::from_str_radix(hash_b, 16).ok()?;
+        crate::sexp::diff_by_hash(a, b)
+    }
+
+    fn migrate_imports(&self, canvas: &str, label: &str) -> Result<Vec<(String, String)>, String> {
+        self.send_command(|reply| NreplCommand::MigrateImports {
+            canvas: canvas.to_string(),
+            label: label.to_string(),
+            reply,
+        }).unwrap_or(Err("command channel unavailable".into()))
+    }
+
+    fn rename_def(&self, canvas: &str, old_name: &str, new_name: &str) -> Result<u32, String> {
+        self.send_command(|reply| NreplCommand::RenameDef {
+            canvas: canvas.to_string(),
+            old_name: old_name.to_string(),
+            new_name: new_name.to_string(),
             reply,
         }).unwrap_or(Err("command channel unavailable".into()))
     }

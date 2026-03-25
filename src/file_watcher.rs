@@ -120,11 +120,14 @@ pub fn apply_file_events(runtime: &mut GraphRuntime, events: Vec<FileEvent>) {
                                 .get(&runtime.all_graphs.get(&canvas).unwrap().nodes[&node_id].template_name)
                                 .cloned();
                             runtime.pending_nodes.insert(node_id);
+                            let node_ref = &runtime.all_graphs.get(&canvas).unwrap().nodes[&node_id];
+                            let hr = crate::graph_runtime::resolve_hash_imports(node_ref, &runtime.all_graphs, &runtime.db);
                             runtime.actor_runtime.compute(
                                 node_id,
-                                runtime.all_graphs.get(&canvas).unwrap().nodes[&node_id].clone(),
+                                node_ref.clone(),
                                 template,
                                 inputs,
+                                hr,
                                 runtime.db.clone(),
                             );
                         }

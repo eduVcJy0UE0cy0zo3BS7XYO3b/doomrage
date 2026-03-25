@@ -316,7 +316,8 @@ impl WasmCanvasApp {
         self.runtime.ensure_imports(node_id);
         if let Some((node, template, inputs)) = self.runtime.resolve_node(node_id) {
             self.runtime.pending_nodes.insert(node_id);
-            self.runtime.actor_runtime.compute(node_id, node, template, inputs, self.resources.db.clone());
+            let hr = crate::graph_runtime::resolve_hash_imports(&node, &self.runtime.all_graphs, &self.resources.db);
+            self.runtime.actor_runtime.compute(node_id, node, template, inputs, hr, self.resources.db.clone());
         }
     }
 
@@ -324,7 +325,8 @@ impl WasmCanvasApp {
         if self.runtime.find_node(node_id).map_or(false, |n| n.phantom) { return; }
         if let Some((node, template, inputs)) = self.runtime.resolve_node(node_id) {
             self.runtime.pending_nodes.insert(node_id);
-            self.runtime.actor_runtime.compute_debounced(node_id, node, template, inputs, self.resources.db.clone());
+            let hr = crate::graph_runtime::resolve_hash_imports(&node, &self.runtime.all_graphs, &self.resources.db);
+            self.runtime.actor_runtime.compute_debounced(node_id, node, template, inputs, hr, self.resources.db.clone());
         }
     }
 }
@@ -414,6 +416,7 @@ impl WasmCanvasApp {
                     self.debug_log.log("net", format!("peer discovered: {}...", &peer[..12.min(peer.len())]));
                     self.connected_peers.lock().unwrap().insert(peer.clone());
                     self.session_manager.lock().unwrap().ensure_session(&peer);
+                    self.runtime.request_missing_defs();
                 }
                 NetEvent::PeerLost(peer) => {
                     self.debug_log.log("net", format!("peer lost: {}...", &peer[..12.min(peer.len())]));
@@ -435,6 +438,11 @@ impl WasmCanvasApp {
                     }
                 }
                 NetEvent::ValuesReceived { peer, channel, values } => {
+                    // Handle definition request/response channels
+                    if self.runtime.handle_def_network_message(&channel, &values) {
+                        continue;
+                    }
+
                     self.debug_log.log("net", format!(
                         "recv \"{}\": {:?}", channel, values.keys().collect::<Vec<_>>()
                     ));
@@ -780,7 +788,8 @@ impl WasmCanvasApp {
                 }
             }
             self.runtime.pending_nodes.insert(node_id);
-            self.runtime.actor_runtime.compute_debounced(node_id, node_clone, template, inputs, self.resources.db.clone());
+            let hr = crate::graph_runtime::resolve_hash_imports(&node_clone, &self.runtime.all_graphs, &self.resources.db);
+            self.runtime.actor_runtime.compute_debounced(node_id, node_clone, template, inputs, hr, self.resources.db.clone());
         }
     }
 
