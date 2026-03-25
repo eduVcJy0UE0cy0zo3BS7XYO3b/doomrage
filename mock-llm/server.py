@@ -173,7 +173,7 @@ if __name__ == "__main__":
         print(f"[mock] Using default scenario ({len(scenario)} steps)")
 
     print(f"[mock] Listening on http://localhost:{port}")
-    server = HTTPServer(("127.0.0.1", port), MockHandler)
+    server = HTTPServer(("0.0.0.0", port), MockHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
