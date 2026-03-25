@@ -70,8 +70,8 @@ echo "  nREPL port: $NREPL_PORT"
 # --- Step 4: Run agent ---
 echo ""
 echo "--- Step 4: Run agent ---"
-LLM_API_BASE=http://localhost:4000 LLM_MODEL=mock-agent LLM_API_KEY=sk-litellm-master-key-local \
-    canvas-agent --project "$PROJECT_DIR" "Build an oscillator" 2>&1 | tail -5
+LLM_API_BASE=http://localhost:9999 LLM_MODEL=mock-agent LLM_API_KEY=fake \
+    canvas-agent --project "$PROJECT_DIR" "Build an oscillator" 2>&1 | tee /tmp/agent.log | tail -20
 
 sleep 2
 
@@ -110,6 +110,15 @@ assert ".scm files staged" grep -q "controls.scm" /tmp/git.log
 
 # --- Summary ---
 echo ""
+if [ "$FAIL" -gt 0 ]; then
+    echo "--- Agent log ---"
+    cat /tmp/agent.log 2>/dev/null | tail -20
+    echo "--- Peer log ---"
+    cat /tmp/peer.log 2>/dev/null | tail -20
+    echo "--- Files in project ---"
+    find "$PROJECT_DIR" -type f 2>/dev/null | head -20
+fi
+
 echo "==================================="
 echo "  PASSED: $PASS"
 echo "  FAILED: $FAIL"

@@ -2,7 +2,7 @@
 set -e
 
 # Build binaries on host, run full-cycle test in a container (sandbox).
-# Requires: podman, litellm running on localhost:4000, litellm-net network.
+# Mock LLM runs as a container, agent connects directly (no litellm needed).
 #
 # Usage: ./tests/run-in-container.sh
 
@@ -14,23 +14,21 @@ if [ -f "$ROOT_DIR/target/release/wasm-canvas-peer" ] && [ -f "$ROOT_DIR/target/
     BUILD_DIR="$ROOT_DIR/target/release"
     echo "Using existing release binaries"
 else
-    cargo build -p wasm-canvas-peer -p canvas-agent -p nrepl 2>&1 | tail -3
+    cargo build -p wasm-canvas-peer -p canvas-agent 2>&1 | tail -3
     BUILD_DIR="$ROOT_DIR/target/debug"
 fi
 
 echo ""
-echo "=== Starting mock LLM container ==="
+echo "=== Starting mock LLM ==="
 podman rm -f mock-llm 2>/dev/null || true
 podman run -d --rm --name mock-llm \
-    --network litellm-net \
+    -p 9999:9999 \
     -v "$ROOT_DIR/mock-llm:/app:ro" \
     -w /app \
     python:3.12-slim \
     python3 server.py 9999
-sleep 3
-# Restart litellm to pick up mock-llm container in the network
-podman restart litellm
-sleep 5
+sleep 2
+echo "Mock LLM on :9999"
 
 echo ""
 echo "=== Building test container ==="
