@@ -1,7 +1,13 @@
-.PHONY: run build nodes clean
+.PHONY: run peer repl build nodes clean
 
 run: nodes
 	cargo run
+
+peer:
+	cargo run -p wasm-canvas-peer
+
+repl:
+	cargo run -p nrepl --bin client
 
 build: nodes
 	cargo build --release

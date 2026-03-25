@@ -89,4 +89,68 @@ impl Client {
         let responses = self.recv_until_done()?;
         Ok(responses.into_iter().last().unwrap())
     }
+
+    /// Get completions for a prefix.
+    pub fn completions(&mut self, session: &str, prefix: &str) -> Result<Value, Box<dyn std::error::Error>> {
+        let id = self.next_id();
+        self.send(&Value::dict(vec![
+            ("id", Value::string(&id)),
+            ("op", Value::string("completions")),
+            ("prefix", Value::string(prefix)),
+            ("session", Value::string(session)),
+        ]))?;
+        let responses = self.recv_until_done()?;
+        Ok(responses.into_iter().last().unwrap())
+    }
+
+    /// Get info about a symbol.
+    pub fn info(&mut self, session: &str, symbol: &str) -> Result<Value, Box<dyn std::error::Error>> {
+        let id = self.next_id();
+        self.send(&Value::dict(vec![
+            ("id", Value::string(&id)),
+            ("op", Value::string("info")),
+            ("session", Value::string(session)),
+            ("symbol", Value::string(symbol)),
+        ]))?;
+        let responses = self.recv_until_done()?;
+        Ok(responses.into_iter().last().unwrap())
+    }
+
+    /// List available namespaces.
+    pub fn ns_list(&mut self, session: &str) -> Result<Value, Box<dyn std::error::Error>> {
+        let id = self.next_id();
+        self.send(&Value::dict(vec![
+            ("id", Value::string(&id)),
+            ("op", Value::string("ns-list")),
+            ("session", Value::string(session)),
+        ]))?;
+        let responses = self.recv_until_done()?;
+        Ok(responses.into_iter().last().unwrap())
+    }
+
+    /// Switch session to a namespace.
+    pub fn switch_ns(&mut self, session: &str, ns: &str) -> Result<Value, Box<dyn std::error::Error>> {
+        let id = self.next_id();
+        self.send(&Value::dict(vec![
+            ("id", Value::string(&id)),
+            ("ns", Value::string(ns)),
+            ("op", Value::string("switch-ns")),
+            ("session", Value::string(session)),
+        ]))?;
+        let responses = self.recv_until_done()?;
+        Ok(responses.into_iter().last().unwrap())
+    }
+
+    /// Load a file.
+    pub fn load_file(&mut self, session: &str, path: &str, content: &str) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+        let id = self.next_id();
+        self.send(&Value::dict(vec![
+            ("file", Value::string(content)),
+            ("file-path", Value::string(path)),
+            ("id", Value::string(&id)),
+            ("op", Value::string("load-file")),
+            ("session", Value::string(session)),
+        ]))?;
+        Ok(self.recv_until_done()?)
+    }
 }

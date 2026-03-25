@@ -181,35 +181,31 @@ pub fn decode(r: &mut impl Read) -> Result<Value, DecodeError> {
             Ok(Value::Int(n))
         }
         b'l' => {
-            // List: l<items>e
+            // List: l<items>e — items can be any bencode type
             let mut items = Vec::new();
             loop {
                 let peek = read_byte(r)?;
                 if peek == b'e' { break; }
-                let item = decode_with_first(peek, r)?;
+                let item = decode_after_peek(peek, r)?;
                 items.push(item);
             }
             Ok(Value::List(items))
         }
         b'd' => {
-            // Dict: d<key><value>...e
+            // Dict: d<key><value>...e — keys are always strings
             let mut map = BTreeMap::new();
             loop {
                 let peek = read_byte(r)?;
                 if peek == b'e' { break; }
-                let key_val = decode_with_first(peek, r)?;
-                let key = match key_val {
-                    Value::Bytes(b) => String::from_utf8(b)
-                        .map_err(|_| DecodeError::InvalidFormat("dict key not utf8".into()))?,
-                    _ => return Err(DecodeError::InvalidFormat("dict key must be string".into())),
-                };
+                let key = String::from_utf8(decode_string_with_first(peek, r)?)
+                    .map_err(|_| DecodeError::InvalidFormat("dict key not utf8".into()))?;
                 let val = decode(r)?;
                 map.insert(key, val);
             }
             Ok(Value::Dict(map))
         }
         b'0'..=b'9' => {
-            decode_with_first(first, r)
+            Ok(Value::Bytes(decode_string_with_first(first, r)?))
         }
         other => {
             Err(DecodeError::InvalidFormat(format!("unexpected byte: {}", other as char)))
@@ -217,7 +213,54 @@ pub fn decode(r: &mut impl Read) -> Result<Value, DecodeError> {
     }
 }
 
-fn decode_with_first(first: u8, r: &mut impl Read) -> Result<Value, DecodeError> {
+/// Decode a bencode value given the first byte has already been read.
+/// Handles all types: strings, ints, lists, dicts.
+fn decode_after_peek(first: u8, r: &mut impl Read) -> Result<Value, DecodeError> {
+    match first {
+        b'i' => {
+            let mut digits = Vec::new();
+            loop {
+                let b = read_byte(r)?;
+                if b == b'e' { break; }
+                digits.push(b);
+            }
+            let s = String::from_utf8(digits)
+                .map_err(|_| DecodeError::InvalidFormat("invalid integer bytes".into()))?;
+            let n: i64 = s.parse()
+                .map_err(|_| DecodeError::InvalidFormat(format!("invalid integer: {}", s)))?;
+            Ok(Value::Int(n))
+        }
+        b'l' => {
+            let mut items = Vec::new();
+            loop {
+                let peek = read_byte(r)?;
+                if peek == b'e' { break; }
+                items.push(decode_after_peek(peek, r)?);
+            }
+            Ok(Value::List(items))
+        }
+        b'd' => {
+            let mut map = BTreeMap::new();
+            loop {
+                let peek = read_byte(r)?;
+                if peek == b'e' { break; }
+                let key_val = decode_string_with_first(peek, r)?;
+                let key = String::from_utf8(key_val)
+                    .map_err(|_| DecodeError::InvalidFormat("dict key not utf8".into()))?;
+                let val = decode(r)?;
+                map.insert(key, val);
+            }
+            Ok(Value::Dict(map))
+        }
+        b'0'..=b'9' => {
+            Ok(Value::Bytes(decode_string_with_first(first, r)?))
+        }
+        other => Err(DecodeError::InvalidFormat(format!("unexpected byte: {}", other as char))),
+    }
+}
+
+/// Decode a bencode byte string given the first digit of the length.
+fn decode_string_with_first(first: u8, r: &mut impl Read) -> Result<Vec<u8>, DecodeError> {
     // Byte string: <length>:<data>
     let mut len_digits = vec![first];
     loop {
@@ -234,7 +277,7 @@ fn decode_with_first(first: u8, r: &mut impl Read) -> Result<Value, DecodeError>
         .map_err(|_| DecodeError::InvalidFormat(format!("invalid length: {}", len_str)))?;
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
-    Ok(Value::Bytes(buf))
+    Ok(buf)
 }
 
 pub fn decode_bytes(data: &[u8]) -> Result<Value, DecodeError> {

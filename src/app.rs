@@ -43,6 +43,8 @@ pub struct WasmCanvasApp {
     trusted_peers: Vec<String>,
     nrepl_server: Option<nrepl::Server>,
     nrepl_port_file: Option<std::path::PathBuf>,
+    nrepl_evaluator: Option<Arc<crate::nrepl_eval::SchemeEvaluator>>,
+    file_watcher: Option<crate::file_watcher::FileWatcher>,
 }
 
 // --- Graph access helpers ---
@@ -186,11 +188,11 @@ impl WasmCanvasApp {
         };
 
         // Start nREPL server
-        let evaluator = Arc::new(crate::nrepl_eval::SchemeEvaluator::new(
+        let nrepl_evaluator = Arc::new(crate::nrepl_eval::SchemeEvaluator::new(
             Arc::clone(&resources.scheme),
             resources.db.clone(),
         ));
-        let (nrepl_server, nrepl_port_file) = match nrepl::Server::start("127.0.0.1:7888", evaluator) {
+        let (nrepl_server, nrepl_port_file) = match nrepl::Server::start("127.0.0.1:7888", nrepl_evaluator.clone()) {
             Ok(server) => {
                 let port_dir = dirs::home_dir().unwrap_or_default().join(".canvas");
                 let port_file = server.write_port_file(&port_dir).ok();
@@ -230,10 +232,31 @@ impl WasmCanvasApp {
             trusted_peers,
             nrepl_server,
             nrepl_port_file,
+            nrepl_evaluator: Some(nrepl_evaluator),
+            file_watcher: None,
         };
 
         // Initialize ports and libraries for current canvas
         app.runtime.init_graph_libraries(&app.current_canvas);
+
+        // Give nREPL evaluator access to the graph
+        if let Some(ref eval) = app.nrepl_evaluator {
+            unsafe {
+                eval.set_graphs(
+                    &app.runtime.all_graphs as *const HashMap<String, Graph>,
+                    app.current_canvas.clone(),
+                );
+            }
+        }
+
+        // Start file watcher
+        app.file_watcher = match crate::file_watcher::FileWatcher::start() {
+            Ok(w) => Some(w),
+            Err(e) => {
+                log::warn!("Failed to start file watcher: {}", e);
+                None
+            }
+        };
 
         app
     }
@@ -778,6 +801,14 @@ impl eframe::App for WasmCanvasApp {
         if !self.theme_applied {
             theme::apply_theme(ctx);
             self.theme_applied = true;
+        }
+
+        // Poll file watcher for external edits
+        if let Some(ref watcher) = self.file_watcher {
+            let events = watcher.poll();
+            if !events.is_empty() {
+                crate::file_watcher::apply_file_events(&mut self.runtime, events);
+            }
         }
 
         self.poll_worker_results();

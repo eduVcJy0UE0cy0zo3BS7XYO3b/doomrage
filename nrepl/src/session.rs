@@ -9,9 +9,59 @@ pub struct EvalResult {
     pub ex: Option<String>,
 }
 
+/// Completion candidate.
+pub struct Completion {
+    pub candidate: String,
+    pub ns: Option<String>,
+    pub kind: Option<String>, // "var", "function", "module", "keyword"
+}
+
+/// Symbol info for go-to-definition.
+pub struct SymbolInfo {
+    pub name: String,
+    pub ns: Option<String>,
+    pub file: Option<String>,
+    pub doc: Option<String>,
+}
+
+/// Result of load-file operation.
+pub struct LoadFileResult {
+    pub value: Option<String>,
+    pub error: Option<String>,
+}
+
 /// Trait for language-specific evaluation. Implement this to plug in any language runtime.
 pub trait Evaluator: Send + Sync {
     fn eval(&self, session_id: &str, code: &str) -> EvalResult;
+
+    /// Return completions for a prefix in the given session/namespace.
+    fn completions(&self, session_id: &str, prefix: &str, ns: Option<&str>) -> Vec<Completion> {
+        let _ = (session_id, prefix, ns);
+        Vec::new()
+    }
+
+    /// Return info about a symbol (go-to-definition).
+    fn info(&self, session_id: &str, symbol: &str, ns: Option<&str>) -> Option<SymbolInfo> {
+        let _ = (session_id, symbol, ns);
+        None
+    }
+
+    /// Load a file by path — find the corresponding node, update code, recompute.
+    fn load_file(&self, session_id: &str, file_path: &str, file_content: &str) -> LoadFileResult {
+        let _ = (session_id, file_path, file_content);
+        LoadFileResult { value: None, error: Some("load-file not implemented".into()) }
+    }
+
+    /// List available namespaces (nodes).
+    fn ns_list(&self, _session_id: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Switch session to a namespace (node context). Returns true if successful.
+    fn switch_ns(&self, session_id: &str, ns: &str) -> bool {
+        let _ = (session_id, ns);
+        false
+    }
 }
 
 /// A simple evaluator that echoes code back (for testing).
@@ -104,8 +154,13 @@ pub fn handle_message(
                 ("ops", Value::dict(vec![
                     ("clone", Value::dict(vec![])),
                     ("close", Value::dict(vec![])),
+                    ("completions", Value::dict(vec![])),
                     ("describe", Value::dict(vec![])),
                     ("eval", Value::dict(vec![])),
+                    ("info", Value::dict(vec![])),
+                    ("load-file", Value::dict(vec![])),
+                    ("ns-list", Value::dict(vec![])),
+                    ("switch-ns", Value::dict(vec![])),
                 ])),
                 ("status", Value::List(vec![Value::string("done")])),
                 ("versions", Value::dict(vec![
@@ -169,6 +224,105 @@ pub fn handle_message(
             responses.push(Value::dict(final_resp));
 
             responses
+        }
+        "completions" => {
+            let prefix = msg.get_str("prefix").unwrap_or("");
+            let ns = msg.get_str("ns");
+            let completions = evaluator.completions(session_id, prefix, ns);
+            let candidates: Vec<Value> = completions.into_iter().map(|c| {
+                let mut pairs = vec![
+                    ("candidate", Value::string(&c.candidate)),
+                ];
+                if let Some(ref ns) = c.ns {
+                    pairs.push(("ns", Value::string(ns.as_str())));
+                }
+                if let Some(ref kind) = c.kind {
+                    pairs.push(("type", Value::string(kind.as_str())));
+                }
+                Value::dict(pairs)
+            }).collect();
+            vec![Value::dict(vec![
+                ("id", Value::string(id)),
+                ("session", Value::string(session_id)),
+                ("completions", Value::List(candidates)),
+                ("status", Value::List(vec![Value::string("done")])),
+            ])]
+        }
+        "info" => {
+            let symbol = msg.get_str("symbol").unwrap_or("");
+            let ns = msg.get_str("ns");
+            let resp = match evaluator.info(session_id, symbol, ns) {
+                Some(info) => {
+                    let mut pairs = vec![
+                        ("id", Value::string(id)),
+                        ("session", Value::string(session_id)),
+                        ("name", Value::string(&info.name)),
+                        ("status", Value::List(vec![Value::string("done")])),
+                    ];
+                    if let Some(ref ns) = info.ns {
+                        pairs.push(("ns", Value::string(ns.as_str())));
+                    }
+                    if let Some(ref file) = info.file {
+                        pairs.push(("file", Value::string(file.as_str())));
+                    }
+                    if let Some(ref doc) = info.doc {
+                        pairs.push(("doc", Value::string(doc.as_str())));
+                    }
+                    Value::dict(pairs)
+                }
+                None => Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("status", Value::List(vec![Value::string("no-info"), Value::string("done")])),
+                ]),
+            };
+            vec![resp]
+        }
+        "load-file" => {
+            let file_content = msg.get_str("file").unwrap_or("");
+            let file_path = msg.get_str("file-path").unwrap_or("");
+            let result = evaluator.load_file(session_id, file_path, file_content);
+            let status = if result.error.is_some() {
+                Value::List(vec![Value::string("eval-error"), Value::string("done")])
+            } else {
+                Value::List(vec![Value::string("done")])
+            };
+            let mut pairs = vec![
+                ("id", Value::string(id)),
+                ("session", Value::string(session_id)),
+                ("status", status),
+            ];
+            if let Some(ref val) = result.value {
+                pairs.push(("value", Value::string(val.as_str())));
+            }
+            if let Some(ref ex) = result.error {
+                pairs.push(("ex", Value::string(ex.as_str())));
+            }
+            vec![Value::dict(pairs)]
+        }
+        "ns-list" => {
+            let namespaces = evaluator.ns_list(session_id);
+            let ns_values: Vec<Value> = namespaces.into_iter().map(|n| Value::string(&n)).collect();
+            vec![Value::dict(vec![
+                ("id", Value::string(id)),
+                ("session", Value::string(session_id)),
+                ("ns-list", Value::List(ns_values)),
+                ("status", Value::List(vec![Value::string("done")])),
+            ])]
+        }
+        "switch-ns" => {
+            let ns = msg.get_str("ns").unwrap_or("");
+            let ok = evaluator.switch_ns(session_id, ns);
+            let status = if ok {
+                Value::List(vec![Value::string("done")])
+            } else {
+                Value::List(vec![Value::string("error"), Value::string("namespace-not-found"), Value::string("done")])
+            };
+            vec![Value::dict(vec![
+                ("id", Value::string(id)),
+                ("session", Value::string(session_id)),
+                ("status", status),
+            ])]
         }
         _ => {
             vec![Value::dict(vec![

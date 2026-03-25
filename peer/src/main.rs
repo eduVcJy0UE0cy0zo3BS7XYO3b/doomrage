@@ -98,6 +98,13 @@ fn main() {
         runtime.actor_runtime.engine_arc(),
         resources.db.clone(),
     ));
+    // Give evaluator access to the graph for ns-list, completions, info
+    unsafe {
+        evaluator.set_graphs(
+            &runtime.all_graphs as *const HashMap<String, Graph>,
+            runtime.all_graphs.keys().next().cloned().unwrap_or_default(),
+        );
+    }
     let mut nrepl_server = match nrepl::Server::start("127.0.0.1:7888", evaluator) {
         Ok(server) => {
             let port_dir = dirs::home_dir().unwrap_or_default().join(".canvas");
@@ -113,9 +120,26 @@ fn main() {
         }
     };
 
+    // Start file watcher
+    let file_watcher = match wasm_canvas::file_watcher::FileWatcher::start() {
+        Ok(w) => Some(w),
+        Err(e) => {
+            log::warn!("Failed to start file watcher: {}", e);
+            None
+        }
+    };
+
     log::info!("Headless daemon running. Ctrl+C to stop.");
 
     loop {
+        // Poll file watcher
+        if let Some(ref watcher) = file_watcher {
+            let events = watcher.poll();
+            if !events.is_empty() {
+                wasm_canvas::file_watcher::apply_file_events(&mut runtime, events);
+            }
+        }
+
         // Poll actor results
         while let Some(result) = runtime.actor_runtime.poll() {
             match result {

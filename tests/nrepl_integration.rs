@@ -226,3 +226,88 @@ fn store_shared_across_sessions() {
     let val = eval_value(&mut client, &s2, "(store-get \"shared-key\")");
     assert!(val.as_deref().map_or(false, |v| v.contains("777")), "expected 777, got: {:?}", val);
 }
+
+// --- Completions ---
+
+#[test]
+fn completions_builtin_prefix() {
+    let (_server, mut client, session) = setup();
+    let resp = client.completions(&session, "store-").unwrap();
+    let completions = resp.get("completions").unwrap().as_list().unwrap();
+    let candidates: Vec<&str> = completions.iter()
+        .filter_map(|c| c.get_str("candidate"))
+        .collect();
+    assert!(candidates.contains(&"store-get"), "expected store-get in {:?}", candidates);
+    assert!(candidates.contains(&"store-set!"), "expected store-set! in {:?}", candidates);
+}
+
+#[test]
+fn completions_render_prefix() {
+    let (_server, mut client, session) = setup();
+    let resp = client.completions(&session, "draw-").unwrap();
+    let completions = resp.get("completions").unwrap().as_list().unwrap();
+    let candidates: Vec<&str> = completions.iter()
+        .filter_map(|c| c.get_str("candidate"))
+        .collect();
+    assert!(candidates.contains(&"draw-line"), "expected draw-line in {:?}", candidates);
+    assert!(candidates.contains(&"draw-rect"), "expected draw-rect in {:?}", candidates);
+}
+
+#[test]
+fn completions_empty_prefix_returns_all() {
+    let (_server, mut client, session) = setup();
+    let resp = client.completions(&session, "").unwrap();
+    let completions = resp.get("completions").unwrap().as_list().unwrap();
+    // Should return all builtins
+    assert!(completions.len() >= 30, "expected many completions, got {}", completions.len());
+}
+
+// --- Info ---
+
+#[test]
+fn info_builtin_symbol() {
+    let (_server, mut client, session) = setup();
+    let resp = client.info(&session, "store-get").unwrap();
+    assert_eq!(resp.get_str("name"), Some("store-get"));
+    assert!(resp.get_str("doc").is_some(), "expected doc for store-get");
+    let status = resp.get("status").unwrap().as_list().unwrap();
+    assert!(status.iter().any(|v| v.as_str() == Some("done")));
+}
+
+#[test]
+fn info_unknown_symbol() {
+    let (_server, mut client, session) = setup();
+    let resp = client.info(&session, "nonexistent-symbol-xyz").unwrap();
+    let status = resp.get("status").unwrap().as_list().unwrap();
+    assert!(status.iter().any(|v| v.as_str() == Some("no-info")));
+}
+
+// --- Describe includes new ops ---
+
+#[test]
+fn describe_includes_new_ops() {
+    let (_server, mut client, _session) = setup();
+    let resp = client.describe().unwrap();
+    let ops = resp.get("ops").unwrap().as_dict().unwrap();
+    assert!(ops.contains_key("completions"), "missing completions op");
+    assert!(ops.contains_key("info"), "missing info op");
+    assert!(ops.contains_key("load-file"), "missing load-file op");
+    assert!(ops.contains_key("ns-list"), "missing ns-list op");
+    assert!(ops.contains_key("switch-ns"), "missing switch-ns op");
+}
+
+// --- Load file ---
+
+#[test]
+fn load_file_evals_content() {
+    let (_server, mut client, session) = setup();
+    let responses = client.load_file(&session, "/tmp/test.scm", "(+ 10 20)").unwrap();
+    let last = responses.last().unwrap();
+    // Should eval the content and return result
+    let status = last.get("status").unwrap().as_list().unwrap();
+    assert!(status.iter().any(|v| v.as_str() == Some("done")));
+    // Value should contain 30
+    if let Some(val) = last.get_str("value") {
+        assert!(val.contains("30"), "expected 30 in load-file result, got: {}", val);
+    }
+}

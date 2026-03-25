@@ -11,6 +11,7 @@ pub mod render;
 pub mod db;
 pub mod debug_log;
 #[cfg(feature = "gui")] pub mod render_ui;
+pub mod file_watcher;
 pub mod nrepl_eval;
 pub mod scheme_convert;
 pub mod scheme_engine;
