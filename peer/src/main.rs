@@ -1,5 +1,5 @@
 //! Headless daemon: runs wasm-canvas without GUI.
-//! Loads graphs from DB, starts P2P network, computes nodes, publishes values.
+//! Loads graphs from DB, starts P2P network and nREPL server, computes nodes, publishes values.
 //!
 //! Usage:
 //!   wasm-canvas-peer [RELAY_ADDR]
@@ -7,14 +7,14 @@
 //! Example:
 //!   wasm-canvas-peer /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...
 
-use wasm_canvas::bridge::{NetValues, SharedSessionManager};
+use wasm_canvas::actor::ActorResult;
+use wasm_canvas::bridge::NetValues;
 use wasm_canvas::executor::AppResources;
+use wasm_canvas::graph_runtime::GraphRuntime;
 use wasm_canvas::network::{NetCommand, NetEvent};
 use wasm_canvas::ocapn::session::SessionManager;
 use wasm_canvas::persistence;
-use wasm_canvas::scheme_engine;
 use wasm_canvas::types::*;
-use wasm_canvas::actor::{ActorResult, ActorRuntime};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -53,18 +53,9 @@ fn main() {
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .unwrap_or_default();
 
-    // Init scheme libraries
-    for (name, graph) in &all_graphs {
-        resources.scheme.register_stub_libraries(name, &graph.nodes);
-    }
-
-    log::info!("Loaded {} canvas(es)", all_graphs.len());
-    for (name, g) in &all_graphs {
-        log::info!("  {}: {} nodes", name, g.nodes.len());
-    }
-
     // Start network
-    let session_manager: SharedSessionManager = Arc::new(Mutex::new(SessionManager::new()));
+    let session_manager: wasm_canvas::bridge::SharedSessionManager =
+        Arc::new(Mutex::new(SessionManager::new()));
     let signal: Arc<dyn RepaintSignal> = Arc::new(NoRepaint);
     let net_handle = wasm_canvas::network::spawn_network(signal.clone(), session_manager.clone());
     let net_values: NetValues = Arc::new(Mutex::new(HashMap::new()));
@@ -74,108 +65,87 @@ fn main() {
         net_handle.send(NetCommand::ConnectRelay { addr: addr.clone() });
     }
 
-    // Set up actor runtime
-    let mut actor_runtime = ActorRuntime::new(Arc::clone(&resources.scheme));
-    actor_runtime.set_net_values(net_values.clone());
-    actor_runtime.set_session_mgr(session_manager.clone());
-    actor_runtime.set_wasm_runner(resources.wasm.clone());
-    actor_runtime.set_repaint_signal(signal);
+    // Build runtime
+    let registry = wasm_canvas::registry::NodeRegistry::new(PathBuf::from("./nodes"));
+    let mut runtime = GraphRuntime {
+        all_graphs,
+        actor_runtime: wasm_canvas::actor::ActorRuntime::new(Arc::clone(&resources.scheme)),
+        pending_nodes: HashSet::new(),
+        net_handle,
+        net_values: net_values.clone(),
+        user_name,
+        registry,
+        db: resources.db.clone(),
+        peer_names: HashMap::new(),
+    };
+    runtime.actor_runtime.set_net_values(net_values);
+    runtime.actor_runtime.set_session_mgr(session_manager);
+    runtime.actor_runtime.set_wasm_runner(resources.wasm.clone());
+    runtime.actor_runtime.set_repaint_signal(signal);
 
-    let mut pending_nodes: HashSet<NodeId> = HashSet::new();
+    // Init libraries & compute all nodes
+    runtime.init_all_libraries();
 
-    // Compute all nodes at startup
-    for (_, graph) in &all_graphs {
-        if let Ok(order) = graph.topological_sort() {
-            for node_id in order {
-                if let Some(node) = graph.nodes.get(&node_id) {
-                    if node.phantom { continue; }
-                    let inputs = graph.resolve_all_input_values(node_id);
-                    pending_nodes.insert(node_id);
-                    actor_runtime.compute(node_id, node.clone(), None, inputs, resources.db.clone());
-                }
-            }
-        }
+    log::info!("Loaded {} canvas(es)", runtime.all_graphs.len());
+    for (name, g) in &runtime.all_graphs {
+        log::info!("  {}: {} nodes", name, g.nodes.len());
     }
+
+    runtime.compute_all();
+
+    // Start nREPL server
+    let evaluator = Arc::new(wasm_canvas::nrepl_eval::SchemeEvaluator::new(
+        runtime.actor_runtime.engine_arc(),
+        resources.db.clone(),
+    ));
+    let mut nrepl_server = match nrepl::Server::start("127.0.0.1:7888", evaluator) {
+        Ok(server) => {
+            let port_dir = dirs::home_dir().unwrap_or_default().join(".canvas");
+            if let Ok(path) = server.write_port_file(&port_dir) {
+                log::info!("nREPL port file: {}", path.display());
+            }
+            log::info!("nREPL server started on port {}", server.port());
+            Some(server)
+        }
+        Err(e) => {
+            log::warn!("Failed to start nREPL server: {}", e);
+            None
+        }
+    };
 
     log::info!("Headless daemon running. Ctrl+C to stop.");
 
     loop {
         // Poll actor results
-        while let Some(result) = actor_runtime.poll() {
+        while let Some(result) = runtime.actor_runtime.poll() {
             match result {
                 ActorResult::Computed { node_id, result, .. } => {
-                    pending_nodes.remove(&node_id);
+                    runtime.pending_nodes.remove(&node_id);
+                    runtime.apply_compute_result(node_id, &result);
+                    runtime.register_node_libraries(node_id);
+                    runtime.auto_publish_node(node_id);
 
-                    // Update node
-                    for (_, g) in &mut all_graphs {
-                        if let Some(n) = g.nodes.get_mut(&node_id) {
-                            for (name, val) in &result.output_values {
-                                n.output_values.insert(name.clone(), val.clone());
-                            }
-                            n.error = None;
-                            if !result.declared_outputs.is_empty() {
-                                n.script_outputs = result.declared_outputs.iter()
-                                    .map(|(name, ts)| PortDef {
-                                        name: name.clone(),
-                                        port_type: PortType::from_str(ts).unwrap_or(PortType::F64),
-                                    }).collect();
-                            }
-                            break;
-                        }
+                    for (peer_id, message) in result.ocapn_sends {
+                        runtime.net_handle.send(NetCommand::OCapNSend { peer_id, message });
+                    }
+                    for target_id in result.recompute_requests {
+                        runtime.compute_if_ready(target_id);
                     }
 
-                    // Register library + auto-publish
-                    for (canvas_name, g) in &all_graphs {
-                        if let Some(node) = g.nodes.get(&node_id) {
-                            if let Some(header) = scheme_engine::parse_module_header(&node.script_code) {
-                                let canvas = if header.canvas.is_empty() { canvas_name.as_str() } else { &header.canvas };
-                                if !header.name.is_empty() {
-                                    actor_runtime.engine().register_node_library_named(
-                                        node_id, canvas, &header.name, &node.output_values,
-                                    );
-                                }
-                                if !node.phantom && !header.exports.is_empty() && !header.name.is_empty() {
-                                    let mut values = node.output_values.clone();
-                                    for (k, v) in &node.widget_values { values.insert(k.clone(), v.clone()); }
-                                    let share_code = all_graphs.get(canvas_name)
-                                        .map_or(true, |g| g.share_code);
-                                    if share_code && !node.script_code.is_empty() {
-                                        values.insert("__source__".to_string(), Value::Str(node.script_code.clone()));
-                                    }
-                                    if !user_name.is_empty() {
-                                        values.insert("__peer_name__".to_string(), Value::Str(user_name.clone()));
-                                    }
-                                    let channel = format!("{}/{}", canvas, header.name);
-                                    net_handle.send(NetCommand::Publish { channel: channel.clone(), values });
-                                    log::info!("Published \"{}\"", channel);
-                                }
-                            }
-
-                            // Propagate downstream
-                            let downstream = g.direct_downstream(node_id);
-                            for did in downstream {
-                                if !pending_nodes.contains(&did) {
-                                    if let Some(dn) = g.nodes.get(&did) {
-                                        if dn.phantom { continue; }
-                                        let inputs = g.resolve_all_input_values(did);
-                                        pending_nodes.insert(did);
-                                        actor_runtime.compute(did, dn.clone(), None, inputs, resources.db.clone());
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                    }
+                    runtime.propagate_downstream(node_id);
                 }
                 ActorResult::Error { node_id, message } => {
-                    pending_nodes.remove(&node_id);
+                    runtime.pending_nodes.remove(&node_id);
                     log::error!("Node #{} error: {}", node_id, message);
+                    if let Some(n) = runtime.find_node_mut(node_id) {
+                        n.error = Some(message);
+                    }
                 }
             }
         }
 
         // Poll network
-        for event in net_handle.poll() {
+        for event in runtime.net_handle.poll() {
             match event {
                 NetEvent::PeerDiscovered(peer) => {
                     log::info!("Peer: +{}...", &peer[..12.min(peer.len())]);
@@ -185,94 +155,19 @@ fn main() {
                 }
                 NetEvent::ValuesReceived { peer, channel, values } => {
                     log::info!("Recv \"{}\": {:?}", channel, values.keys().collect::<Vec<_>>());
-                    net_values.lock().unwrap().insert((peer.clone(), channel.clone()), values.clone());
+                    runtime.net_values.lock().unwrap().insert(
+                        (peer.clone(), channel.clone()), values.clone(),
+                    );
 
-                    // Filter out __source__ metadata from node values
-                    let node_values: HashMap<String, Value> = values.iter()
-                        .filter(|(k, _)| !k.starts_with("__"))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-
-                    // Parse channel: "canvas-name/module-name" or legacy "module-name"
                     let (source_canvas, module_name) = if let Some(slash) = channel.find('/') {
                         (&channel[..slash], &channel[slash + 1..])
                     } else {
                         (peer.as_str(), channel.as_str())
                     };
 
-                    for (canvas_key, graph) in &mut all_graphs {
-                        let has_local = graph.nodes.values().any(|n| {
-                            !n.phantom && scheme_engine::parse_module_header(&n.script_code)
-                                .map_or(false, |h| h.name == module_name)
-                        });
-                        if has_local { continue; }
-
-                        // Upsert phantom
-                        let phantom_id = graph.nodes.iter()
-                            .find(|(_, n)| n.phantom && n.label == module_name)
-                            .map(|(&id, _)| id);
-
-                        let pid = if let Some(id) = phantom_id {
-                            if let Some(n) = graph.nodes.get_mut(&id) {
-                                n.output_values = node_values.clone();
-                                n.remote_peer = Some(peer.clone());
-                                let mut sorted_keys: Vec<_> = node_values.keys().cloned().collect();
-                                sorted_keys.sort();
-                                n.script_outputs = sorted_keys.iter()
-                                    .map(|k| PortDef { name: k.clone(), port_type: PortType::F64 })
-                                    .collect();
-                            }
-                            id
-                        } else {
-                            let id = graph.next_node_id;
-                            graph.next_node_id += 1;
-                            let pc = graph.nodes.values().filter(|n| n.phantom).count();
-                            let mut sorted_keys: Vec<_> = node_values.keys().cloned().collect();
-                            sorted_keys.sort();
-                            graph.nodes.insert(id, Node {
-                                id,
-                                template_name: "Script".to_string(),
-                                label: module_name.to_string(),
-                                pos: [900.0, 50.0 + pc as f32 * 200.0],
-                                input_values: HashMap::new(),
-                                output_values: node_values.clone(),
-                                script_code: String::new(),
-                                script_inputs: Vec::new(),
-                                script_outputs: sorted_keys.iter()
-                                    .map(|k| PortDef { name: k.clone(), port_type: PortType::F64 })
-                                    .collect(),
-                                widget_decls: Vec::new(),
-                                widget_values: HashMap::new(),
-                                error: None,
-                                last_exec_us: None,
-                                render_blocks: Vec::new(),
-                                phantom: true,
-                                remote_peer: Some(peer.clone()),
-                            });
-                            log::info!("Phantom \"{}\" on \"{}\"", module_name, canvas_key);
-                            id
-                        };
-
-                        actor_runtime.engine().register_node_library_named(pid, source_canvas, module_name, &node_values);
-
-                        // Recompute downstream
-                        let mod_name = module_name.to_string();
-                        let downstream: Vec<NodeId> = graph.nodes.iter()
-                            .filter(|(_, n)| {
-                                if n.phantom { return false; }
-                                scheme_engine::extract_imports(&n.script_code)
-                                    .iter().any(|(_, m)| *m == mod_name)
-                            })
-                            .map(|(id, _)| *id).collect();
-                        for did in downstream {
-                            if !pending_nodes.contains(&did) {
-                                if let Some(n) = graph.nodes.get(&did) {
-                                    let inputs = graph.resolve_all_input_values(did);
-                                    pending_nodes.insert(did);
-                                    actor_runtime.compute(did, n.clone(), None, inputs, resources.db.clone());
-                                }
-                            }
-                        }
+                    let canvas_keys: Vec<String> = runtime.all_graphs.keys().cloned().collect();
+                    for canvas_key in canvas_keys {
+                        runtime.deliver_values(&canvas_key, source_canvas, module_name, &values);
                     }
                 }
                 NetEvent::LocalPeerId(id) => log::info!("PeerId: {}", id),

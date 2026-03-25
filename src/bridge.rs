@@ -32,22 +32,18 @@ pub struct WidgetDecl {
 }
 
 pub struct PortRegistry {
-    pub inputs: Vec<(String, String)>,
-    pub outputs: Vec<(String, String)>,
     pub widgets: Vec<WidgetDecl>,
 }
 
 impl PortRegistry {
     pub fn new() -> Self {
         Self {
-            inputs: Vec::new(),
-            outputs: Vec::new(),
             widgets: Vec::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inputs.is_empty() && self.outputs.is_empty() && self.widgets.is_empty()
+        self.widgets.is_empty()
     }
 }
 
@@ -391,9 +387,9 @@ fn bridge_connect(
                 let canvas_name = &ctx.canvas_name;
                 if let Some(source_label) = graph.nodes.get(&from_id).map(|n| n.label.replace(' ', "-")) {
                     if let Some(target_node) = graph.nodes.get_mut(&to_id) {
-                        let import_line = format!("(import ({} {}))", canvas_name, source_label);
-                        if !target_node.script_code.contains(&import_line) {
-                            target_node.script_code = format!("{}\n{}", import_line, target_node.script_code);
+                        let pair = (canvas_name.clone(), source_label);
+                        if !target_node.imports.contains(&pair) {
+                            target_node.imports.push(pair);
                         }
                     }
                 }
@@ -487,7 +483,7 @@ fn bridge_node_set(id: &Value, key: &Value, value: &Value) -> Result<Vec<Value>,
                 "label" => node.label = value_to_string(value),
                 "x" => node.pos[0] = value.cast_to_scheme_type::<f64>().unwrap_or(0.0) as f32,
                 "y" => node.pos[1] = value.cast_to_scheme_type::<f64>().unwrap_or(0.0) as f32,
-                "code" => node.script_code = value_to_string(value),
+                "code" => node.set_code(value_to_string(value)),
                 _ => {}
             }
         }
@@ -496,41 +492,6 @@ fn bridge_node_set(id: &Value, key: &Value, value: &Value) -> Result<Vec<Value>,
 }
 
 // --- (canvas ports) bridge functions ---
-
-#[bridge(name = "register-input", lib = "(canvas ports)")]
-fn bridge_register_input(name: &Value, port_type: &Value) -> Result<Vec<Value>, Exception> {
-    let name_str = value_to_string(name);
-    let type_str = value_to_string(port_type);
-
-    THREAD_PORTS.with(|cell| {
-        cell.borrow_mut().inputs.push((name_str.clone(), type_str));
-    });
-
-    let result = THREAD_INPUTS.with(|cell| {
-        let borrow = cell.borrow();
-        match borrow.as_ref() {
-            Some(map) => match map.get(&name_str) {
-                Some(val) => types_value_to_scheme(val),
-                None => Value::from(String::from("<compute>")),
-            },
-            None => Value::from(String::from("<compute>")),
-        }
-    });
-
-    Ok(vec![result])
-}
-
-#[bridge(name = "register-output", lib = "(canvas ports)")]
-fn bridge_register_output(name: &Value, port_type: &Value) -> Result<Vec<Value>, Exception> {
-    let name_str = value_to_string(name);
-    let type_str = value_to_string(port_type);
-
-    THREAD_PORTS.with(|cell| {
-        cell.borrow_mut().outputs.push((name_str, type_str));
-    });
-
-    Ok(vec![Value::null()])
-}
 
 #[bridge(name = "register-widget", lib = "(canvas ports)")]
 fn bridge_register_widget(
@@ -542,13 +503,11 @@ fn bridge_register_widget(
     let p2_f64 = p2.cast_to_scheme_type::<f64>().unwrap_or(0.0);
 
     THREAD_PORTS.with(|cell| {
-        let mut ports = cell.borrow_mut();
-        ports.widgets.push(WidgetDecl {
+        cell.borrow_mut().widgets.push(WidgetDecl {
             name: name_str.clone(),
             widget_type: type_str,
             params: vec![p1_f64, p2_f64],
         });
-        ports.outputs.push((name_str.clone(), "f64".to_string()));
     });
 
     let result = THREAD_INPUTS.with(|cell| {

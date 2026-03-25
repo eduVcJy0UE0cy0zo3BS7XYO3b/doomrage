@@ -351,6 +351,7 @@ pub fn draw_inspector(
     is_computing: bool,
     debug_log: &mut DebugLog,
     window_title: Option<&str>,
+    canvas_name: &str,
 ) -> Vec<PanelAction> {
     let mut actions = Vec::new();
 
@@ -369,8 +370,22 @@ pub fn draw_inspector(
         let node = graph.nodes.get(&node_id).unwrap().clone();
         let template = registry.templates.get(&node.template_name);
 
-        // Node info
-        ui.label(RichText::new(format!("#{} {}", node.id, node.template_name)).color(TEXT));
+        // Node info + editable label
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("#{}", node.id)).color(TEXT_DIM));
+            let mut label = node.label.clone();
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut label)
+                    .desired_width(ui.available_width() - 4.0)
+                    .font(egui::TextStyle::Body),
+            );
+            if resp.changed() && !label.is_empty() {
+                let old_label = graph.nodes[&node_id].label.clone();
+                graph.nodes.get_mut(&node_id).unwrap().label = label;
+                let new_label = &graph.nodes[&node_id].label;
+                crate::persistence::rename_node_file(canvas_name, &old_label, new_label);
+            }
+        });
 
         // Phantom node: show remote info, output values, no code editor
         if node.phantom {
@@ -437,35 +452,78 @@ pub fn draw_inspector(
                         );
                         if response.changed() {
                             let n = graph.nodes.get_mut(&node_id).unwrap();
-                            n.script_code = code;
+                            n.set_code(code);
                             n.render_blocks.clear();
+                            let _ = crate::persistence::save_node_file(canvas_name, n);
                         }
 
-                        // Input port overrides
+                        // Exports editor
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Exports").color(TEXT_DIM).small());
+                        {
+                            let mut exports_text = graph.nodes[&node_id].exports.join(" ");
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut exports_text)
+                                    .hint_text("gain freq ...")
+                                    .desired_width(ui.available_width()),
+                            );
+                            if resp.changed() {
+                                let new_exports: Vec<String> = exports_text
+                                    .split_whitespace()
+                                    .map(|s| s.to_string())
+                                    .collect();
+                                graph.nodes.get_mut(&node_id).unwrap().exports = new_exports;
+                            }
+                        }
+
+                        // Imports editor
                         ui.add_space(4.0);
-                        ui.label(RichText::new("Inputs").color(TEXT_DIM));
-                        for port in &template.inputs {
-                            let connected = graph.is_port_connected(node_id, &port.name);
-                            if connected {
+                        ui.label(RichText::new("Imports").color(TEXT_DIM).small());
+                        {
+                            let current_label = graph.nodes[&node_id].label.replace(' ', "-");
+                            let available_modules: Vec<(String, String)> = graph.nodes.iter()
+                                .filter(|(&id, n)| id != node_id && !n.phantom && !n.exports.is_empty())
+                                .map(|(_, n)| {
+                                    let module = n.label.replace(' ', "-");
+                                    (module, n.label.clone())
+                                })
+                                .collect();
+
+                            // Show existing imports with remove button
+                            let imports = graph.nodes[&node_id].imports.clone();
+                            let mut to_remove: Option<usize> = None;
+                            for (i, (canvas, module)) in imports.iter().enumerate() {
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(&port.name).color(TEXT_DIM));
-                                    ui.label(RichText::new("(connected)").color(TEXT_DIM).small());
+                                    ui.label(RichText::new(format!("{}/{}", canvas, module)).color(TEXT));
+                                    if ui.small_button("x").clicked() {
+                                        to_remove = Some(i);
+                                    }
                                 });
-                            } else {
-                                ui.label(RichText::new(&port.name).color(TEXT));
-                                let mut val = graph.nodes[&node_id]
-                                    .input_values
-                                    .get(&port.name)
-                                    .cloned()
-                                    .unwrap_or_else(|| port.port_type.default_value());
-                                if draw_value_editor(ui, &mut val) {
-                                    graph
-                                        .nodes
-                                        .get_mut(&node_id)
-                                        .unwrap()
-                                        .input_values
-                                        .insert(port.name.clone(), val);
-                                }
+                            }
+                            if let Some(idx) = to_remove {
+                                graph.nodes.get_mut(&node_id).unwrap().imports.remove(idx);
+                            }
+
+                            // Add import dropdown
+                            let not_imported: Vec<_> = available_modules.iter()
+                                .filter(|(module, _)| {
+                                    *module != current_label &&
+                                    !imports.iter().any(|(_, m)| m == module)
+                                })
+                                .collect();
+                            if !not_imported.is_empty() {
+                                egui::ComboBox::from_id_salt("add_import")
+                                    .selected_text("+ add import")
+                                    .width(ui.available_width() - 8.0)
+                                    .show_ui(ui, |ui| {
+                                        for (module, display_label) in &not_imported {
+                                            if ui.selectable_label(false, display_label.as_str()).clicked() {
+                                                graph.nodes.get_mut(&node_id).unwrap().imports.push(
+                                                    (canvas_name.to_string(), module.to_string())
+                                                );
+                                            }
+                                        }
+                                    });
                             }
                         }
                     }

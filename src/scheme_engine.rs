@@ -188,6 +188,7 @@ pub struct ModuleHeader {
 ///   (use-module (my-canvas wave))
 ///   (use-module (other-canvas sensors)))
 /// ```
+/// Migration: used by migrate_module_header() to extract metadata from legacy code.
 pub fn parse_module_header(code: &str) -> Option<ModuleHeader> {
     let dm_start = code.find("(define-module")?;
     // Find the matching closing paren for the define-module form
@@ -265,12 +266,28 @@ fn find_matching_paren(code: &str, start: usize) -> Option<usize> {
     None
 }
 
-/// Extract imports from code as (canvas_name, module_name) pairs.
+/// Migration helper: extract imports from code as (canvas_name, module_name) pairs.
+/// Prefer reading node.imports directly — this function is for backward compat only.
 pub fn extract_imports(code: &str) -> Vec<(String, String)> {
     if let Some(header) = parse_module_header(code) {
         return header.imports;
     }
     Vec::new()
+}
+
+/// Migration: extract define-module metadata into Node fields and strip header from code.
+/// Idempotent — skips if node already has exports or imports populated.
+pub fn migrate_module_header(node: &mut crate::types::Node) {
+    if !node.exports.is_empty() || !node.imports.is_empty() {
+        return;
+    }
+    if let Some(header) = parse_module_header(&node.script_code) {
+        node.exports = header.exports;
+        node.imports = header.imports;
+        let (body, _) = strip_module_header(&node.script_code);
+        node.script_code = body;
+        node.recompute_hash();
+    }
 }
 
 /// Strip `(define-module ...)` form from code, returning the body.
@@ -292,8 +309,6 @@ pub fn strip_module_header(code: &str) -> (String, Vec<String>) {
 }
 
 const PORT_WRAPPERS: &str = r#"
-    (define (input name type) (register-input name type))
-    (define (output name type) (register-output name type))
     (define (widget name type . params)
       (register-widget name type
         (if (null? params) 0 (car params))
@@ -451,24 +466,22 @@ impl SchemeEngine {
         Ok(env)
     }
 
-    /// Register stub libraries for all nodes with define-module headers.
+    /// Register stub libraries for all nodes with exports.
     /// All exports get sentinel values. This ensures (import (canvas module))
     /// never fails, even before first compute.
     pub fn register_stub_libraries(&self, canvas_name: &str, nodes: &std::collections::HashMap<crate::types::NodeId, crate::types::Node>) {
         for (node_id, node) in nodes {
-            if let Some(header) = parse_module_header(&node.script_code) {
-                if header.exports.is_empty() && header.name.is_empty() {
-                    continue;
-                }
-                // Use existing output_values if available, otherwise 0.0 defaults
-                let mut stub_outputs = std::collections::HashMap::new();
-                for export_name in &header.exports {
-                    let val = node.output_values.get(export_name).cloned()
-                        .unwrap_or(crate::types::Value::F64(0.0));
-                    stub_outputs.insert(export_name.clone(), val);
-                }
-                self.register_node_library_named(*node_id, canvas_name, &header.name, &stub_outputs);
+            let module_name = node.label.replace(' ', "-");
+            if node.exports.is_empty() || module_name.is_empty() {
+                continue;
             }
+            let mut stub_outputs = std::collections::HashMap::new();
+            for export_name in &node.exports {
+                let val = node.output_values.get(export_name).cloned()
+                    .unwrap_or(crate::types::Value::F64(0.0));
+                stub_outputs.insert(export_name.clone(), val);
+            }
+            self.register_node_library_named(*node_id, canvas_name, &module_name, &stub_outputs);
         }
     }
 
@@ -599,7 +612,7 @@ impl SchemeEngine {
         forms
     }
 
-    /// Eval preprocessed code form-by-form.
+    /// Eval module-stripped code form-by-form.
     /// Imports need `eval(true, ...)`. Everything else uses `eval(false, ...)`
     /// which persists defines in the REPL env and allows runtime variable lookup.
     fn eval_forms(env: &TopLevelEnvironment, code: &str) -> Result<Vec<Value>> {
@@ -660,42 +673,42 @@ impl SchemeEngine {
         db: Option<&crate::db::Db>,
         code: &str,
     ) -> Result<ScriptResult> {
-        let (result, _env, _preprocessed) = self.execute_script_cached(None, available_inputs, db, code)?;
+        let (result, _env, _preprocessed) = self.execute_script_cached(None, available_inputs, db, code, &[], &[])?;
         Ok(result)
     }
 
     /// Execute a script, optionally reusing a cached environment.
-    /// Returns (result, env) — caller can cache the env for next eval.
+    /// Returns (result, env, eval_code) — caller can cache env and eval_code for next eval.
     /// When env is reused, `set!` mutations persist between computes.
+    ///
+    /// `exports` and `imports` come from Node struct fields (not from code).
+    /// `code` is pure Scheme without define-module header.
     pub fn execute_script_cached(
         &self,
         cached_env: Option<TopLevelEnvironment>,
         available_inputs: &HashMap<String, crate::types::Value>,
         db: Option<&crate::db::Db>,
         code: &str,
+        exports: &[String],
+        imports: &[(String, String)],
     ) -> Result<(ScriptResult, TopLevelEnvironment, String)> {
-
-        // Parse module header if present
-        let module_header = parse_module_header(code);
 
         // Nodes with module imports need fresh env each time —
         // R6RS library imports are static, so cached env has stale bindings.
-        let has_imports = module_header.as_ref().map_or(false, |h| !h.imports.is_empty());
+        let has_imports = !imports.is_empty();
         let env = if has_imports {
             self.make_env()
         } else {
             cached_env.unwrap_or_else(|| self.make_env())
         };
 
-        // Strip define-module, prepend imports as R6RS (import ...) statements
-        let eval_code = if module_header.is_some() {
-            let (body, import_stmts) = strip_module_header(code);
+        // Generate (import ...) statements from structured imports, prepend to code
+        let eval_code = if !imports.is_empty() {
             let mut full = String::new();
-            for stmt in &import_stmts {
-                full.push_str(stmt);
-                full.push('\n');
+            for (canvas, module) in imports {
+                full.push_str(&format!("(import ({} {}))\n", canvas, module));
             }
-            full.push_str(&body);
+            full.push_str(code);
             full
         } else {
             code.to_string()
@@ -709,29 +722,18 @@ impl SchemeEngine {
         let results = eval_result?;
         let render_blocks = extract_render_blocks(&results);
 
-        // Determine output names: from module header exports, or legacy PortRegistry
-        let (declared_inputs, declared_outputs, widget_decls);
-        let output_names: Vec<String>;
-        if let Some(ref header) = module_header {
-            declared_inputs = Vec::new();
-            // Exports from header — widgets also register outputs via bridge
-            let mut exports = header.exports.clone();
-            // Add widget-declared outputs not already in exports
-            for (name, _) in &port_registry.outputs {
-                if !exports.contains(name) {
-                    exports.push(name.clone());
-                }
+        // Determine output names from exports metadata + widget names
+        let widget_decls = port_registry.widgets;
+        let mut output_names: Vec<String> = exports.to_vec();
+        // Add widget-declared outputs not already in exports
+        for w in &widget_decls {
+            if !output_names.contains(&w.name) {
+                output_names.push(w.name.clone());
             }
-            declared_outputs = exports.iter().map(|n| (n.clone(), "f64".to_string())).collect();
-            output_names = exports;
-            widget_decls = port_registry.widgets;
-        } else {
-            // Legacy: use PortRegistry
-            declared_inputs = port_registry.inputs;
-            declared_outputs = port_registry.outputs.clone();
-            output_names = port_registry.outputs.iter().map(|(name, _)| name.clone()).collect();
-            widget_decls = port_registry.widgets;
-        };
+        }
+        let declared_inputs: Vec<(String, String)> = Vec::new();
+        let declared_outputs: Vec<(String, String)> = output_names.iter()
+            .map(|n| (n.clone(), "f64".to_string())).collect();
 
         // Collect output values by name from environment
         let mut output_values = HashMap::new();
@@ -756,13 +758,15 @@ impl SchemeEngine {
         }, env, eval_code))
     }
 
-    /// Re-eval using already preprocessed code (skip Scribble preprocessing).
+    /// Re-eval using code with imports already prepended.
+    /// `exports` from Node fields used for output resolution when non-empty.
     pub fn eval_preprocessed(
         &self,
         env: &TopLevelEnvironment,
         available_inputs: &HashMap<String, crate::types::Value>,
         db: Option<&crate::db::Db>,
         preprocessed: &str,
+        exports: &[String],
     ) -> Result<ScriptResult> {
         let (eval_result, port_registry) = eval_with_bridge(
             Some(available_inputs), db,
@@ -771,11 +775,19 @@ impl SchemeEngine {
         let results = eval_result?;
         let render_blocks = extract_render_blocks(&results);
 
-        let (declared_inputs, declared_outputs, widget_decls) =
-            (port_registry.inputs, port_registry.outputs, port_registry.widgets);
+        let widget_decls = port_registry.widgets;
+        let mut output_names: Vec<String> = exports.to_vec();
+        for w in &widget_decls {
+            if !output_names.contains(&w.name) {
+                output_names.push(w.name.clone());
+            }
+        }
+        let declared_inputs: Vec<(String, String)> = Vec::new();
+        let declared_outputs: Vec<(String, String)> = output_names.iter()
+            .map(|n| (n.clone(), "f64".to_string())).collect();
 
         let mut output_values = HashMap::new();
-        for (name, _) in &declared_outputs {
+        for name in &output_names {
             if let Ok(vals) = env.eval(false, name) {
                 if let Some(val) = vals.first() {
                     output_values.insert(name.clone(), scheme_value_to_types_value(val));
@@ -977,10 +989,14 @@ mod tests {
         let db = crate::db::Db::new().unwrap();
         db.kv_set("gain", serde_json::json!(2.0));
         // define after set!, then use the defined variable
-        let result = engine.execute_script(
+        let exports = vec!["r".to_string()];
+        let (result, _, _) = engine.execute_script_cached(
+            None,
             &inputs(&[("x", 5.0)]),
             Some(&db),
-            "(define x (input 'x 'f64))\n(define r (output 'r 'f64))\n(set! r (* x 2))\n(define gain (store-get \"gain\"))\n(set! r (* r gain))",
+            "(define x 5)\n(define r 0)\n(set! r (* x 2))\n(define gain (store-get \"gain\"))\n(set! r (* r gain))",
+            &exports,
+            &[],
         ).unwrap();
         // x=5, r=5*2=10, gain=2, r=10*2=20
         assert!(matches!(result.output_values.get("r"), Some(crate::types::Value::F64(v)) if (*v - 20.0).abs() < 1e-10));
@@ -1020,8 +1036,15 @@ mod tests {
     #[test]
     fn test_with_bindings() {
         let engine = SchemeEngine::new().unwrap();
-        let map = inputs(&[("x", 7.0), ("y", 3.0)]);
-        let result = engine.execute_script(&map, None, "(define x (input 'x 'f64))\n(define y (input 'y 'f64))\n(define result (output 'result 'f64))\n(set! result (* x y))").unwrap();
+        let exports = vec!["result".to_string()];
+        let (result, _, _) = engine.execute_script_cached(
+            None,
+            &inputs(&[("x", 7.0), ("y", 3.0)]),
+            None,
+            "(define x 7)\n(define y 3)\n(define result (* x y))",
+            &exports,
+            &[],
+        ).unwrap();
         match result.output_values.get("result") {
             Some(crate::types::Value::F64(v)) => assert!((*v - 21.0).abs() < 1e-10),
             other => panic!("Expected F64(21.0), got {:?}", other),
@@ -1055,9 +1078,9 @@ mod tests {
         let engine = SchemeEngine::new().unwrap();
         let result = engine
             .execute_script(
-                &inputs(&[("x", 42.0)]),
+                &HashMap::new(),
                 None,
-                r#"(define x (input 'x 'f64))
+                r#"(define x 42)
 (render (bold "Result") (text "Value: " (number->string x)))"#,
             )
             .unwrap();
@@ -1071,8 +1094,8 @@ mod tests {
         let result = engine
             .preview_script(
                 None,
-                r#"(define x (input 'x 'f64))
-(define y (input 'y 'f64))
+                r#"(define x <compute>)
+(define y <compute>)
 (render (bold "Analysis") (text "x + y = " (+ x y)) (hr) (plot-line (list 1 2 x 4) "test"))"#,
             )
             .unwrap();
@@ -1259,16 +1282,21 @@ mod tests {
 
         std::env::set_var("SCHEME_RS_LOAD_PATH", &dir);
         let engine = SchemeEngine::new().unwrap();
-        let result = engine.execute_script(
+        let exports = vec!["msg".to_string()];
+        let imports = vec![("mylib".to_string(), String::new())];
+        let result = engine.execute_script_cached(
+            None,
             &HashMap::new(),
             None,
-            "(import (mylib))\n(define msg (output 'msg 'str))\n(set! msg (greet \"World\"))",
+            "(import (mylib))\n(define msg (greet \"World\"))",
+            &exports,
+            &[],
         );
         // Clean up
         std::fs::remove_file(&lib_file).ok();
         std::fs::remove_dir(&dir).ok();
 
-        let result = result.unwrap();
+        let (result, _, _) = result.unwrap();
         match result.output_values.get("msg") {
             Some(crate::types::Value::Str(s)) => assert!(s.contains("Hello"), "Got: {}", s),
             other => panic!("Expected string output, got: {:?}", other),
@@ -1284,20 +1312,6 @@ mod tests {
             "(import (nonexistent-lib-xyz))",
         );
         assert!(result.is_err(), "Expected error for missing library");
-    }
-
-    #[test]
-    fn test_dynamic_input_port() {
-        let engine = SchemeEngine::new().unwrap();
-        let mut map = HashMap::new();
-        map.insert("x".to_string(), crate::types::Value::F64(7.0));
-        let result = engine.execute_script(&map, None,
-            "(define x (input 'x 'f64))\n(define r (output 'r 'f64))\n(set! r (* x 3))").unwrap();
-        assert_eq!(result.declared_inputs.len(), 1);
-        assert_eq!(result.declared_inputs[0].0, "x");
-        assert_eq!(result.declared_outputs.len(), 1);
-        assert_eq!(result.declared_outputs[0].0, "r");
-        assert!(matches!(result.output_values.get("r"), Some(crate::types::Value::F64(v)) if (*v - 21.0).abs() < 1e-10));
     }
 
     #[test]
@@ -1323,15 +1337,6 @@ mod tests {
     }
 
     #[test]
-    fn test_new_syntax_input_returns_value() {
-        let engine = SchemeEngine::new().unwrap();
-        let map = inputs(&[("a", 3.0), ("b", 4.0)]);
-        let result = engine.execute_script(&map, None,
-            "(define a (input 'a 'f64))\n(define b (input 'b 'f64))\n(define r (output 'r 'f64))\n(set! r (+ a b))").unwrap();
-        assert!(matches!(result.output_values.get("r"), Some(crate::types::Value::F64(v)) if (*v - 7.0).abs() < 1e-10));
-    }
-
-    #[test]
     fn test_checkbox_widget() {
         let engine = SchemeEngine::new().unwrap();
         let mut map = HashMap::new();
@@ -1346,11 +1351,15 @@ mod tests {
     #[test]
     fn test_scheme_render_pipeline() {
         let engine = SchemeEngine::new().unwrap();
-        let code = "(define x (input 'x 'f64))\n(define result (output 'result 'f64))\n(set! result (* x 2))\n(render (bold \"Title\") (text (string-append \"Result is \" (->str result))))";
-        let result = engine.execute_script(
-            &inputs(&[("x", 5.0)]),
+        let code = "(define x 5)\n(define result (* x 2))\n(render (bold \"Title\") (text (string-append \"Result is \" (->str result))))";
+        let exports = vec!["result".to_string()];
+        let (result, _, _) = engine.execute_script_cached(
+            None,
+            &HashMap::new(),
             None,
             code,
+            &exports,
+            &[],
         ).unwrap();
         assert!(matches!(result.output_values.get("result"),
             Some(crate::types::Value::F64(v)) if (*v - 10.0).abs() < f64::EPSILON));
@@ -1384,10 +1393,8 @@ mod tests {
     fn test_canvas_wave_script() {
         let engine = SchemeEngine::new().unwrap();
         let script = r##"
-(define gain-raw (input 'gain 'f64))
-(define freq-raw (input 'freq 'f64))
-(define gain (if (compute? gain-raw) 50.0 gain-raw))
-(define freq (if (compute? freq-raw) 5.0 freq-raw))
+(define gain 50.0)
+(define freq 5.0)
 
 (define pi 3.14159265)
 (define w 300.0)

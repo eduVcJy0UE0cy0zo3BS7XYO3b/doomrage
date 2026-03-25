@@ -26,7 +26,13 @@ pub fn save_graph(graph: &Graph, path: &Path, db: &Db) -> Result<()> {
 
 pub fn load_graph(path: &Path, db: &Db) -> Result<Graph> {
     let json = std::fs::read_to_string(path)?;
-    let graph: Graph = serde_json::from_str(&json)?;
+    let mut graph: Graph = serde_json::from_str(&json)?;
+
+    // Migrate: extract define-module headers into Node fields
+    for node in graph.nodes.values_mut() {
+        crate::scheme_engine::migrate_module_header(node);
+        node.recompute_hash();
+    }
 
     // Load DB if exists alongside
     let db_path = db_path_for(path);
@@ -56,6 +62,65 @@ pub fn load_db(db: &Db, path: &Path) -> Result<()> {
     Ok(())
 }
 
+// --- File-per-node: .scm files ---
+
+/// Root directory for node source files.
+pub fn nodes_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".canvas").join("nodes")
+}
+
+/// Path to a node's .scm source file.
+pub fn node_file_path(canvas_name: &str, label: &str) -> PathBuf {
+    let safe_label = label.replace(' ', "-");
+    nodes_dir().join(canvas_name).join(format!("{}.scm", safe_label))
+}
+
+/// Write a Script node's code to its .scm file.
+pub fn save_node_file(canvas_name: &str, node: &Node) -> Result<()> {
+    if node.template_name != "Script" || node.phantom {
+        return Ok(());
+    }
+    let path = node_file_path(canvas_name, &node.label);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, &node.script_code)?;
+    Ok(())
+}
+
+/// Delete a node's .scm file if it exists.
+pub fn delete_node_file(canvas_name: &str, label: &str) {
+    let path = node_file_path(canvas_name, label);
+    let _ = std::fs::remove_file(path);
+}
+
+/// Rename a node's .scm file when label changes.
+pub fn rename_node_file(canvas_name: &str, old_label: &str, new_label: &str) {
+    let old_path = node_file_path(canvas_name, old_label);
+    let new_path = node_file_path(canvas_name, new_label);
+    if old_path.exists() {
+        if let Some(parent) = new_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::rename(old_path, new_path);
+    }
+}
+
+/// Load script_code from .scm file into a node. Returns true if loaded from file.
+pub fn load_node_file(canvas_name: &str, node: &mut Node) -> bool {
+    if node.template_name != "Script" || node.phantom {
+        return false;
+    }
+    let path = node_file_path(canvas_name, &node.label);
+    if path.exists() {
+        if let Ok(code) = std::fs::read_to_string(&path) {
+            node.set_code(code);
+            return true;
+        }
+    }
+    false
+}
+
 // --- DB graph persistence (multi-canvas) ---
 
 const DEFAULT_CANVAS: &str = "default";
@@ -79,9 +144,15 @@ pub fn save_canvas_to_db(canvas_name: &str, graph: &Graph, db: &Db) -> Result<()
         if node.phantom { continue; }
         let input_values_json = serde_json::to_string(&node.input_values)?;
         let widget_values_json = serde_json::to_string(&node.widget_values)?;
-        let script_code_escaped = Db::escape_surql(&node.script_code);
+        let exports_json = serde_json::to_string(&node.exports)?;
+        let imports_json = serde_json::to_string(&node.imports)?;
         let label_escaped = Db::escape_surql(&node.label);
         let template_escaped = Db::escape_surql(&node.template_name);
+
+        // Write script_code to .scm file (not DB)
+        if let Err(e) = save_node_file(canvas_name, node) {
+            log::warn!("Failed to save node file for '{}': {}", node.label, e);
+        }
 
         db.run(&format!(
             "CREATE graph_nodes SET \
@@ -91,18 +162,20 @@ pub fn save_canvas_to_db(canvas_name: &str, graph: &Graph, db: &Db) -> Result<()
              label = '{}', \
              pos_x = {}, \
              pos_y = {}, \
-             script_code = '{}', \
              input_values_json = '{}', \
-             widget_values_json = '{}'",
+             widget_values_json = '{}', \
+             exports_json = '{}', \
+             imports_json = '{}'",
             cn,
             node.id,
             template_escaped,
             label_escaped,
             node.pos[0],
             node.pos[1],
-            script_code_escaped,
             Db::escape_surql(&input_values_json),
             Db::escape_surql(&widget_values_json),
+            Db::escape_surql(&exports_json),
+            Db::escape_surql(&imports_json),
         ))?;
     }
 
@@ -139,7 +212,11 @@ pub fn load_canvas_from_db(canvas_name: &str, db: &Db) -> Result<Option<Graph>> 
         "SELECT * FROM graph_nodes WHERE canvas = '{}'", cn
     ))?;
     for row in &node_rows {
-        if let Some(node) = parse_node_row(row) {
+        if let Some(mut node) = parse_node_row(row) {
+            crate::scheme_engine::migrate_module_header(&mut node);
+            // Load code from .scm file; fall back to DB script_code for migration
+            load_node_file(canvas_name, &mut node);
+            node.recompute_hash();
             graph.nodes.insert(node.id, node);
         }
     }
@@ -199,6 +276,15 @@ fn parse_node_row(row: &serde_json::Value) -> Option<Node> {
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
 
+    let exports: Vec<String> = row.get("exports_json")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let imports: Vec<(String, String)> = row.get("imports_json")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
     Some(Node {
         id: node_id,
         template_name,
@@ -211,6 +297,9 @@ fn parse_node_row(row: &serde_json::Value) -> Option<Node> {
         script_outputs: Vec::new(),
         widget_decls: Vec::new(),
         widget_values,
+        exports,
+        imports,
+        code_hash: 0,
         error: None,
         last_exec_us: None,
         render_blocks: Vec::new(),
@@ -436,16 +525,22 @@ fn parse_scm(src: &str) -> Result<Graph> {
 
     graph.next_node_id = max_node_id + 1;
 
-    // Convert legacy connections to imports in target node script_code
+    // Convert legacy connections to node.imports
     for lc in &legacy_connections {
         if let Some(source_label) = graph.nodes.get(&lc.from_node).map(|n| n.label.replace(' ', "-")) {
             if let Some(target_node) = graph.nodes.get_mut(&lc.to_node) {
-                let import_line = format!("(import (node {}))", source_label);
-                if !target_node.script_code.contains(&import_line) {
-                    target_node.script_code = format!("{}\n{}", import_line, target_node.script_code);
+                let pair = ("node".to_string(), source_label);
+                if !target_node.imports.contains(&pair) {
+                    target_node.imports.push(pair);
                 }
             }
         }
+    }
+
+    // Migrate: extract define-module headers into Node fields
+    for node in graph.nodes.values_mut() {
+        crate::scheme_engine::migrate_module_header(node);
+        node.recompute_hash();
     }
 
     Ok(graph)
@@ -504,9 +599,11 @@ fn parse_node_form(src: &str, form_start: usize, form_end: usize) -> Result<Node
         p = pos_end + 1;
     }
 
-    // Parse optional (inputs ...) and (widgets ...) blocks before the script body
+    // Parse optional metadata blocks before the script body
     let mut input_values: HashMap<String, crate::types::Value> = HashMap::new();
     let mut widget_values: HashMap<String, crate::types::Value> = HashMap::new();
+    let mut exports: Vec<String> = Vec::new();
+    let mut imports: Vec<(String, String)> = Vec::new();
 
     p = skip_ws(src, p);
     loop {
@@ -515,12 +612,47 @@ fn parse_node_form(src: &str, form_start: usize, form_end: usize) -> Result<Node
         // Peek at tag without consuming
         let inner = skip_ws(src, p + 1);
         let (tag, _) = read_token(src, inner);
-        if tag != "inputs" && tag != "widgets" { break; }
+        if tag != "inputs" && tag != "widgets" && tag != "exports" && tag != "imports" { break; }
 
         let block_end = find_sexp_end(src, p)
             .ok_or_else(|| anyhow::anyhow!("Bad {} block in node {}", tag, id))?;
-        let map = if tag == "inputs" { &mut input_values } else { &mut widget_values };
-        parse_kv_pairs(&src[p + 1..block_end], map)?;
+        if tag == "inputs" || tag == "widgets" {
+            let map = if tag == "inputs" { &mut input_values } else { &mut widget_values };
+            parse_kv_pairs(&src[p + 1..block_end], map)?;
+        } else if tag == "exports" {
+            // (exports "name1" "name2" ...)
+            let content = &src[inner..block_end];
+            let (_, after_tag) = read_token(content, 0);
+            let rest = content[after_tag..].trim();
+            let mut ep = 0;
+            while ep < rest.len() {
+                let rp = skip_ws(rest, ep);
+                if rp >= rest.len() { break; }
+                let (name, np) = parse_quoted(rest, rp);
+                if !name.is_empty() { exports.push(name); }
+                ep = np;
+            }
+        } else if tag == "imports" {
+            // (imports ("canvas" "module") ...)
+            let content = &src[inner..block_end];
+            let (_, after_tag) = read_token(content, 0);
+            let mut ip = after_tag;
+            while ip < content.len() {
+                ip = skip_ws(content, ip);
+                if ip >= content.len() || content.as_bytes()[ip] != b'(' { break; }
+                let pair_end = find_sexp_end(content, ip)
+                    .unwrap_or(content.len() - 1);
+                let pair_inner = &content[ip + 1..pair_end];
+                let mut pp = skip_ws(pair_inner, 0);
+                let (canvas, pp2) = parse_quoted(pair_inner, pp);
+                pp = skip_ws(pair_inner, pp2);
+                let (module, _) = parse_quoted(pair_inner, pp);
+                if !canvas.is_empty() && !module.is_empty() {
+                    imports.push((canvas, module));
+                }
+                ip = pair_end + 1;
+            }
+        }
         p = block_end + 1;
     }
 
@@ -541,6 +673,9 @@ fn parse_node_form(src: &str, form_start: usize, form_end: usize) -> Result<Node
         script_outputs: Vec::new(),
         widget_decls: Vec::new(),
         widget_values,
+        exports,
+        imports,
+        code_hash: 0,
         error: None,
         last_exec_us: None,
         render_blocks: Vec::new(),
@@ -714,6 +849,24 @@ fn serialize_scm(graph: &Graph) -> String {
             out.push_str(")\n");
         }
 
+        // Write exports if non-empty
+        if !node.exports.is_empty() {
+            out.push_str("  (exports");
+            for e in &node.exports {
+                out.push_str(&format!(" {:?}", e));
+            }
+            out.push_str(")\n");
+        }
+
+        // Write imports if non-empty
+        if !node.imports.is_empty() {
+            out.push_str("  (imports");
+            for (c, m) in &node.imports {
+                out.push_str(&format!(" ({:?} {:?})", c, m));
+            }
+            out.push_str(")\n");
+        }
+
         // Indent each line of script_code by 2 spaces
         for line in node.script_code.lines() {
             if line.is_empty() {
@@ -812,7 +965,7 @@ mod tests {
 
 (node 2 "Script" "world" (pos 200.0 100.0)
 
-  (define y (input 'x 'f64))
+  (define y 0)
 )
 
 (connection 1 (from 1 "out") (to 2 "in"))
@@ -845,8 +998,8 @@ mod tests {
 
         let node2 = &graph.nodes[&2];
         assert_eq!(node2.template_name, "Script");
-        // Legacy connection should have been converted to import in node2's code
-        assert!(node2.script_code.contains("(import (node hello))"));
+        // Legacy connection should have been converted to node.imports
+        assert!(node2.imports.contains(&("node".to_string(), "hello".to_string())));
 
         assert_eq!(graph.next_node_id, 3);
     }
@@ -905,7 +1058,10 @@ mod tests {
 
         let controls = &graph.nodes[&1];
         assert_eq!(controls.label, "controls");
-        assert!(controls.script_code.contains("define-module"));
+        // After migration, define-module is stripped and exports/imports populated
+        assert!(!controls.script_code.contains("define-module"));
+        assert!(controls.exports.contains(&"gain".to_string()));
+        assert!(controls.exports.contains(&"freq".to_string()));
     }
 
     #[test]
@@ -926,6 +1082,9 @@ mod tests {
             script_outputs: Vec::new(),
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
+            exports: Vec::new(),
+            imports: Vec::new(),
+            code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -987,6 +1146,9 @@ mod tests {
             script_outputs: Vec::new(),
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
+            exports: Vec::new(),
+            imports: Vec::new(),
+            code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -1006,6 +1168,9 @@ mod tests {
             script_outputs: Vec::new(),
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
+            exports: Vec::new(),
+            imports: Vec::new(),
+            code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -1038,6 +1203,9 @@ mod tests {
             script_outputs: Vec::new(),
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
+            exports: Vec::new(),
+            imports: Vec::new(),
+            code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -1064,7 +1232,8 @@ mod tests {
             pos: [0.0, 0.0], input_values: HashMap::new(), output_values: HashMap::new(),
             script_code: "(define a 1)".to_string(), script_inputs: Vec::new(),
             script_outputs: Vec::new(), widget_decls: Vec::new(), widget_values: HashMap::new(),
-            error: None, last_exec_us: None, render_blocks: Vec::new(),
+            exports: Vec::new(), imports: Vec::new(),
+            code_hash: 0, error: None, last_exec_us: None, render_blocks: Vec::new(),
             phantom: false, remote_peer: None,
         });
         g1.next_node_id = 2;
@@ -1075,7 +1244,8 @@ mod tests {
             pos: [100.0, 100.0], input_values: HashMap::new(), output_values: HashMap::new(),
             script_code: "(define b 2)".to_string(), script_inputs: Vec::new(),
             script_outputs: Vec::new(), widget_decls: Vec::new(), widget_values: HashMap::new(),
-            error: None, last_exec_us: None, render_blocks: Vec::new(),
+            exports: Vec::new(), imports: Vec::new(),
+            code_hash: 0, error: None, last_exec_us: None, render_blocks: Vec::new(),
             phantom: false, remote_peer: None,
         });
         g2.next_node_id = 2;

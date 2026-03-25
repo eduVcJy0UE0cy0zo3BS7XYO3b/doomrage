@@ -1,7 +1,15 @@
-use crate::scheme_engine::extract_imports;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+
+/// Content hash of code string. Same code = same hash regardless of node name/position.
+pub fn content_hash(code: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    code.hash(&mut hasher);
+    hasher.finish()
+}
 
 // Re-export from net crate
 pub use wasm_canvas_net::{Value, RepaintSignal, NoRepaint};
@@ -123,6 +131,15 @@ pub struct Node {
     pub widget_decls: Vec<crate::bridge::WidgetDecl>,
     #[serde(default)]
     pub widget_values: HashMap<String, Value>,
+    /// Module exports declared by this node (e.g. ["gain", "freq"])
+    #[serde(default)]
+    pub exports: Vec<String>,
+    /// Module imports: (canvas_name, module_name) pairs
+    #[serde(default)]
+    pub imports: Vec<(String, String)>,
+    /// Content hash of script_code — same code = same hash regardless of name/position
+    #[serde(skip)]
+    pub code_hash: u64,
     #[serde(skip)]
     pub error: Option<String>,
     #[serde(skip)]
@@ -153,6 +170,17 @@ impl Node {
         } else {
             template.map(|t| t.outputs.as_slice()).unwrap_or(&[])
         }
+    }
+
+    /// Update script_code and recompute content hash.
+    pub fn set_code(&mut self, code: String) {
+        self.code_hash = content_hash(&code);
+        self.script_code = code;
+    }
+
+    /// Recompute code_hash from current script_code.
+    pub fn recompute_hash(&mut self) {
+        self.code_hash = content_hash(&self.script_code);
     }
 }
 
@@ -200,12 +228,12 @@ impl Graph {
         let script_code = if let Some(ref code) = template.script_code {
             code.clone()
         } else if template.builtin == Some(BuiltinKind::Script) {
-            "(define x (input 'x 'f64))\n(define y (input 'y 'f64))\n(define result (output 'result 'f64))\n(set! result (+ x y))\n\n# Result\n\nThe sum is @result.\n\n| input | value |\n|-------|-------|\n| x     | @x    |\n| y     | @y    |".to_string()
+"".to_string()
         } else {
             String::new()
         };
 
-        let node = Node {
+        let mut node = Node {
             id,
             template_name: template.name.clone(),
             label: template.name.clone(),
@@ -217,12 +245,17 @@ impl Graph {
             script_outputs: Vec::new(),
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
+            exports: Vec::new(),
+            imports: Vec::new(),
+            code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
             phantom: false,
             remote_peer: None,
         };
+        crate::scheme_engine::migrate_module_header(&mut node);
+        node.recompute_hash();
         self.nodes.insert(id, node);
         id
     }
@@ -248,12 +281,11 @@ impl Graph {
             Some(n) => n,
             None => return Vec::new(),
         };
-        let header = match crate::scheme_engine::parse_module_header(&node.script_code) {
-            Some(h) => h,
-            None => return Vec::new(),
-        };
+        if node.imports.is_empty() {
+            return Vec::new();
+        }
         let mut inputs = Vec::new();
-        for (_, module_name) in &header.imports {
+        for (_, module_name) in &node.imports {
             if let Some(src_id) = self.find_node_by_import_label(module_name) {
                 if let Some(src) = self.nodes.get(&src_id) {
                     for port in &src.script_outputs {
@@ -271,8 +303,8 @@ impl Graph {
     fn import_edges(&self) -> Vec<(NodeId, NodeId)> {
         let mut edges = Vec::new();
         for (&target_id, target_node) in &self.nodes {
-            for (_, module_name) in extract_imports(&target_node.script_code) {
-                if let Some(source_id) = self.find_node_by_import_label(&module_name) {
+            for (_, module_name) in &target_node.imports {
+                if let Some(source_id) = self.find_node_by_import_label(module_name) {
                     edges.push((source_id, target_id));
                 }
             }
@@ -315,8 +347,8 @@ impl Graph {
         let mut vals = node.input_values.clone();
 
         // Add upstream output values from all imported nodes
-        for (_, module_name) in extract_imports(&node.script_code) {
-            if let Some(source_id) = self.find_node_by_import_label(&module_name) {
+        for (_, module_name) in &node.imports {
+            if let Some(source_id) = self.find_node_by_import_label(module_name) {
                 if let Some(src) = self.nodes.get(&source_id) {
                     for (out_name, out_val) in &src.output_values {
                         vals.insert(out_name.clone(), out_val.clone());
@@ -339,8 +371,8 @@ impl Graph {
             Some(n) => n,
             None => return false,
         };
-        for (_, module_name) in extract_imports(&node.script_code) {
-            if let Some(source_id) = self.find_node_by_import_label(&module_name) {
+        for (_, module_name) in &node.imports {
+            if let Some(source_id) = self.find_node_by_import_label(module_name) {
                 if let Some(src) = self.nodes.get(&source_id) {
                     if src.output_values.contains_key(port_name)
                         || src.script_outputs.iter().any(|p| p.name == port_name)
@@ -451,8 +483,7 @@ impl Graph {
         let mut result = Vec::new();
         for (&id, node) in &self.nodes {
             if id != source_id {
-                let imports = extract_imports(&node.script_code);
-                if imports.iter().any(|(_, module)| *module == source_label) {
+                if node.imports.iter().any(|(_, module)| *module == source_label) {
                     result.push(id);
                 }
             }
@@ -486,6 +517,9 @@ mod tests {
             script_outputs: Vec::new(),
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
+            exports: Vec::new(),
+            imports: Vec::new(),
+            code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -507,12 +541,22 @@ mod tests {
             script_outputs: Vec::new(),
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
+            exports: Vec::new(),
+            imports: Vec::new(),
+            code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
             phantom: true,
             remote_peer: Some("peer-abc".to_string()),
         }
+    }
+
+    fn make_module_node(id: NodeId, label: &str, exports: &[&str], imports: &[(&str, &str)]) -> Node {
+        let mut node = make_node(id, label, "");
+        node.exports = exports.iter().map(|s| s.to_string()).collect();
+        node.imports = imports.iter().map(|(c, m)| (c.to_string(), m.to_string())).collect();
+        node
     }
 
     // --- Phantom node discovery via local imports ---
@@ -529,8 +573,7 @@ mod tests {
         graph.nodes.insert(1, phantom);
 
         // Node that imports controls
-        let wave = make_node(2, "wave",
-            "(define-module (test wave)\n  (use-module (test controls))\n  (export out))");
+        let wave = make_module_node(2, "wave", &["out"], &[("test", "controls")]);
         graph.nodes.insert(2, wave);
 
         // import_edges should find phantom as upstream of wave
@@ -556,8 +599,7 @@ mod tests {
         graph.nodes.insert(1, phantom);
 
         // Node that imports via remote syntax: (use-module (other-canvas controls))
-        let wave = make_node(2, "wave",
-            "(define-module (test wave)\n  (use-module (other-canvas controls))\n  (export out))");
+        let wave = make_module_node(2, "wave", &["out"], &[("other-canvas", "controls")]);
         graph.nodes.insert(2, wave);
 
         // resolve_all_input_values should find phantom via imports
@@ -571,16 +613,14 @@ mod tests {
     fn test_derive_inputs_from_local_module() {
         let mut graph = Graph::new();
 
-        let mut controls = make_node(1, "controls",
-            "(define-module (test controls)\n  (export gain freq))");
+        let mut controls = make_module_node(1, "controls", &["gain", "freq"], &[]);
         controls.script_outputs = vec![
             PortDef { name: "gain".to_string(), port_type: PortType::F64 },
             PortDef { name: "freq".to_string(), port_type: PortType::F64 },
         ];
         graph.nodes.insert(1, controls);
 
-        let wave = make_node(2, "wave",
-            "(define-module (test wave)\n  (use-module (test controls))\n  (export out))");
+        let wave = make_module_node(2, "wave", &["out"], &[("test", "controls")]);
         graph.nodes.insert(2, wave);
 
         let inputs = graph.derive_inputs_for_node(2);
@@ -601,8 +641,7 @@ mod tests {
         ];
         graph.nodes.insert(1, phantom);
 
-        let wave = make_node(2, "wave",
-            "(define-module (test wave)\n  (use-module (test controls))\n  (export out))");
+        let wave = make_module_node(2, "wave", &["out"], &[("test", "controls")]);
         graph.nodes.insert(2, wave);
 
         let inputs = graph.derive_inputs_for_node(2);
@@ -622,8 +661,7 @@ mod tests {
         ];
         graph.nodes.insert(1, phantom);
 
-        let consumer = make_node(2, "consumer",
-            "(define-module (test consumer)\n  (use-module (peer-abc data))\n  (export y))");
+        let consumer = make_module_node(2, "consumer", &["y"], &[("peer-abc", "data")]);
         graph.nodes.insert(2, consumer);
 
         let inputs = graph.derive_inputs_for_node(2);
@@ -641,8 +679,7 @@ mod tests {
         let phantom = make_phantom(1, "controls", outputs);
         graph.nodes.insert(1, phantom);
 
-        let wave = make_node(2, "wave",
-            "(define-module (test wave)\n  (use-module (test controls))\n  (export out))");
+        let wave = make_module_node(2, "wave", &["out"], &[("test", "controls")]);
         graph.nodes.insert(2, wave);
 
         let downstream = graph.direct_downstream(1);
@@ -656,8 +693,7 @@ mod tests {
         let mut graph = Graph::new();
 
         // Local "controls" with gain=100
-        let mut local = make_node(1, "controls",
-            "(define-module (test controls)\n  (export gain))");
+        let mut local = make_module_node(1, "controls", &["gain"], &[]);
         local.output_values.insert("gain".to_string(), Value::F64(100.0));
         graph.nodes.insert(1, local);
 
@@ -668,8 +704,7 @@ mod tests {
 
         // Consumer imports controls — should get local (id=1) because
         // find_node_by_import_label returns first match
-        let consumer = make_node(3, "consumer",
-            "(define-module (test consumer)\n  (use-module (test controls))\n  (export out))");
+        let consumer = make_module_node(3, "consumer", &["out"], &[("test", "controls")]);
         graph.nodes.insert(3, consumer);
 
         let inputs = graph.resolve_all_input_values(3);
@@ -687,8 +722,7 @@ mod tests {
         let phantom = make_phantom(1, "controls", outputs);
         graph.nodes.insert(1, phantom);
 
-        let mut wave = make_node(2, "wave",
-            "(define-module (test wave)\n  (use-module (test controls))\n  (export out))");
+        let mut wave = make_module_node(2, "wave", &["out"], &[("test", "controls")]);
         wave.widget_values.insert("gain".to_string(), Value::F64(999.0));
         graph.nodes.insert(2, wave);
 
@@ -707,12 +741,10 @@ mod tests {
         let phantom = make_phantom(1, "source", outputs);
         graph.nodes.insert(1, phantom);
 
-        let mid = make_node(2, "mid",
-            "(define-module (test mid)\n  (use-module (test source))\n  (export w))");
+        let mid = make_module_node(2, "mid", &["w"], &[("test", "source")]);
         graph.nodes.insert(2, mid);
 
-        let leaf = make_node(3, "leaf",
-            "(define-module (test leaf)\n  (use-module (test mid))\n  (export z))");
+        let leaf = make_module_node(3, "leaf", &["z"], &[("test", "mid")]);
         graph.nodes.insert(3, leaf);
 
         let order = graph.topological_sort().unwrap();
@@ -733,12 +765,10 @@ mod tests {
         let phantom = make_phantom(1, "source", outputs);
         graph.nodes.insert(1, phantom);
 
-        let a = make_node(2, "a",
-            "(define-module (test a)\n  (use-module (test source))\n  (export x))");
+        let a = make_module_node(2, "a", &["x"], &[("test", "source")]);
         graph.nodes.insert(2, a);
 
-        let b = make_node(3, "b",
-            "(define-module (test b)\n  (use-module (test a))\n  (export y))");
+        let b = make_module_node(3, "b", &["y"], &[("test", "a")]);
         graph.nodes.insert(3, b);
 
         let desc = graph.descendants_sorted(1);
@@ -807,12 +837,11 @@ mod tests {
         graph.nodes.insert(1, phantom);
 
         // Local node that imports from alice canvas
-        let consumer = make_node(2, "synth",
-            "(define-module (bob synth)\n  (use-module (alice controls))\n  (export sound))");
+        let consumer = make_module_node(2, "synth", &["sound"], &[("alice", "controls")]);
         graph.nodes.insert(2, consumer);
 
         // The import (alice controls) should resolve to phantom "controls" by module name
-        let imports = extract_imports(&graph.nodes[&2].script_code);
+        let imports = graph.nodes[&2].imports.clone();
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0], ("alice".to_string(), "controls".to_string()));
 
@@ -859,8 +888,7 @@ mod tests {
     fn test_cross_canvas_loopback() {
         // Canvas "alice" has a "controls" node
         let mut alice_graph = Graph::new();
-        let mut controls = make_node(1, "controls",
-            "(define-module (alice controls)\n  (export gain))");
+        let mut controls = make_module_node(1, "controls", &["gain"], &[]);
         controls.output_values.insert("gain".to_string(), Value::F64(88.0));
         controls.script_outputs = vec![
             PortDef { name: "gain".to_string(), port_type: PortType::F64 },
@@ -869,8 +897,7 @@ mod tests {
 
         // Canvas "bob" has a "synth" node that imports from alice
         let mut bob_graph = Graph::new();
-        let synth = make_node(2, "synth",
-            "(define-module (bob synth)\n  (use-module (alice controls))\n  (export sound))");
+        let synth = make_module_node(2, "synth", &["sound"], &[("alice", "controls")]);
         bob_graph.nodes.insert(2, synth);
 
         // Simulate loopback: alice publishes, bob receives phantom
@@ -899,21 +926,18 @@ mod tests {
         let mut graph = Graph::new();
 
         // Local "controls" module
-        let mut local = make_node(1, "controls",
-            "(define-module (demo controls)\n  (export gain))");
+        let mut local = make_module_node(1, "controls", &["gain"], &[]);
         local.output_values.insert("gain".to_string(), Value::F64(100.0));
         graph.nodes.insert(1, local);
 
         // Consumer imports controls
-        let consumer = make_node(2, "synth",
-            "(define-module (demo synth)\n  (use-module (demo controls))\n  (export out))");
+        let consumer = make_module_node(2, "synth", &["out"], &[("demo", "controls")]);
         graph.nodes.insert(2, consumer);
 
         // Simulate incoming network values for "controls"
-        // deliver_values checks: has_local → skip
+        // deliver_values checks: has_local → skip (now uses label match)
         let has_local = graph.nodes.values().any(|n| {
-            !n.phantom && crate::scheme_engine::parse_module_header(&n.script_code)
-                .map_or(false, |h| h.name == "controls")
+            !n.phantom && n.label == "controls"
         });
         assert!(has_local, "Local module should block phantom creation");
 
@@ -940,8 +964,7 @@ mod tests {
         graph.nodes.insert(2, phantom_c);
 
         // Local node imports from both
-        let synth = make_node(3, "synth",
-            "(define-module (bob synth)\n  (use-module (alice controls))\n  (use-module (charlie clock))\n  (export sound))");
+        let synth = make_module_node(3, "synth", &["sound"], &[("alice", "controls"), ("charlie", "clock")]);
         graph.nodes.insert(3, synth);
 
         let vals = graph.resolve_all_input_values(3);
@@ -1000,15 +1023,11 @@ mod tests {
         engine.register_node_library_named(1, "alice", "controls", &ctrl_outputs);
 
         // Execute a node that imports from alice/controls and uses gain directly
-        let code = r#"(define-module (bob synth)
-  (use-module (alice controls))
-  (export result))
-
-(define result (output 'result 'f64))
-(set! result (* gain 2))
-"#;
+        let code = "(define result (* gain 2))\n";
+        let exports = vec!["result".to_string()];
+        let imports = vec![("alice".to_string(), "controls".to_string())];
         let inputs = HashMap::new();
-        let result = engine.execute_script(&inputs, None, code).unwrap();
+        let (result, _, _) = engine.execute_script_cached(None, &inputs, None, code, &exports, &imports).unwrap();
         // gain=50 from library, result=50*2=100
         match result.output_values.get("result") {
             Some(Value::F64(v)) => assert!((*v - 100.0).abs() < f64::EPSILON),
@@ -1028,8 +1047,7 @@ mod tests {
         graph.nodes.insert(1, phantom);
 
         // Consumer
-        let consumer = make_node(2, "display",
-            "(define-module (local display)\n  (use-module (remote sensor))\n  (export out))");
+        let consumer = make_module_node(2, "display", &["out"], &[("remote", "sensor")]);
         graph.nodes.insert(2, consumer);
 
         // Initial resolve
@@ -1054,12 +1072,10 @@ mod tests {
         let phantom = make_phantom(1, "source", outputs);
         graph.nodes.insert(1, phantom);
 
-        let a = make_node(2, "processor",
-            "(define-module (demo processor)\n  (use-module (remote source))\n  (export x))");
+        let a = make_module_node(2, "processor", &["x"], &[("remote", "source")]);
         graph.nodes.insert(2, a);
 
-        let b = make_node(3, "output",
-            "(define-module (demo output)\n  (use-module (demo processor))\n  (export y))");
+        let b = make_module_node(3, "output", &["y"], &[("demo", "processor")]);
         graph.nodes.insert(3, b);
 
         // Topo sort: phantom(1) → processor(2) → output(3)
@@ -1101,7 +1117,7 @@ mod tests {
     /// __source__ is included in published values and can be extracted.
     #[test]
     fn test_source_code_in_published_values() {
-        let code = "(define-module (demo controls)\n  (export gain))\n\n(define gain (output 'gain 'f64))\n(set! gain 50)";
+        let code = "(define-module (demo controls)\n  (export gain))\n\n(define gain 50)";
         let header = crate::scheme_engine::parse_module_header(code).unwrap();
 
         // Simulate what auto_publish_node does
@@ -1132,7 +1148,7 @@ mod tests {
     /// Remote template is created from __source__ and can be used to add a node.
     #[test]
     fn test_remote_template_from_source() {
-        let code = "(define-module (alice synth)\n  (export sound))\n\n(define sound (output 'sound 'f64))\n(set! sound 42)";
+        let code = "(define-module (alice synth)\n  (export sound))\n\n(define sound 42)";
 
         let template = NodeTemplate {
             name: "synth".to_string(),
@@ -1150,8 +1166,10 @@ mod tests {
         let id = graph.add_node(&template, [100.0, 100.0]);
         let node = graph.nodes.get(&id).unwrap();
 
-        // Node should have the source code from the remote template
-        assert_eq!(node.script_code, code);
+        // After migration, define-module is stripped, exports populated
+        assert!(!node.script_code.contains("define-module"));
+        assert!(node.script_code.contains("(define sound 42)"));
+        assert_eq!(node.exports, vec!["sound".to_string()]);
         assert_eq!(node.label, "synth");
         assert!(!node.phantom);
     }

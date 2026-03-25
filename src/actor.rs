@@ -12,8 +12,6 @@ use crate::types::{BuiltinKind, NodeId, NodeTemplate, Value};
 use scheme_rs::env::TopLevelEnvironment;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::{mpsc, Arc, Mutex};
 
 /// Per-node actor context. Replaces 10+ individual thread-locals with a single struct.
@@ -160,7 +158,7 @@ pub enum ActorResult {
         env: TopLevelEnvironment,
         /// Hash of code that produced this env.
         code_hash: u64,
-        /// Cached preprocessed code for fast re-eval.
+        /// Cached module-stripped code for fast re-eval.
         preprocessed: Option<String>,
     },
     Error {
@@ -170,9 +168,7 @@ pub enum ActorResult {
 }
 
 fn hash_code(code: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    code.hash(&mut hasher);
-    hasher.finish()
+    crate::types::content_hash(code)
 }
 
 /// Shared resources cloned into each actor's context.
@@ -193,7 +189,7 @@ struct SharedResources {
 struct CachedEnv {
     code_hash: u64,
     env: TopLevelEnvironment,
-    /// Cached preprocessed code (skip Scribble on re-eval)
+    /// Cached code with module header already stripped
     preprocessed: Option<String>,
 }
 
@@ -343,7 +339,7 @@ impl ActorRuntime {
     }
 
     /// Check if a node qualifies for fast message-handler path.
-    /// Fast path: drain messages + re-eval with cached preprocessed code.
+    /// Fast path: drain messages + re-eval with cached module-stripped code.
     fn should_fast_path(&self, node_id: NodeId, node: &crate::types::Node) -> bool {
         if !self.handler_nodes.contains(&node_id) {
             return false;
@@ -448,6 +444,11 @@ impl ActorRuntime {
         &self.engine
     }
 
+    /// Get Arc clone of engine (for passing to nREPL evaluator etc).
+    pub fn engine_arc(&self) -> Arc<SchemeEngine> {
+        Arc::clone(&self.engine)
+    }
+
     /// Actually spawn eval on a worker thread.
     fn spawn_eval(&mut self, node_id: NodeId, pending: PendingCompute) {
         let code_hash = hash_code(&pending.msg.node.script_code);
@@ -502,7 +503,7 @@ fn execute_on_thread(
 ) -> ActorResult {
     let builtin = msg.template.as_ref().and_then(|t| t.builtin);
 
-    // Fast message path: drain messages, then re-eval with cached preprocessed code
+    // Fast message path: drain messages, then re-eval with cached module-stripped code
     if msg.fast_message_path {
         if let Some(env) = cached_env {
             let mut ctx = ActorContext::new(node_id);
@@ -525,11 +526,11 @@ fn execute_on_thread(
                 return ActorResult::Error { node_id, message: e.to_string() };
             }
 
-            // Re-eval with cached preprocessed code for fresh render blocks
+            // Re-eval with cached module-stripped code for fresh render blocks
             if let Some(ref preprocessed) = cached_preprocessed {
                 ctx.reset_outputs();
                 let result = with_actor_context(&mut ctx, || {
-                    engine.eval_preprocessed(&env, &msg.available_inputs, Some(&msg.db), preprocessed)
+                    engine.eval_preprocessed(&env, &msg.available_inputs, Some(&msg.db), preprocessed, &msg.node.exports)
                 });
                 return match result {
                     Ok(script_result) => ActorResult::Computed {
@@ -543,7 +544,7 @@ fn execute_on_thread(
                 };
             }
 
-            // No cached preprocessed code — return drain-only result
+            // No cached module-stripped code — return drain-only result
             let drain_result = drain_result.unwrap();
             return ActorResult::Computed {
                 node_id,
@@ -582,6 +583,7 @@ fn execute_on_thread(
             let result = with_actor_context(&mut ctx, || {
                 engine.execute_script_cached(
                     cached_env, &msg.available_inputs, Some(&msg.db), code,
+                    &msg.node.exports, &msg.node.imports,
                 )
             });
 

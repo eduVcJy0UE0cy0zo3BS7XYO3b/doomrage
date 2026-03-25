@@ -105,15 +105,11 @@ fn test_receive_creates_remote_template() {
     let id = graph.add_node(&template, [200.0, 200.0]);
     let node = graph.nodes.get(&id).unwrap();
 
-    assert_eq!(node.script_code, code);
+    // After migration, define-module is stripped, exports populated
+    assert!(!node.script_code.contains("define-module"));
+    assert_eq!(node.exports, vec!["freq".to_string()]);
     assert_eq!(node.label, "synth");
     assert!(!node.phantom);
-
-    // The node has the full define-module header — can be computed
-    let header = scheme_engine::parse_module_header(&node.script_code).unwrap();
-    assert_eq!(header.canvas, "alice");
-    assert_eq!(header.name, "synth");
-    assert_eq!(header.exports, vec!["freq"]);
 }
 
 #[test]

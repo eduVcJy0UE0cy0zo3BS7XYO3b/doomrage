@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "relay", "peer", "net"]
+members = [".", "relay", "peer", "net", "nrepl"]
 
 [package]
 name = "wasm-canvas"
@@ -35,6 +35,7 @@ inventory = "0.3"
 surrealdb = { version = "3.0.4", default-features = false, features = ["kv-mem"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 wasm-canvas-net = { path = "net" }
+nrepl = { path = "nrepl" }
 rayon = "1"
 rand = "0.8"
 anyhow = "1.0.102"

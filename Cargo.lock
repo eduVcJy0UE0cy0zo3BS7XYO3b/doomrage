@@ -5300,6 +5300,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrepl"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "env_logger",
+ "log",
+]
+
+[[package]]
 name = "ntapi"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9053,6 +9062,7 @@ dependencies = [
  "log",
  "notify",
  "notify-debouncer-mini",
+ "nrepl",
  "rand 0.8.5",
  "rayon",
  "rfd",
@@ -9060,6 +9070,7 @@ dependencies = [
  "serde",
  "serde_json",
  "surrealdb",
+ "tempfile",
  "tokio",
  "wasm-canvas-net",
  "wasmtime",
@@ -9085,8 +9096,10 @@ dependencies = [
 name = "wasm-canvas-peer"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "env_logger",
  "log",
+ "nrepl",
  "wasm-canvas",
 ]
 

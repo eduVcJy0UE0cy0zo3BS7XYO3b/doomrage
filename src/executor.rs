@@ -190,6 +190,9 @@ mod tests {
             script_outputs: Vec::new(),
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
+            exports: Vec::new(),
+            imports: Vec::new(),
+            code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -211,6 +214,9 @@ mod tests {
             script_outputs: Vec::new(),
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
+            exports: Vec::new(),
+            imports: Vec::new(),
+            code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -232,6 +238,9 @@ mod tests {
             script_outputs: Vec::new(),
             widget_decls: Vec::new(),
             widget_values: HashMap::new(),
+            exports: Vec::new(),
+            imports: Vec::new(),
+            code_hash: 0,
             error: None,
             last_exec_us: None,
             render_blocks: Vec::new(),
@@ -329,10 +338,16 @@ mod tests {
 
         let res = fresh_resources();
         let mut rt = ActorRuntime::with_debounce(Arc::clone(&res.scheme), 0);
-        let code = "(define x (input 'x 'f64))\n(define result (output 'result 'f64))\n(set! result (* x 2))";
-        let mut inputs = HashMap::new();
-        inputs.insert("x".to_string(), Value::F64(5.0));
-        send_script(&mut rt,code, inputs, &res.db);
+        let code = "(define x 5)\n(define result (* x 2))";
+        let mut node = script_node(1, code);
+        node.exports = vec!["result".to_string()];
+        rt.compute(
+            1,
+            node,
+            Some(builtin_registry().templates["Script"].clone()),
+            HashMap::new(),
+            res.db.clone(),
+        );
         // Wait for result
         loop {
             if let Some(result) = rt.poll() {

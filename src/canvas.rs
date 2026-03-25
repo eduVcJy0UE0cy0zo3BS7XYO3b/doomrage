@@ -1,10 +1,9 @@
-use crate::panels::PanelAction;
 use crate::registry::NodeRegistry;
 use crate::render::DrawCmd;
 use crate::theme::*;
 use crate::types::*;
 use egui::{
-    pos2, vec2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, RichText, Sense, Stroke,
+    pos2, vec2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Sense, Stroke,
     StrokeKind, Vec2,
 };
 
@@ -19,12 +18,6 @@ const ACCENT_STRIP_WIDTH: f32 = 4.0;
 #[derive(Debug, Clone)]
 pub enum DragKind {
     Node(NodeId, Vec2),
-    Wire {
-        from_node: NodeId,
-        from_port: String,
-        is_output: bool,
-        port_type: PortType,
-    },
     BoxSelect(Pos2),
     None,
 }
@@ -32,7 +25,6 @@ pub enum DragKind {
 pub struct CanvasState {
     pub selected_nodes: Vec<NodeId>,
     pub drag: DragKind,
-    pub hovered_port: Option<(NodeId, String, bool)>,
     pub context_menu_pos: Option<Pos2>,
     pub show_context_menu: bool,
 }
@@ -42,7 +34,6 @@ impl CanvasState {
         Self {
             selected_nodes: Vec::new(),
             drag: DragKind::None,
-            hovered_port: None,
             context_menu_pos: None,
             show_context_menu: false,
         }
@@ -142,28 +133,6 @@ pub fn draw_canvas(
         }
     }
 
-    // Draw wire being dragged
-    if let DragKind::Wire {
-        from_node,
-        from_port,
-        is_output,
-        port_type,
-    } = &state.drag
-    {
-        if let Some(node) = graph.nodes.get(from_node) {
-            let template = registry.templates.get(&node.template_name);
-            let from_pos =
-                port_screen_pos(node, template, from_port, *is_output, canvas_rect, offset, zoom);
-            if let (Some(from_pos), Some(cursor)) =
-                (from_pos, ui.input(|i| i.pointer.hover_pos()))
-            {
-                draw_wire(&painter, from_pos, cursor, port_type.color(), true);
-            }
-        }
-    }
-
-    // Collect port positions for interaction
-    let mut port_positions: Vec<(NodeId, String, bool, PortType, Pos2)> = Vec::new();
 
     // Draw nodes (sorted by selection for z-order)
     let mut node_ids: Vec<NodeId> = graph.nodes.keys().copied().collect();
@@ -193,7 +162,6 @@ pub fn draw_canvas(
             is_selected,
             node_rect,
             zoom,
-            &mut port_positions,
             node_id,
         );
     }
@@ -270,64 +238,32 @@ pub fn draw_canvas(
         }
     }
 
-    // Handle interactions
-    state.hovered_port = None;
-
-    if let Some(cursor) = pointer_pos {
-        for (nid, port_name, is_output, port_type, pos) in &port_positions {
-            if cursor.distance(*pos) < PORT_RADIUS * zoom * 2.0 {
-                state.hovered_port = Some((*nid, port_name.clone(), *is_output));
-
-                painter.circle(
-                    *pos,
-                    PORT_RADIUS * zoom * 1.5,
-                    port_type.color().linear_multiply(0.3),
-                    Stroke::new(2.0, port_type.color()),
-                );
-
-                // Simple tooltip via painter text near cursor
-                let tip = format!("{}: {}", port_name, port_type.label());
-                painter.text(
-                    pos2(cursor.x + 12.0, cursor.y - 12.0),
-                    egui::Align2::LEFT_BOTTOM,
-                    tip,
-                    FontId::proportional(11.0),
-                    TEXT,
-                );
-
-                break;
-            }
-        }
-    }
-
     // Click to select (no drag required)
     if canvas_response.clicked() {
         if let Some(cursor) = pointer_pos {
-            if state.hovered_port.is_none() {
-                let mut clicked_node = None;
-                for &node_id in node_ids.iter().rev() {
-                    let node = &graph.nodes[&node_id];
-                    let template = registry.templates.get(&node.template_name);
-                    let rect = node_screen_rect(node, template, canvas_rect, offset, zoom);
-                    if rect.contains(cursor) {
-                        clicked_node = Some(node_id);
-                        break;
-                    }
+            let mut clicked_node = None;
+            for &node_id in node_ids.iter().rev() {
+                let node = &graph.nodes[&node_id];
+                let template = registry.templates.get(&node.template_name);
+                let rect = node_screen_rect(node, template, canvas_rect, offset, zoom);
+                if rect.contains(cursor) {
+                    clicked_node = Some(node_id);
+                    break;
                 }
+            }
 
-                if let Some(node_id) = clicked_node {
-                    if !ui.input(|i| i.modifiers.shift) {
-                        state.selected_nodes = vec![node_id];
-                    } else if state.selected_nodes.contains(&node_id) {
-                        state.selected_nodes.retain(|&id| id != node_id);
-                    } else {
-                        state.selected_nodes.push(node_id);
-                    }
-                    response.node_selected = Some(node_id);
-                } else if !ui.input(|i| i.modifiers.shift) {
-                    state.selected_nodes.clear();
-                    response.node_selected = None;
+            if let Some(node_id) = clicked_node {
+                if !ui.input(|i| i.modifiers.shift) {
+                    state.selected_nodes = vec![node_id];
+                } else if state.selected_nodes.contains(&node_id) {
+                    state.selected_nodes.retain(|&id| id != node_id);
+                } else {
+                    state.selected_nodes.push(node_id);
                 }
+                response.node_selected = Some(node_id);
+            } else if !ui.input(|i| i.modifiers.shift) {
+                state.selected_nodes.clear();
+                response.node_selected = None;
             }
         }
     }
@@ -338,55 +274,40 @@ pub fn draw_canvas(
         && !ui.input(|i| i.modifiers.ctrl)
     {
         if let Some(cursor) = pointer_pos {
-            if let Some((nid, port_name, is_output)) = &state.hovered_port {
-                let port_type = port_positions
-                    .iter()
-                    .find(|(n, p, o, _, _)| n == nid && p == port_name && *o == *is_output)
-                    .map(|(_, _, _, pt, _)| *pt)
-                    .unwrap_or(PortType::F64);
-
-                state.drag = DragKind::Wire {
-                    from_node: *nid,
-                    from_port: port_name.clone(),
-                    is_output: *is_output,
-                    port_type,
-                };
-            } else {
-                let mut clicked_node = None;
-                for &node_id in node_ids.iter().rev() {
-                    let node = &graph.nodes[&node_id];
-                    let template = registry.templates.get(&node.template_name);
-                    let rect = node_screen_rect(node, template, canvas_rect, offset, zoom);
-                    if rect.contains(cursor) {
-                        clicked_node = Some(node_id);
-                        break;
-                    }
+            let mut clicked_node = None;
+            for &node_id in node_ids.iter().rev() {
+                let node = &graph.nodes[&node_id];
+                let template = registry.templates.get(&node.template_name);
+                let rect = node_screen_rect(node, template, canvas_rect, offset, zoom);
+                if rect.contains(cursor) {
+                    clicked_node = Some(node_id);
+                    break;
                 }
+            }
 
-                if let Some(node_id) = clicked_node {
-                    if !ui.input(|i| i.modifiers.shift) {
-                        if !state.selected_nodes.contains(&node_id) {
-                            state.selected_nodes = vec![node_id];
-                        }
-                    } else if state.selected_nodes.contains(&node_id) {
-                        state.selected_nodes.retain(|&id| id != node_id);
-                    } else {
-                        state.selected_nodes.push(node_id);
+            if let Some(node_id) = clicked_node {
+                if !ui.input(|i| i.modifiers.shift) {
+                    if !state.selected_nodes.contains(&node_id) {
+                        state.selected_nodes = vec![node_id];
                     }
-                    let node_pos = graph.nodes[&node_id].pos;
-                    let screen_pos = pos2(
-                        node_pos[0] * zoom + offset.x + canvas_rect.left(),
-                        node_pos[1] * zoom + offset.y + canvas_rect.top(),
-                    );
-                    state.drag = DragKind::Node(node_id, cursor - screen_pos);
-                    response.node_selected = Some(node_id);
+                } else if state.selected_nodes.contains(&node_id) {
+                    state.selected_nodes.retain(|&id| id != node_id);
                 } else {
-                    if !ui.input(|i| i.modifiers.shift) {
-                        state.selected_nodes.clear();
-                        response.node_selected = None;
-                    }
-                    state.drag = DragKind::BoxSelect(cursor);
+                    state.selected_nodes.push(node_id);
                 }
+                let node_pos = graph.nodes[&node_id].pos;
+                let screen_pos = pos2(
+                    node_pos[0] * zoom + offset.x + canvas_rect.left(),
+                    node_pos[1] * zoom + offset.y + canvas_rect.top(),
+                );
+                state.drag = DragKind::Node(node_id, cursor - screen_pos);
+                response.node_selected = Some(node_id);
+            } else {
+                if !ui.input(|i| i.modifiers.shift) {
+                    state.selected_nodes.clear();
+                    response.node_selected = None;
+                }
+                state.drag = DragKind::BoxSelect(cursor);
             }
         }
     }
@@ -444,24 +365,6 @@ pub fn draw_canvas(
 
     // Handle drag release
     if canvas_response.drag_stopped_by(egui::PointerButton::Primary) {
-        if let DragKind::Wire {
-            from_node,
-            from_port,
-            is_output,
-            port_type: _,
-        } = &state.drag
-        {
-            if let Some((target_node, target_port, target_is_output)) = &state.hovered_port {
-                if from_node != target_node && is_output != target_is_output {
-                    let (src_node, src_port, dst_node, dst_port) = if *is_output {
-                        (*from_node, from_port.clone(), *target_node, target_port.clone())
-                    } else {
-                        (*target_node, target_port.clone(), *from_node, from_port.clone())
-                    };
-                    response.new_connection = Some((src_node, src_port, dst_node, dst_port));
-                }
-            }
-        }
         state.drag = DragKind::None;
     }
 
@@ -657,8 +560,7 @@ fn draw_node(
     is_selected: bool,
     rect: Rect,
     zoom: f32,
-    port_positions: &mut Vec<(NodeId, String, bool, PortType, Pos2)>,
-    node_id: NodeId,
+    _node_id: NodeId,
 ) {
     let accent = if node.phantom {
         Color32::from_rgb(0x88, 0x66, 0xcc) // purple for phantom/remote nodes
@@ -796,7 +698,6 @@ fn draw_node(
                 TEXT_DIM,
             );
 
-            port_positions.push((node_id, port.name.clone(), false, port.port_type, pos2(px, py)));
         }
 
         for (i, port) in eff_outputs.iter().enumerate() {
@@ -813,13 +714,6 @@ fn draw_node(
                 TEXT_DIM,
             );
 
-            port_positions.push((
-                node_id,
-                port.name.clone(),
-                true,
-                port.port_type,
-                pos2(px, py),
-            ));
         }
 
         // Result display
@@ -1062,7 +956,6 @@ fn draw_minimap(
 #[derive(Default)]
 pub struct CanvasResponse {
     pub node_selected: Option<NodeId>,
-    pub new_connection: Option<(NodeId, String, NodeId, String)>,
     pub delete_nodes: Vec<NodeId>,
     pub widget_updates: Vec<(NodeId, String, Value)>,
 }
