@@ -131,9 +131,14 @@ fn find_nrepl_port(project_dir: Option<&std::path::Path>) -> Option<u16> {
 }
 
 fn call_claude(api_key: &str, messages: &[Value], tools: &Value) -> Result<Value, String> {
+    let base_url = std::env::var("LLM_API_BASE")
+        .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+    let model = std::env::var("LLM_MODEL")
+        .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+
     let client = reqwest::blocking::Client::new();
     let body = json!({
-        "model": "claude-sonnet-4-20250514",
+        "model": model,
         "max_tokens": 4096,
         "system": SYSTEM_PROMPT,
         "tools": tools,
@@ -141,7 +146,7 @@ fn call_claude(api_key: &str, messages: &[Value], tools: &Value) -> Result<Value
     });
 
     let resp = client
-        .post("https://api.anthropic.com/v1/messages")
+        .post(format!("{}/v1/messages", base_url))
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
