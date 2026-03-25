@@ -1,4 +1,4 @@
-.PHONY: run peer repl build nodes clean
+.PHONY: run peer repl agent build nodes clean
 
 run: nodes
 	cargo run
@@ -8,6 +8,9 @@ peer:
 
 repl:
 	cargo run -p nrepl --bin client
+
+agent:
+	cargo run -p canvas-agent --
 
 build: nodes
 	cargo build --release

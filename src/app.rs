@@ -81,7 +81,7 @@ impl WasmCanvasApp {
         let resources = AppResources::new().expect("Failed to create app resources");
 
         // Restore DB state from previous session
-        let db_auto_path = PathBuf::from("./db.json");
+        let db_auto_path = persistence::db_path();
         if let Err(e) = persistence::load_db(&resources.db, &db_auto_path) {
             log::warn!("Failed to restore DB: {}", e);
         }
@@ -194,7 +194,7 @@ impl WasmCanvasApp {
         ));
         let (nrepl_server, nrepl_port_file) = match nrepl::Server::start("127.0.0.1:7888", nrepl_evaluator.clone()) {
             Ok(server) => {
-                let port_dir = dirs::home_dir().unwrap_or_default().join(".canvas");
+                let port_dir = persistence::project_dir();
                 let port_file = server.write_port_file(&port_dir).ok();
                 log::info!("nREPL server started on port {}", server.port());
                 (Some(server), port_file)
@@ -671,7 +671,7 @@ impl WasmCanvasApp {
                             self.init_graph_libraries();
                             self.panel_state.selected_node = None;
                         }
-                        let _ = persistence::save_db(&self.resources.db, &PathBuf::from("./db.json"));
+                        let _ = persistence::save_db(&self.resources.db, &persistence::db_path());
                     }
                 }
                 PanelAction::ExportScm => {
@@ -790,7 +790,7 @@ impl WasmCanvasApp {
                 log::error!("Failed to save canvas '{}' to DB: {}", name, e);
             }
         }
-        let _ = persistence::save_db(&self.resources.db, &PathBuf::from("./db.json"));
+        let _ = persistence::save_db(&self.resources.db, &persistence::db_path());
     }
 }
 
@@ -1059,7 +1059,7 @@ impl eframe::App for WasmCanvasApp {
                 log::error!("Failed to auto-save canvas '{}': {}", name, e);
             }
         }
-        if let Err(e) = persistence::save_db(&self.resources.db, &PathBuf::from("./db.json")) {
+        if let Err(e) = persistence::save_db(&self.resources.db, &persistence::db_path()) {
             log::error!("Failed to auto-save DB: {}", e);
         }
         // Cleanup nREPL

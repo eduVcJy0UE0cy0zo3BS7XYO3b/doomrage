@@ -62,11 +62,54 @@ pub fn load_db(db: &Db, path: &Path) -> Result<()> {
     Ok(())
 }
 
+// --- Project directory ---
+
+use std::sync::OnceLock;
+
+static PROJECT_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set the project root directory (.canvas dir inside project).
+/// Call once at startup. Contains nodes/, db.json, .nrepl-port, lib/.
+pub fn set_project_dir(dir: PathBuf) {
+    let _ = PROJECT_DIR.set(dir);
+}
+
+/// Get the project .canvas directory. Falls back to ~/.canvas if not set.
+pub fn project_dir() -> PathBuf {
+    PROJECT_DIR.get().cloned()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".canvas"))
+}
+
+/// Path to db.json within the project.
+pub fn db_path() -> PathBuf {
+    project_dir().join("db.json")
+}
+
+/// Initialize a new project directory with default structure.
+pub fn init_project(dir: &Path) -> Result<()> {
+    let canvas_dir = dir.join(".canvas");
+    std::fs::create_dir_all(canvas_dir.join("nodes").join("main"))?;
+    std::fs::create_dir_all(canvas_dir.join("lib"))?;
+
+    let db_json = canvas_dir.join("db.json");
+    if !db_json.exists() {
+        std::fs::write(&db_json, "{}")?;
+    }
+
+    let gitignore = dir.join(".gitignore");
+    if !gitignore.exists() {
+        std::fs::write(&gitignore, "*.bak\n")?;
+    }
+
+    log::info!("Initialized project at {}", dir.display());
+    Ok(())
+}
+
 // --- File-per-node: .scm files ---
 
 /// Root directory for node source files.
 pub fn nodes_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".canvas").join("nodes")
+    project_dir().join("nodes")
 }
 
 /// Path to a node's .scm source file.

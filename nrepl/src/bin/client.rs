@@ -3,11 +3,13 @@ use std::io::{self, BufRead, Write};
 
 fn main() {
     let addr = std::env::args().nth(1).unwrap_or_else(|| {
-        // Try to read .nrepl-port from ~/.canvas/
-        let port_file = dirs::home_dir()
-            .map(|h| h.join(".canvas").join(".nrepl-port"));
-        if let Some(path) = port_file {
-            if let Ok(content) = std::fs::read_to_string(&path) {
+        // Try cwd/.canvas/.nrepl-port first, then ~/.canvas/.nrepl-port
+        let candidates = vec![
+            std::env::current_dir().ok().map(|d| d.join(".canvas").join(".nrepl-port")),
+            dirs::home_dir().map(|h| h.join(".canvas").join(".nrepl-port")),
+        ];
+        for candidate in candidates.into_iter().flatten() {
+            if let Ok(content) = std::fs::read_to_string(&candidate) {
                 return format!("127.0.0.1:{}", content.trim());
             }
         }

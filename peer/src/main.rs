@@ -2,10 +2,9 @@
 //! Loads graphs from DB, starts P2P network and nREPL server, computes nodes, publishes values.
 //!
 //! Usage:
-//!   wasm-canvas-peer [RELAY_ADDR]
-//!
-//! Example:
-//!   wasm-canvas-peer /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...
+//!   wasm-canvas-peer --init <dir>              Create a new project
+//!   wasm-canvas-peer --project <dir>           Run in a project directory
+//!   wasm-canvas-peer [RELAY_ADDR]              Run in current directory (legacy)
 
 use wasm_canvas::actor::ActorResult;
 use wasm_canvas::bridge::NetValues;
@@ -25,13 +24,43 @@ fn main() {
         env_logger::Env::default().default_filter_or("info,wasm_canvas=info"),
     ).init();
 
-    let relay_addr = std::env::args().nth(1);
+    let args: Vec<String> = std::env::args().collect();
+
+    // Parse CLI flags
+    let mut relay_addr = None;
+    let mut project_dir = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--init" => {
+                let dir = args.get(i + 1).expect("--init requires a directory argument");
+                let path = PathBuf::from(dir);
+                persistence::init_project(&path).expect("Failed to init project");
+                println!("Project initialized at {}", path.display());
+                return;
+            }
+            "--project" => {
+                let dir = args.get(i + 1).expect("--project requires a directory argument");
+                project_dir = Some(PathBuf::from(dir));
+                i += 2;
+            }
+            arg if arg.starts_with('/') => {
+                relay_addr = Some(arg.to_string());
+                i += 1;
+            }
+            _ => { i += 1; }
+        }
+    }
+
+    // Set project directory
+    if let Some(ref dir) = project_dir {
+        persistence::set_project_dir(dir.join(".canvas"));
+    }
 
     let resources = AppResources::new().expect("Failed to create app resources");
 
     // Load DB
-    let db_path = PathBuf::from("./db.json");
-    if let Err(e) = persistence::load_db(&resources.db, &db_path) {
+    if let Err(e) = persistence::load_db(&resources.db, &persistence::db_path()) {
         log::warn!("Failed to restore DB: {}", e);
     }
 
@@ -108,7 +137,7 @@ fn main() {
     }
     let mut nrepl_server = match nrepl::Server::start("127.0.0.1:7888", evaluator) {
         Ok(server) => {
-            let port_dir = dirs::home_dir().unwrap_or_default().join(".canvas");
+            let port_dir = persistence::project_dir();
             if let Ok(path) = server.write_port_file(&port_dir) {
                 log::info!("nREPL port file: {}", path.display());
             }
