@@ -1,8 +1,9 @@
 #!/bin/bash
 set -e
 
-# Build binaries on host, run full-cycle test in a container (sandbox).
-# Mock LLM runs as a container, agent connects directly (no litellm needed).
+# Full-cycle e2e test in a container sandbox.
+# Agent connects directly to mock LLM (no litellm dependency for tests).
+# For production: use LLM_API_BASE=http://localhost:4000 with litellm.
 #
 # Usage: ./tests/run-in-container.sh
 
