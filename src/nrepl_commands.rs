@@ -6,6 +6,13 @@ use std::sync::mpsc;
 
 /// A command from nREPL to the main loop.
 pub enum NreplCommand {
+    CreateCanvas {
+        name: String,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    ListCanvases {
+        reply: mpsc::Sender<Vec<String>>,
+    },
     CreateNode {
         canvas: String,
         label: String,

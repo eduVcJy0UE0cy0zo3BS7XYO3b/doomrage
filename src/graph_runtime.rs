@@ -462,6 +462,20 @@ impl GraphRuntime {
     pub fn poll_nrepl_commands(&mut self, rx: &CommandReceiver) {
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
+                NreplCommand::CreateCanvas { name, reply } => {
+                    let result = if self.all_graphs.contains_key(&name) {
+                        Err(format!("canvas '{}' already exists", name))
+                    } else {
+                        self.all_graphs.insert(name.clone(), Graph::new());
+                        log::info!("nREPL: created canvas '{}'", name);
+                        Ok(())
+                    };
+                    let _ = reply.send(result);
+                }
+                NreplCommand::ListCanvases { reply } => {
+                    let names: Vec<String> = self.all_graphs.keys().cloned().collect();
+                    let _ = reply.send(names);
+                }
                 NreplCommand::CreateNode { canvas, label, code, exports, imports, reply } => {
                     let result = self.cmd_create_node(&canvas, &label, &code, exports, imports);
                     let _ = reply.send(result);

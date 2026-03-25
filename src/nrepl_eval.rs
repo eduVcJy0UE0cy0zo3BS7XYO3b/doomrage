@@ -376,6 +376,18 @@ impl Evaluator for SchemeEvaluator {
         }).unwrap_or(Err("command channel unavailable".into()))
     }
 
+    fn create_canvas(&self, name: &str) -> Result<(), String> {
+        self.send_command(|reply| NreplCommand::CreateCanvas {
+            name: name.to_string(),
+            reply,
+        }).unwrap_or(Err("command channel unavailable".into()))
+    }
+
+    fn list_canvases(&self) -> Vec<String> {
+        self.send_command(|reply| NreplCommand::ListCanvases { reply })
+            .unwrap_or_default()
+    }
+
     fn delete_node(&self, canvas: &str, label: &str) -> Result<(), String> {
         self.send_command(|reply| NreplCommand::DeleteNode {
             canvas: canvas.to_string(),

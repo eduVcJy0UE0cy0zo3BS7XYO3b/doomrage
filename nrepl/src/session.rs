@@ -63,6 +63,17 @@ pub trait Evaluator: Send + Sync {
         false
     }
 
+    /// Create a new canvas.
+    fn create_canvas(&self, name: &str) -> Result<(), String> {
+        let _ = name;
+        Err("create-canvas not implemented".into())
+    }
+
+    /// List all canvases.
+    fn list_canvases(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Create a new node on a canvas. Returns node id or error.
     fn create_node(&self, canvas: &str, label: &str, code: &str,
                    exports: &[String], imports: &[(String, String)]) -> Result<String, String> {
@@ -203,6 +214,8 @@ pub fn handle_message(
                     ("load-file", Value::dict(vec![])),
                     ("ns-list", Value::dict(vec![])),
                     ("switch-ns", Value::dict(vec![])),
+                    ("create-canvas", Value::dict(vec![])),
+                    ("list-canvases", Value::dict(vec![])),
                     ("create-node", Value::dict(vec![])),
                     ("delete-node", Value::dict(vec![])),
                     ("update-node", Value::dict(vec![])),
@@ -369,6 +382,32 @@ pub fn handle_message(
                 ("id", Value::string(id)),
                 ("session", Value::string(session_id)),
                 ("status", status),
+            ])]
+        }
+        "create-canvas" => {
+            let name = msg.get_str("name").unwrap_or("");
+            match evaluator.create_canvas(name) {
+                Ok(()) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("status", Value::List(vec![Value::string("done")])),
+                ])],
+                Err(e) => vec![Value::dict(vec![
+                    ("id", Value::string(id)),
+                    ("session", Value::string(session_id)),
+                    ("ex", Value::string(&e)),
+                    ("status", Value::List(vec![Value::string("error"), Value::string("done")])),
+                ])],
+            }
+        }
+        "list-canvases" => {
+            let canvases = evaluator.list_canvases();
+            let values: Vec<Value> = canvases.into_iter().map(|n| Value::string(&n)).collect();
+            vec![Value::dict(vec![
+                ("id", Value::string(id)),
+                ("session", Value::string(session_id)),
+                ("canvases", Value::List(values)),
+                ("status", Value::List(vec![Value::string("done")])),
             ])]
         }
         "create-node" => {
