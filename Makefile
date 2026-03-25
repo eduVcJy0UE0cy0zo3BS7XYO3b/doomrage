@@ -1,4 +1,4 @@
-.PHONY: run peer repl agent mock build nodes clean
+.PHONY: run peer repl agent mock test-e2e build nodes clean
 
 run: nodes
 	cargo run
@@ -14,6 +14,9 @@ agent:
 
 mock:
 	python3 mock-llm/server.py
+
+test-e2e:
+	./tests/run-in-container.sh
 
 build: nodes
 	cargo build --release
