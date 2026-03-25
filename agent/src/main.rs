@@ -35,8 +35,8 @@ fn main() {
         std::process::exit(1);
     });
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| {
-        eprintln!("Set ANTHROPIC_API_KEY environment variable");
+    let api_key = std::env::var("LLM_API_KEY").unwrap_or_else(|_| {
+        eprintln!("Set LLM_API_KEY environment variable");
         std::process::exit(1);
     });
 
@@ -131,10 +131,14 @@ fn find_nrepl_port(project_dir: Option<&std::path::Path>) -> Option<u16> {
 }
 
 fn call_claude(api_key: &str, messages: &[Value], tools: &Value) -> Result<Value, String> {
-    let base_url = std::env::var("LLM_API_BASE")
-        .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
-    let model = std::env::var("LLM_MODEL")
-        .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+    let base_url = std::env::var("LLM_API_BASE").unwrap_or_else(|_| {
+        eprintln!("Set LLM_API_BASE (e.g. http://localhost:4000)");
+        std::process::exit(1);
+    });
+    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| {
+        eprintln!("Set LLM_MODEL (e.g. anthropic/claude-sonnet-4-20250514)");
+        std::process::exit(1);
+    });
 
     let client = reqwest::blocking::Client::new();
     let body = json!({
