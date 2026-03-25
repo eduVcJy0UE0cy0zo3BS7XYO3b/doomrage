@@ -96,6 +96,41 @@
 
 (define-error 'canvas-incomplete-bencode "Incomplete bencode data")
 
+;; --- Path helpers ---
+
+(defun canvas--infer-from-path ()
+  "Infer canvas and label from current buffer file path.
+Returns (canvas . label) or nil if not a .canvas/nodes/ file."
+  (when buffer-file-name
+    (let ((path (expand-file-name buffer-file-name)))
+      (when (string-match "/\\.?canvas/nodes/\\([^/]+\\)/\\([^/]+\\)\\.scm\\'" path)
+        (cons (match-string 1 path)
+              (match-string 2 path))))))
+
+(defun canvas--ensure-ns ()
+  "Ensure canvas--current-ns is set. Infer from file path if needed."
+  (unless canvas--current-ns
+    (when-let ((info (canvas--infer-from-path)))
+      (setq canvas--current-ns (format "%s/%s" (car info) (cdr info)))))
+  canvas--current-ns)
+
+(defun canvas--ensure-connected ()
+  "Auto-connect if not connected and port file exists."
+  (unless canvas--session
+    (when-let ((port (canvas--port)))
+      (canvas-connect port)))
+  (unless canvas--session
+    (error "Not connected. Run M-x canvas-connect")))
+
+(defun canvas--extract-defines ()
+  "Extract all top-level define names from the current buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (let (names)
+      (while (re-search-forward "^(define\\(?:-record-type\\|-syntax\\)?\\s-+(?\\(\\S-+\\)" nil t)
+        (push (match-string 1) names))
+      (nreverse names))))
+
 ;; --- Connection ---
 
 (defun canvas--port ()
@@ -307,7 +342,8 @@
 (defun canvas-info-at-point ()
   "Show info about symbol at point (go-to-definition with prefix arg)."
   (interactive)
-  (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
+  (canvas--ensure-connected)
+  (canvas--ensure-ns)
   (let* ((symbol (thing-at-point 'symbol t))
          (responses (apply #'canvas--sync-request "info" "symbol" (or symbol "")
                           (when canvas--current-ns (list "ns" canvas--current-ns))))
@@ -361,10 +397,12 @@
 (defun canvas-delete-node (canvas label)
   "Delete a node from the canvas."
   (interactive
-   (let* ((canvas (read-string "Canvas: " "default"))
-          (label (read-string "Node label: ")))
-     (list canvas label)))
-  (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
+   (let ((info (canvas--infer-from-path)))
+     (if info
+         (list (car info) (cdr info))
+       (list (read-string "Canvas: " "default")
+             (read-string "Node label: ")))))
+  (canvas--ensure-connected)
   (when (yes-or-no-p (format "Delete node '%s' from '%s'?" label canvas))
     (let ((resp (car (last (canvas--sync-request "delete-node" "canvas" canvas "label" label)))))
       (if (canvas--ok-p resp)
@@ -373,10 +411,19 @@
 
 ;;;###autoload
 (defun canvas-set-exports (exports-str)
-  "Set exports for the current node. EXPORTS is a space-separated list of names."
-  (interactive "sExports (space-separated): ")
-  (unless canvas--session (error "Not connected"))
-  (unless canvas--current-ns (error "Not in a node namespace. Use M-x canvas-switch-ns"))
+  "Set exports for the current node.
+With no prefix arg: auto-detect all defines from buffer.
+With prefix arg: prompt for space-separated names."
+  (interactive
+   (list (if current-prefix-arg
+             (read-string "Exports (space-separated): ")
+           (let ((detected (canvas--extract-defines)))
+             (if detected
+                 (mapconcat #'identity detected " ")
+               (read-string "Exports (space-separated): "))))))
+  (canvas--ensure-connected)
+  (canvas--ensure-ns)
+  (unless canvas--current-ns (error "Cannot determine node"))
   (let* ((parts (split-string canvas--current-ns "/"))
          (canvas (car parts))
          (label (cadr parts))
@@ -386,33 +433,51 @@
                                                  "label" label
                                                  "exports" exports)))))
       (if (canvas--ok-p resp)
-          (message "Exports set: %s" exports-str)
+          (message "Exports: %s" exports-str)
         (message "Error: %s" (cdr (assoc "ex" resp)))))))
 
 ;;;###autoload
 (defun canvas-compute ()
-  "Compute the current node."
+  "Save, load, and compute the current node. Auto-detects canvas/label from file path."
   (interactive)
-  (unless canvas--session (error "Not connected"))
-  (unless canvas--current-ns (error "Not in a node namespace. Use M-x canvas-switch-ns"))
+  (canvas--ensure-connected)
+  (canvas--ensure-ns)
+  (unless canvas--current-ns (error "Cannot determine node. Open a .scm file or M-x canvas-switch-ns"))
   (let* ((parts (split-string canvas--current-ns "/"))
          (canvas (car parts))
          (label (cadr parts)))
-    ;; Save buffer first if visiting the .scm file
+    ;; Save + load if buffer has unsaved changes
     (when (and buffer-file-name (buffer-modified-p))
-      (save-buffer)
+      (save-buffer))
+    (when buffer-file-name
       (canvas-load-file))
     (let ((resp (car (last (canvas--sync-request "compute" "canvas" canvas "label" label)))))
-      (if (canvas--ok-p resp)
-          (message "Computing '%s'..." label)
-        (message "Error: %s" (cdr (assoc "ex" resp)))))))
+      (if (not (canvas--ok-p resp))
+          (message "Error: %s" (cdr (assoc "ex" resp)))
+        (message "Computing '%s'..." label)
+        ;; Poll for result and show error/output
+        (run-at-time 1.5 nil
+                     (lambda ()
+                       (when canvas--current-ns
+                         (let* ((parts (split-string canvas--current-ns "/"))
+                                (state (car (last (canvas--sync-request "node-state"
+                                                                        "canvas" (car parts)
+                                                                        "label" (cadr parts))))))
+                           (when (canvas--ok-p state)
+                             (if-let ((err (cdr (assoc "error" state))))
+                                 (message "Error: %s" err)
+                               (let ((outputs (cdr (assoc "outputs" state))))
+                                 (message "Done: %s"
+                                          (mapconcat (lambda (p) (format "%s=%s" (car p) (cdr p)))
+                                                     outputs ", ")))))))))))))
 
 ;;;###autoload
 (defun canvas-node-state ()
   "Show the current node's state: exports, imports, outputs, errors."
   (interactive)
-  (unless canvas--session (error "Not connected"))
-  (unless canvas--current-ns (error "Not in a node namespace"))
+  (canvas--ensure-connected)
+  (canvas--ensure-ns)
+  (unless canvas--current-ns (error "Cannot determine node"))
   (let* ((parts (split-string canvas--current-ns "/"))
          (canvas (car parts))
          (label (cadr parts))
@@ -457,8 +522,9 @@
 (defun canvas-add-import ()
   "Interactively add a hash import: pick from available definitions."
   (interactive)
-  (unless canvas--session (error "Not connected"))
-  (unless canvas--current-ns (error "Not in a node namespace"))
+  (canvas--ensure-connected)
+  (canvas--ensure-ns)
+  (unless canvas--current-ns (error "Cannot determine node"))
   (let* ((parts (split-string canvas--current-ns "/"))
          (canvas (car parts))
          (label (cadr parts))
@@ -510,7 +576,8 @@
 ;;;###autoload
 (defun canvas-list-defs (canvas)
   "List all content-addressed definitions for CANVAS."
-  (interactive (list (read-string "Canvas: " "main")))
+  (interactive (list (or (car (canvas--infer-from-path))
+                         (read-string "Canvas: " "default"))))
   (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
   (let* ((responses (canvas--sync-request "defs" "canvas" canvas))
          (resp (car (last responses)))
@@ -555,7 +622,8 @@
 (defun canvas-def-history (name canvas)
   "Show version history of definition NAME on CANVAS."
   (interactive (list (read-string "Definition name: " (thing-at-point 'symbol t))
-                     (read-string "Canvas: " "main")))
+                     (or (car (canvas--infer-from-path))
+                         (read-string "Canvas: " "default"))))
   (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
   (let* ((responses (canvas--sync-request "def-history" "name" name "canvas" canvas))
          (resp (car (last responses)))
@@ -610,10 +678,13 @@
 
 ;;;###autoload
 (defun canvas-migrate-imports (canvas label)
-  "Migrate legacy module imports to hash-based imports for a node."
-  (interactive (list (read-string "Canvas: " "main")
-                     (read-string "Node label: ")))
-  (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
+  "Migrate legacy module imports to hash-based imports for current node."
+  (interactive (let ((info (canvas--infer-from-path)))
+                 (if info
+                     (list (car info) (cdr info))
+                   (list (read-string "Canvas: " "default")
+                         (read-string "Node label: ")))))
+  (canvas--ensure-connected)
   (let* ((responses (canvas--sync-request "migrate-imports" "canvas" canvas "label" label))
          (resp (car (last responses)))
          (migrated (cdr (assoc "migrated" resp)))
@@ -628,11 +699,11 @@
 Updates source code, exports, Name DB, and all hash_imports in consumers."
   (interactive
    (let* ((sym (thing-at-point 'symbol t))
-          (old (read-string "Old name: " sym))
-          (new (read-string (format "Rename '%s' to: " old)))
-          (canvas (read-string "Canvas: " "main")))
+          (old (read-string "Rename: " sym))
+          (new (read-string (format "'%s' → " old)))
+          (canvas (or (car (canvas--infer-from-path)) (read-string "Canvas: " "default"))))
      (list old new canvas)))
-  (unless canvas--session (error "Not connected. Run M-x canvas-connect"))
+  (canvas--ensure-connected)
   (let* ((responses (canvas--sync-request "rename-def"
                                           "canvas" canvas
                                           "old-name" old-name
@@ -722,11 +793,14 @@ Import definition HASH as LOCAL-NAME into node LABEL on CANVAS."
   (if canvas-mode
       (progn
         (add-hook 'completion-at-point-functions #'canvas-completions-at-point nil t)
+        ;; Auto-connect
         (unless canvas--session
           (when (canvas--port)
             (condition-case err
                 (canvas-connect)
               (error (message "Canvas: %s" (error-message-string err))))))
+        ;; Auto-set namespace from file path
+        (canvas--ensure-ns)
         (canvas--prettify-hash-imports))
     (canvas--clear-hash-import-overlays)
     (remove-hook 'completion-at-point-functions #'canvas-completions-at-point t)))
