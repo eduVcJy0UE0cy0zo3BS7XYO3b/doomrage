@@ -1,4 +1,4 @@
-.PHONY: run peer repl agent mock test-e2e build nodes clean
+.PHONY: run peer repl agent mock test-e2e build nodes clean metrics-report
 
 run: nodes
 	cargo run
@@ -35,6 +35,11 @@ nodes:
 			-o nodes/math/$$name.wasm; \
 	done
 	@echo "All nodes built."
+
+metrics-report:
+	python3 tools/metrics-report.py ~/.canvas/metrics.jsonl -o /tmp/metrics-report.html
+	@echo "Report: /tmp/metrics-report.html"
+	@xdg-open /tmp/metrics-report.html 2>/dev/null || open /tmp/metrics-report.html 2>/dev/null || echo "Open /tmp/metrics-report.html in browser"
 
 clean:
 	cargo clean

@@ -191,6 +191,14 @@ fn main() {
         }
     });
 
+    // Metrics JSONL recording
+    let metrics_file = persistence::project_dir().join("metrics.jsonl");
+    let mut metrics_writer = std::fs::OpenOptions::new()
+        .create(true).append(true).open(&metrics_file).ok();
+    if metrics_writer.is_some() {
+        log::info!("Recording metrics to {}", metrics_file.display());
+    }
+
     log::info!("Headless daemon running. Ctrl+C to stop.");
     let mut last_gauge_update = std::time::Instant::now();
 
@@ -273,9 +281,15 @@ fn main() {
             }
         }
 
-        // Update gauge metrics periodically
-        if last_gauge_update.elapsed() > Duration::from_secs(5) {
+        // Update gauge metrics + write JSONL snapshot periodically
+        if last_gauge_update.elapsed() > Duration::from_secs(2) {
             wasm_canvas::metrics::update_gauges(&runtime);
+            if let Some(ref mut w) = metrics_writer {
+                use std::io::Write;
+                let line = wasm_canvas::metrics::snapshot_json();
+                let _ = writeln!(w, "{}", line);
+                let _ = w.flush();
+            }
             last_gauge_update = std::time::Instant::now();
         }
 
