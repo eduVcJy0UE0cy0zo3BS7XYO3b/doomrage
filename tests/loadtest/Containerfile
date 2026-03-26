@@ -1,0 +1,12 @@
+FROM docker.io/library/rust:1.87-bookworm AS builder
+WORKDIR /src
+COPY . .
+RUN cargo build -p wasm-canvas-peer -p canvas-loadtest 2>&1 | tail -3
+
+FROM docker.io/library/debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 python3 ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/debug/wasm-canvas-peer /usr/local/bin/peer
+COPY --from=builder /src/target/debug/canvas-loadtest /usr/local/bin/loadtest
+COPY tools/metrics-report.py /usr/local/bin/metrics-report
+WORKDIR /workspace

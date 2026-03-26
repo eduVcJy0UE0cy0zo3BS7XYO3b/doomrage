@@ -377,6 +377,17 @@ fn main() {
     // (counters keep going, that's fine — we track from snapshot)
 
     // --- Phase 2: Soak ---
+    if cfg.soak_minutes == 0 {
+        println!();
+        println!("=== Ramp-up only (--soak-minutes 0) ===");
+        println!("Max clients: {}", max_clients);
+        println!("Results: loadtest-results.jsonl");
+        println!();
+        println!("To run soak test:");
+        println!("  canvas-loadtest --max-clients {} --soak-minutes 60", max_clients);
+        std::process::exit(0);
+    }
+
     println!();
     println!("--- Phase 2: Soak ({} min, {} clients) ---", cfg.soak_minutes, max_clients);
 

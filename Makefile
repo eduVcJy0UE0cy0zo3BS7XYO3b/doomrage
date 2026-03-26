@@ -36,11 +36,12 @@ nodes:
 	done
 	@echo "All nodes built."
 
-loadtest:
-	./tests/loadtest/run.sh --soak-minutes 60
+loadtest-find-max:
+	./tests/loadtest/run.sh --soak-minutes 0
 
-loadtest-quick:
-	./tests/loadtest/run.sh --soak-minutes 5
+loadtest-soak:
+	@test -n "$(MAX_CLIENTS)" || (echo "Usage: make loadtest-soak MAX_CLIENTS=5" && exit 1)
+	./tests/loadtest/run.sh --max-clients $(MAX_CLIENTS) --soak-minutes 60
 
 metrics-report:
 	python3 tools/metrics-report.py ~/.canvas/metrics.jsonl -o /tmp/metrics-report.html

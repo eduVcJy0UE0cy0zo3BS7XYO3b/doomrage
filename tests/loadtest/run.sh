@@ -1,87 +1,84 @@
 #!/bin/bash
 set -e
 
-# Load test in a container with fixed resources.
+# Load test with isolated containers in a pod:
+#   Container 1 (peer): fixed resources (4 CPU, 2GB) — system under test
+#   Container 2 (loadtest): no limits — load generator
+#   Both share network namespace via pod → localhost works
 #
 # Usage:
-#   ./tests/loadtest/run.sh                    # defaults: 1 hour soak
-#   ./tests/loadtest/run.sh --soak-minutes 5   # quick 5-min test
-#   ./tests/loadtest/run.sh --max-clients 10   # skip ramp-up, go straight to 10
+#   ./tests/loadtest/run.sh --soak-minutes 0              # find max only
+#   ./tests/loadtest/run.sh --max-clients 5 --soak-minutes 60  # soak
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SOAK_ARGS="${@}"
+LOADTEST_ARGS="${@}"
+OUTPUT_DIR="$ROOT_DIR/loadtest-output"
+IMAGE="docker.io/library/ubuntu:24.04"
+POD="loadtest-pod"
+BUILD_DIR="$ROOT_DIR/target/debug"
+
+mkdir -p "$OUTPUT_DIR"
 
 echo "=== Building binaries ==="
 cargo build -p wasm-canvas-peer -p canvas-loadtest 2>&1 | tail -3
-BUILD_DIR="$ROOT_DIR/target/debug"
+
+# Clean up previous
+podman pod rm -f "$POD" 2>/dev/null || true
 
 echo ""
-echo "=== Building container ==="
-podman build -t canvas-loadtest -f - "$ROOT_DIR" <<'DOCKERFILE'
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 python3 ca-certificates && rm -rf /var/lib/apt/lists/*
-WORKDIR /workspace
-DOCKERFILE
+echo "=== Creating pod ==="
+podman pod create --name "$POD" -p 9099:9090
 
 echo ""
-echo "=== Running load test (4 CPUs, 2GB RAM) ==="
-podman run --rm \
+echo "=== Starting peer (4 CPUs, 2GB RAM) ==="
+podman run -d --rm \
+    --pod "$POD" \
+    --name "${POD}-peer" \
     --cpus=4 --memory=2g \
-    --network=host \
     -v "$BUILD_DIR/wasm-canvas-peer:/usr/local/bin/peer:ro" \
-    -v "$BUILD_DIR/canvas-loadtest:/usr/local/bin/loadtest:ro" \
-    -v "$ROOT_DIR/tools/metrics-report.py:/usr/local/bin/metrics-report:ro" \
-    -v "$(pwd)/loadtest-output:/output" \
+    -v "$OUTPUT_DIR:/output" \
     -e RUST_LOG=warn,wasm_canvas=info \
-    bash -c "
-        set -e
+    "$IMAGE" \
+    /bin/bash -c '
+        PROJECT=$(mktemp -d)
+        peer --init $PROJECT >/dev/null 2>&1
+        peer --project $PROJECT &
+        PEER_PID=$!
+        trap "cp $PROJECT/.canvas/metrics.jsonl /output/peer-metrics.jsonl 2>/dev/null; kill $PEER_PID" EXIT
+        wait $PEER_PID
+    '
 
-        # Init project
-        PROJECT=\$(mktemp -d)
-        peer --init \$PROJECT >/dev/null 2>&1
+echo "Waiting for peer..."
+for i in $(seq 1 30); do
+    if curl -s localhost:9099/metrics >/dev/null 2>&1; then
+        echo "Peer ready"
+        break
+    fi
+    sleep 1
+done
 
-        # Start peer
-        peer --project \$PROJECT &
-        PEER_PID=\$!
-        sleep 3
-
-        if ! kill -0 \$PEER_PID 2>/dev/null; then
-            echo 'FAIL: peer did not start'
-            exit 1
-        fi
-
-        echo 'Peer started (PID '\$PEER_PID')'
-
-        # Run load test
-        cd /output
-        loadtest --addr 127.0.0.1:7888 ${SOAK_ARGS}
-        EXIT_CODE=\$?
-
-        # Copy metrics
-        cp \$PROJECT/.canvas/metrics.jsonl /output/peer-metrics.jsonl 2>/dev/null || true
-
-        # Generate report
-        python3 /usr/local/bin/metrics-report /output/loadtest-results.jsonl -o /output/loadtest-report.html 2>/dev/null || true
-
-        # Stop peer
-        kill \$PEER_PID 2>/dev/null || true
-        wait \$PEER_PID 2>/dev/null || true
-
-        exit \$EXIT_CODE
-    "
-
+echo ""
+echo "=== Running loadtest (no resource limits, same pod network) ==="
+podman run --rm \
+    --pod "$POD" \
+    --name "${POD}-load" \
+    -v "$BUILD_DIR/canvas-loadtest:/usr/local/bin/loadtest:ro" \
+    -v "$OUTPUT_DIR:/output" \
+    "$IMAGE" \
+    /bin/bash -c "cd /output && loadtest --addr 127.0.0.1:7888 ${LOADTEST_ARGS}"
 EXIT_CODE=$?
 
 echo ""
-echo "=== Output ==="
-ls -la loadtest-output/ 2>/dev/null || echo "(no output dir)"
-echo ""
-if [ -f loadtest-output/loadtest-report.html ]; then
-    echo "Report: loadtest-output/loadtest-report.html"
-    echo "Data:   loadtest-output/loadtest-results.jsonl"
-    xdg-open loadtest-output/loadtest-report.html 2>/dev/null || true
-fi
+echo "=== Generating report ==="
+python3 "$ROOT_DIR/tools/metrics-report.py" "$OUTPUT_DIR/loadtest-results.jsonl" -o "$OUTPUT_DIR/loadtest-report.html" 2>/dev/null && \
+    echo "Report: $OUTPUT_DIR/loadtest-report.html" || echo "(no report data)"
 
+echo ""
+echo "=== Cleanup ==="
+podman pod stop "$POD" 2>/dev/null || true
+podman pod rm -f "$POD" 2>/dev/null || true
+
+echo ""
+ls -lh "$OUTPUT_DIR/"*.jsonl "$OUTPUT_DIR/"*.html 2>/dev/null
 exit $EXIT_CODE
