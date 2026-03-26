@@ -958,6 +958,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "canvas-loadtest"
+version = "0.1.0"
+dependencies = [
+ "nrepl",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cbor4ii"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

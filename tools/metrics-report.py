@@ -81,9 +81,71 @@ def svg_chart(title, series, width=800, height=200):
     svg += '</svg></div>\n'
     return svg
 
+def is_loadtest_format(data):
+    return data and 't' in data[0] and 'phase' in data[0]
+
+def generate_loadtest_report(data):
+    if not data:
+        return '<html><body><h1>No data</h1></body></html>'
+
+    def extract(key):
+        return [d.get(key) for d in data]
+
+    last = data[-1]
+    duration = last.get('t', 0)
+
+    html = '''<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Load Test Report</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; }
+h1 { border-bottom: 2px solid #333; padding-bottom: 10px; }
+h2 { margin-top: 30px; color: #555; }
+.chart { margin: 20px 0; }
+.chart h3 { margin: 5px 0; font-size: 14px; color: #444; }
+.summary { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 15px; margin: 20px 0; }
+.stat { background: #f5f5f5; padding: 15px; border-radius: 8px; }
+.stat .value { font-size: 24px; font-weight: bold; }
+.stat .label { font-size: 12px; color: #888; }
+</style></head><body>
+'''
+    html += f'<h1>Load Test Report</h1>\n'
+    html += f'<p>Duration: {duration:.0f}s | Samples: {len(data)}</p>\n'
+
+    html += '<div class="summary">\n'
+    for key, label in [
+        ('clients', 'Clients'), ('ops', 'Total ops'), ('cycles', 'Cycles'),
+        ('errors', 'Errors'), ('error_rate', 'Error rate %'),
+        ('p50_ms', 'p50 ms'), ('p99_ms', 'p99 ms'),
+    ]:
+        val = last.get(key, 0)
+        val_str = f'{val:.1f}' if isinstance(val, float) else str(val)
+        html += f'<div class="stat"><div class="value">{val_str}</div><div class="label">{label}</div></div>\n'
+    html += '</div>\n'
+
+    html += '<h2>Latency</h2>\n'
+    html += svg_chart('p99 latency (ms)', [
+        ('p99', '#cc2222', extract('p99_ms')),
+        ('p50', '#2266cc', extract('p50_ms')),
+    ])
+
+    html += '<h2>Throughput</h2>\n'
+    html += svg_chart('Concurrent clients', [('clients', '#22aa66', extract('clients'))])
+    html += svg_chart('Total ops', [('ops', '#8844cc', extract('ops'))])
+    html += svg_chart('Cycles completed', [('cycles', '#2288aa', extract('cycles'))])
+
+    html += '<h2>Errors</h2>\n'
+    html += svg_chart('Error rate (%)', [('error %', '#cc4444', extract('error_rate'))])
+    html += svg_chart('Total errors', [('errors', '#cc2222', extract('errors'))])
+
+    html += '</body></html>'
+    return html
+
 def generate_report(data):
     if not data:
         return '<html><body><h1>No metrics data</h1></body></html>'
+
+    if is_loadtest_format(data):
+        return generate_loadtest_report(data)
 
     t0 = data[0].get('ts', 0)
     times = [(d.get('ts', 0) - t0) for d in data]

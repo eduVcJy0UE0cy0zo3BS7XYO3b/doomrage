@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "relay", "peer", "net", "nrepl", "agent"]
+members = [".", "relay", "peer", "net", "nrepl", "agent", "tests/loadtest"]
 
 [package]
 name = "wasm-canvas"

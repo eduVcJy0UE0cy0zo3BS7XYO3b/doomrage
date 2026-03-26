@@ -1,4 +1,4 @@
-.PHONY: run peer repl agent mock test-e2e build nodes clean metrics-report
+.PHONY: run peer repl agent mock test-e2e build nodes clean metrics-report loadtest
 
 run: nodes
 	cargo run
@@ -35,6 +35,12 @@ nodes:
 			-o nodes/math/$$name.wasm; \
 	done
 	@echo "All nodes built."
+
+loadtest:
+	./tests/loadtest/run.sh --soak-minutes 60
+
+loadtest-quick:
+	./tests/loadtest/run.sh --soak-minutes 5
 
 metrics-report:
 	python3 tools/metrics-report.py ~/.canvas/metrics.jsonl -o /tmp/metrics-report.html
