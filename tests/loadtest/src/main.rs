@@ -12,10 +12,10 @@
 use nrepl::{Client, bencode::Value};
 
 macro_rules! timed {
-    ($metrics:expr, $block:expr) => {{
+    ($metrics:expr, $op_name:expr, $block:expr) => {{
         let _start = Instant::now();
         let _ok = $block;
-        $metrics.record(_start.elapsed(), !_ok);
+        $metrics.record_op($op_name, _start.elapsed(), !_ok);
         _ok
     }};
 }
@@ -57,13 +57,42 @@ fn parse_args() -> Config {
     cfg
 }
 
+// --- Per-op latency tracker ---
+
+struct OpStats {
+    count: AtomicU64,
+    total_us: AtomicU64, // sum of latencies in microseconds
+    errors: AtomicU64,
+}
+
+impl OpStats {
+    fn new() -> Self {
+        Self { count: AtomicU64::new(0), total_us: AtomicU64::new(0), errors: AtomicU64::new(0) }
+    }
+    fn record(&self, latency: Duration, is_error: bool) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.total_us.fetch_add(latency.as_micros() as u64, Ordering::Relaxed);
+        if is_error { self.errors.fetch_add(1, Ordering::Relaxed); }
+    }
+    fn avg_ms(&self) -> f64 {
+        let c = self.count.load(Ordering::Relaxed);
+        if c == 0 { return 0.0; }
+        self.total_us.load(Ordering::Relaxed) as f64 / c as f64 / 1000.0
+    }
+    fn count(&self) -> u64 { self.count.load(Ordering::Relaxed) }
+    fn errors(&self) -> u64 { self.errors.load(Ordering::Relaxed) }
+}
+
 // --- Metrics ---
 
+const OP_NAMES: &[&str] = &["create-node", "update-node", "compute", "node-state", "defs", "info", "delete-node"];
+
 struct Metrics {
-    latencies_us: Mutex<VecDeque<u64>>, // rolling window of latencies in microseconds
+    latencies_us: Mutex<VecDeque<u64>>,
     total_ops: AtomicU64,
     total_errors: AtomicU64,
     total_cycles: AtomicU64,
+    per_op: Vec<(&'static str, OpStats)>,
 }
 
 impl Metrics {
@@ -73,19 +102,24 @@ impl Metrics {
             total_ops: AtomicU64::new(0),
             total_errors: AtomicU64::new(0),
             total_cycles: AtomicU64::new(0),
+            per_op: OP_NAMES.iter().map(|&name| (name, OpStats::new())).collect(),
         }
     }
 
-    fn record(&self, latency: Duration, is_error: bool) {
+    fn record_op(&self, op_name: &str, latency: Duration, is_error: bool) {
         let us = latency.as_micros() as u64;
         let mut lat = self.latencies_us.lock().unwrap();
         lat.push_back(us);
-        // Keep last 10000 samples
         while lat.len() > 10000 { lat.pop_front(); }
         drop(lat);
         self.total_ops.fetch_add(1, Ordering::Relaxed);
-        if is_error {
-            self.total_errors.fetch_add(1, Ordering::Relaxed);
+        if is_error { self.total_errors.fetch_add(1, Ordering::Relaxed); }
+        // Per-op
+        for (name, stats) in &self.per_op {
+            if *name == op_name {
+                stats.record(latency, is_error);
+                break;
+            }
         }
     }
 
@@ -99,8 +133,7 @@ impl Metrics {
         let mut sorted: Vec<u64> = lat.iter().copied().collect();
         sorted.sort();
         let idx = (sorted.len() as f64 * 0.99) as usize;
-        let idx = idx.min(sorted.len() - 1);
-        sorted[idx] as f64 / 1000.0
+        sorted[idx.min(sorted.len() - 1)] as f64 / 1000.0
     }
 
     fn p50_ms(&self) -> f64 {
@@ -120,6 +153,18 @@ impl Metrics {
     fn ops(&self) -> u64 { self.total_ops.load(Ordering::Relaxed) }
     fn errors(&self) -> u64 { self.total_errors.load(Ordering::Relaxed) }
     fn cycles(&self) -> u64 { self.total_cycles.load(Ordering::Relaxed) }
+
+    /// Per-op stats as JSON fragment: "create-node_avg_ms":12.3,"create-node_count":100,...
+    fn per_op_json(&self) -> String {
+        self.per_op.iter()
+            .map(|(name, stats)| {
+                let safe = name.replace('-', "_");
+                format!("\"{}__avg_ms\":{:.1},\"{}__count\":{},\"{}__errors\":{}",
+                        safe, stats.avg_ms(), safe, stats.count(), safe, stats.errors())
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 // --- JSONL writer ---
@@ -151,11 +196,13 @@ impl JsonlWriter {
         let ops_per_sec = if dt > 0.1 { (current_ops - self.last_ops) as f64 / dt } else { 0.0 };
         self.last_ops = current_ops;
         self.last_time = now;
+        let per_op = metrics.per_op_json();
         let line = format!(
-            "{{\"t\":{:.1},\"phase\":\"{}\",\"clients\":{},\"ops\":{},\"ops_per_sec\":{:.1},\"errors\":{},\"cycles\":{},\"p50_ms\":{:.1},\"p99_ms\":{:.1},\"error_rate\":{:.2}}}",
+            "{{\"t\":{:.1},\"phase\":\"{}\",\"clients\":{},\"ops\":{},\"ops_per_sec\":{:.1},\"errors\":{},\"cycles\":{},\"p50_ms\":{:.1},\"p99_ms\":{:.1},\"error_rate\":{:.2},{}}}",
             elapsed, phase, clients,
             current_ops, ops_per_sec, metrics.errors(), metrics.cycles(),
-            metrics.p50_ms(), metrics.p99_ms(), metrics.error_rate()
+            metrics.p50_ms(), metrics.p99_ms(), metrics.error_rate(),
+            per_op
         );
         let _ = writeln!(self.file, "{}", line);
         let _ = self.file.flush();
@@ -196,7 +243,7 @@ fn client_worker(
         let node_label = format!("{}-{}", label, cycle);
 
         // 1. create-node
-        let ok = timed!(metrics, {
+        let ok = timed!(metrics, "create-node", {
             let id = next_id_static();
             client.send(&Value::dict(vec![
                 ("id", Value::string(&id)),
@@ -212,7 +259,7 @@ fn client_worker(
         if !ok { continue; }
 
         // 2. update-node with more complex code
-        timed!(metrics, {
+        timed!(metrics, "update-node", {
             let id = next_id_static();
             client.send(&Value::dict(vec![
                 ("id", Value::string(&id)),
@@ -227,7 +274,7 @@ fn client_worker(
         });
 
         // 3. compute
-        timed!(metrics, {
+        timed!(metrics, "compute", {
             let id = next_id_static();
             client.send(&Value::dict(vec![
                 ("id", Value::string(&id)),
@@ -243,7 +290,7 @@ fn client_worker(
         thread::sleep(Duration::from_millis(300));
 
         // 5. node-state
-        timed!(metrics, {
+        timed!(metrics, "node-state", {
             let id = next_id_static();
             client.send(&Value::dict(vec![
                 ("id", Value::string(&id)),
@@ -256,7 +303,7 @@ fn client_worker(
         });
 
         // 6. defs
-        timed!(metrics, {
+        timed!(metrics, "defs", {
             let id = next_id_static();
             client.send(&Value::dict(vec![
                 ("id", Value::string(&id)),
@@ -268,7 +315,7 @@ fn client_worker(
         });
 
         // 7. info
-        timed!(metrics, {
+        timed!(metrics, "info", {
             let id = next_id_static();
             client.send(&Value::dict(vec![
                 ("id", Value::string(&id)),
@@ -280,7 +327,7 @@ fn client_worker(
         });
 
         // 8. delete-node
-        timed!(metrics, {
+        timed!(metrics, "delete-node", {
             let id = next_id_static();
             client.send(&Value::dict(vec![
                 ("id", Value::string(&id)),
@@ -340,30 +387,63 @@ fn main() {
         let s = stop.clone();
         handles.push(thread::spawn(move || client_worker(num_clients, addr, m, s)));
 
-        println!("  Clients: {} | warming up {}s...", num_clients, cfg.ramp_step_secs);
+        println!("  Clients: {} | waiting for stabilization (min {}s)...", num_clients, cfg.plateau_wait_secs);
 
-        // Warm-up: wait ramp_step, let throughput stabilize
-        let step_start = Instant::now();
-        let ops_before = metrics.ops();
-        while step_start.elapsed() < Duration::from_secs(cfg.ramp_step_secs) {
+        // Wait until ops/sec stabilizes: collect 5-second windows,
+        // stable = last 3 windows differ < 5%, and at least plateau_wait_secs elapsed
+        let stab_start = Instant::now();
+        let mut windows: VecDeque<f64> = VecDeque::new();
+        let mut window_ops_start = metrics.ops();
+        let mut window_start = Instant::now();
+        let current_ops_sec;
+
+        loop {
             thread::sleep(Duration::from_secs(2));
             jsonl.write(&metrics, num_clients, "ramp");
-            let elapsed = step_start.elapsed().as_secs_f64();
-            let current_ops_sec = if elapsed > 0.0 { (metrics.ops() - ops_before) as f64 / elapsed } else { 0.0 };
-            print!("\r    ops/s={:.1} p50={:.0}ms p99={:.0}ms err={:.1}% ops={} cycles={}    ",
-                   current_ops_sec, metrics.p50_ms(), metrics.p99_ms(), metrics.error_rate(),
-                   metrics.ops(), metrics.cycles());
+
+            // Every 5 seconds, take a window measurement
+            if window_start.elapsed() >= Duration::from_secs(5) {
+                let now_ops = metrics.ops();
+                let dt = window_start.elapsed().as_secs_f64();
+                let window_rate = (now_ops - window_ops_start) as f64 / dt;
+                windows.push_back(window_rate);
+                while windows.len() > 6 { windows.pop_front(); }
+                window_ops_start = now_ops;
+                window_start = Instant::now();
+
+                print!("\r    ops/s={:.1} p50={:.0}ms p99={:.0}ms err={:.1}% [{} windows]    ",
+                       window_rate, metrics.p50_ms(), metrics.p99_ms(), metrics.error_rate(),
+                       windows.len());
+            }
+
+            // Check stability: need 3+ windows, variance < 5%, min time elapsed
+            let elapsed = stab_start.elapsed().as_secs();
+            if windows.len() >= 3 && elapsed >= cfg.plateau_wait_secs {
+                let recent: Vec<f64> = windows.iter().rev().take(3).copied().collect();
+                let avg = recent.iter().sum::<f64>() / recent.len() as f64;
+                if avg > 0.0 {
+                    let max_dev = recent.iter().map(|r| ((r - avg) / avg).abs()).fold(0.0f64, f64::max);
+                    if max_dev < 0.05 {
+                        println!();
+                        current_ops_sec = avg;
+                        println!("    Stabilized at {:.1} ops/sec (variance {:.1}%, {}s)",
+                                 avg, max_dev * 100.0, elapsed);
+                        break;
+                    }
+                }
+            }
+
+            // Safety: don't wait forever
+            if elapsed > cfg.plateau_wait_secs * 5 {
+                println!();
+                let avg = if windows.is_empty() { 0.0 } else { windows.iter().sum::<f64>() / windows.len() as f64 };
+                current_ops_sec = avg;
+                println!("    Timeout after {}s, using avg {:.1} ops/sec", elapsed, avg);
+                break;
+            }
         }
-        println!();
 
-        // Measure stabilized ops/sec
-        let measure_start = Instant::now();
-        let ops_at_start = metrics.ops();
-        thread::sleep(Duration::from_secs(10));
-        let ops_at_end = metrics.ops();
-        let current_ops_sec = (ops_at_end - ops_at_start) as f64 / measure_start.elapsed().as_secs_f64();
-
-        println!("    Measured: {:.1} ops/sec (prev: {:.1}, best: {:.1} at {} clients)",
+        println!("    Result: {:.1} ops/sec (prev: {:.1}, best: {:.1} at {} clients)",
                  current_ops_sec, prev_ops_per_sec, best_ops_per_sec, best_clients);
 
         if current_ops_sec > best_ops_per_sec {
@@ -386,39 +466,11 @@ fn main() {
         }
 
         if !improved && num_clients > 1 {
-            // Plateau detected — wait longer to confirm
-            println!("  Plateau detected at {:.1} ops/sec. Waiting {}s to confirm...",
-                     current_ops_sec, cfg.plateau_wait_secs);
-            let plateau_start = Instant::now();
-            while plateau_start.elapsed() < Duration::from_secs(cfg.plateau_wait_secs) {
-                thread::sleep(Duration::from_secs(2));
-                jsonl.write(&metrics, num_clients, "plateau");
-                let elapsed_total = plateau_start.elapsed().as_secs_f64();
-                print!("\r    [plateau {:.0}s/{:.0}s] ops/s={:.1} p99={:.0}ms    ",
-                       elapsed_total, cfg.plateau_wait_secs,
-                       current_ops_sec, metrics.p99_ms());
-            }
-            println!();
-
-            // Re-measure after plateau wait
-            let ops_before_remeasure = metrics.ops();
-            thread::sleep(Duration::from_secs(10));
-            let ops_after_remeasure = metrics.ops();
-            let remeasured = (ops_after_remeasure - ops_before_remeasure) as f64 / 10.0;
-            println!("    After plateau wait: {:.1} ops/sec", remeasured);
-
-            if remeasured <= prev_ops_per_sec * 1.10 {
-                // Confirmed plateau — adding more clients won't help
-                max_clients = best_clients;
-                println!("  PLATEAU CONFIRMED: {:.1} ops/sec at {} clients", best_ops_per_sec, best_clients);
-                break;
-            } else {
-                println!("  False plateau — throughput recovered to {:.1}, continuing", remeasured);
-                if remeasured > best_ops_per_sec {
-                    best_ops_per_sec = remeasured;
-                    best_clients = num_clients;
-                }
-            }
+            // Plateau: throughput didn't improve. This is our max.
+            max_clients = best_clients;
+            println!("  PLATEAU: {:.1} ops/sec at {} clients (adding client {} didn't help: {:.1} ops/sec)",
+                     best_ops_per_sec, best_clients, num_clients, current_ops_sec);
+            break;
         }
 
         prev_ops_per_sec = current_ops_sec;

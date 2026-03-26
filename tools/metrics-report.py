@@ -138,6 +138,33 @@ h2 { margin-top: 30px; color: #555; }
     html += svg_chart('Error rate (%)', [('error %', '#cc4444', extract('error_rate'))])
     html += svg_chart('Total errors', [('errors', '#cc2222', extract('errors'))])
 
+    # Per-op breakdown table
+    op_names = ['create_node', 'update_node', 'compute', 'node_state', 'defs', 'info', 'delete_node']
+    op_labels = ['create-node', 'update-node', 'compute', 'node-state', 'defs', 'info', 'delete-node']
+    html += '<h2>Per-operation latency</h2>\n'
+    html += '<table style="width:100%;border-collapse:collapse;margin:20px 0">\n'
+    html += '<tr><th style="padding:8px;border:1px solid #ddd;text-align:left">Operation</th>'
+    html += '<th style="padding:8px;border:1px solid #ddd">Avg ms</th>'
+    html += '<th style="padding:8px;border:1px solid #ddd">Count</th>'
+    html += '<th style="padding:8px;border:1px solid #ddd">Errors</th></tr>\n'
+    for op_key, op_label in zip(op_names, op_labels):
+        avg = last.get(f'{op_key}__avg_ms', 0)
+        count = last.get(f'{op_key}__count', 0)
+        errors = last.get(f'{op_key}__errors', 0)
+        color = '#cc2222' if errors else '#333'
+        html += f'<tr><td style="padding:8px;border:1px solid #ddd"><code>{op_label}</code></td>'
+        html += f'<td style="padding:8px;border:1px solid #ddd;text-align:right">{avg:.1f}</td>'
+        html += f'<td style="padding:8px;border:1px solid #ddd;text-align:right">{count}</td>'
+        html += f'<td style="padding:8px;border:1px solid #ddd;text-align:right;color:{color}">{errors}</td></tr>\n'
+    html += '</table>\n'
+
+    # Per-op latency chart
+    colors = ['#2266cc', '#cc6622', '#22aa66', '#8844cc', '#aa4488', '#448888', '#cc2222']
+    series = []
+    for (op_key, op_label), color in zip(zip(op_names, op_labels), colors):
+        series.append((op_label, color, extract(f'{op_key}__avg_ms')))
+    html += svg_chart('Per-op avg latency (ms)', series)
+
     html += '</body></html>'
     return html
 
