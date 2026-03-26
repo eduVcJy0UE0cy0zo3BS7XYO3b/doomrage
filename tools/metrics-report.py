@@ -113,8 +113,8 @@ h2 { margin-top: 30px; color: #555; }
 
     html += '<div class="summary">\n'
     for key, label in [
-        ('clients', 'Clients'), ('ops', 'Total ops'), ('cycles', 'Cycles'),
-        ('errors', 'Errors'), ('error_rate', 'Error rate %'),
+        ('clients', 'Clients'), ('ops_per_sec', 'ops/sec'), ('ops', 'Total ops'),
+        ('cycles', 'Cycles'), ('errors', 'Errors'), ('error_rate', 'Error rate %'),
         ('p50_ms', 'p50 ms'), ('p99_ms', 'p99 ms'),
     ]:
         val = last.get(key, 0)
@@ -129,7 +129,8 @@ h2 { margin-top: 30px; color: #555; }
     ])
 
     html += '<h2>Throughput</h2>\n'
-    html += svg_chart('Concurrent clients', [('clients', '#22aa66', extract('clients'))])
+    html += svg_chart('ops/sec', [('ops/sec', '#22aa66', extract('ops_per_sec'))])
+    html += svg_chart('Concurrent clients', [('clients', '#448844', extract('clients'))])
     html += svg_chart('Total ops', [('ops', '#8844cc', extract('ops'))])
     html += svg_chart('Cycles completed', [('cycles', '#2288aa', extract('cycles'))])
 

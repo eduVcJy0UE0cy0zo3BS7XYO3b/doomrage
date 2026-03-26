@@ -29,6 +29,7 @@ use std::thread;
 struct Config {
     addr: String,
     ramp_step_secs: u64,
+    plateau_wait_secs: u64, // wait this long on plateau before adding client
     soak_minutes: u64,
     max_clients: usize, // 0 = auto-detect
 }
@@ -38,6 +39,7 @@ fn parse_args() -> Config {
     let mut cfg = Config {
         addr: "127.0.0.1:7888".into(),
         ramp_step_secs: 30,
+        plateau_wait_secs: 60,
         soak_minutes: 60,
         max_clients: 0,
     };
@@ -46,6 +48,7 @@ fn parse_args() -> Config {
         match args[i].as_str() {
             "--addr" => { cfg.addr = args[i + 1].clone(); i += 2; }
             "--ramp-step" => { cfg.ramp_step_secs = args[i + 1].parse().unwrap(); i += 2; }
+            "--plateau-wait" => { cfg.plateau_wait_secs = args[i + 1].parse().unwrap(); i += 2; }
             "--soak-minutes" => { cfg.soak_minutes = args[i + 1].parse().unwrap(); i += 2; }
             "--max-clients" => { cfg.max_clients = args[i + 1].parse().unwrap(); i += 2; }
             _ => { i += 1; }
@@ -124,23 +127,34 @@ impl Metrics {
 struct JsonlWriter {
     file: std::fs::File,
     start: Instant,
+    last_ops: u64,
+    last_time: Instant,
 }
 
 impl JsonlWriter {
     fn new(path: &str) -> Self {
+        let now = Instant::now();
         Self {
             file: std::fs::File::create(path).expect("cannot create JSONL"),
-            start: Instant::now(),
+            start: now,
+            last_ops: 0,
+            last_time: now,
         }
     }
 
     fn write(&mut self, metrics: &Metrics, clients: usize, phase: &str) {
         use std::io::Write;
         let elapsed = self.start.elapsed().as_secs_f64();
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_time).as_secs_f64();
+        let current_ops = metrics.ops();
+        let ops_per_sec = if dt > 0.1 { (current_ops - self.last_ops) as f64 / dt } else { 0.0 };
+        self.last_ops = current_ops;
+        self.last_time = now;
         let line = format!(
-            "{{\"t\":{:.1},\"phase\":\"{}\",\"clients\":{},\"ops\":{},\"errors\":{},\"cycles\":{},\"p50_ms\":{:.1},\"p99_ms\":{:.1},\"error_rate\":{:.2}}}",
+            "{{\"t\":{:.1},\"phase\":\"{}\",\"clients\":{},\"ops\":{},\"ops_per_sec\":{:.1},\"errors\":{},\"cycles\":{},\"p50_ms\":{:.1},\"p99_ms\":{:.1},\"error_rate\":{:.2}}}",
             elapsed, phase, clients,
-            metrics.ops(), metrics.errors(), metrics.cycles(),
+            current_ops, ops_per_sec, metrics.errors(), metrics.cycles(),
             metrics.p50_ms(), metrics.p99_ms(), metrics.error_rate()
         );
         let _ = writeln!(self.file, "{}", line);
@@ -298,15 +312,18 @@ fn main() {
 
     println!("=== wasm-canvas load test ===");
     println!("Target: {}", cfg.addr);
-    println!("Ramp step: {}s", cfg.ramp_step_secs);
+    println!("Ramp step: {}s, plateau wait: {}s", cfg.ramp_step_secs, cfg.plateau_wait_secs);
     println!("Soak: {} min", cfg.soak_minutes);
     println!();
 
-    // --- Phase 1: Ramp-up ---
-    println!("--- Phase 1: Ramp-up ---");
+    // --- Phase 1: Ramp-up (ops/sec targeting) ---
+    println!("--- Phase 1: Ramp-up (target: max ops/sec) ---");
     let mut num_clients = 0usize;
     let mut max_clients = 0usize;
     let ramp_start = Instant::now();
+    let mut prev_ops_per_sec: f64 = 0.0;
+    let mut best_ops_per_sec: f64 = 0.0;
+    let mut best_clients: usize = 0;
 
     loop {
         num_clients += 1;
@@ -323,40 +340,92 @@ fn main() {
         let s = stop.clone();
         handles.push(thread::spawn(move || client_worker(num_clients, addr, m, s)));
 
-        println!("  Clients: {} | waiting {}s...", num_clients, cfg.ramp_step_secs);
+        println!("  Clients: {} | warming up {}s...", num_clients, cfg.ramp_step_secs);
 
-        // Wait ramp step, printing stats
+        // Warm-up: wait ramp_step, let throughput stabilize
         let step_start = Instant::now();
+        let ops_before = metrics.ops();
         while step_start.elapsed() < Duration::from_secs(cfg.ramp_step_secs) {
             thread::sleep(Duration::from_secs(2));
             jsonl.write(&metrics, num_clients, "ramp");
-
-            let p99 = metrics.p99_ms();
-            let err = metrics.error_rate();
-            print!("\r    p50={:.0}ms p99={:.0}ms err={:.1}% ops={} cycles={}    ",
-                   metrics.p50_ms(), p99, err, metrics.ops(), metrics.cycles());
-
-            // Check limits
-            if metrics.ops() > 100 && (p99 > 1000.0 || err > 1.0) {
-                max_clients = if num_clients > 1 { num_clients - 1 } else { 1 };
-                println!();
-                println!("  LIMIT HIT at {} clients (p99={:.0}ms err={:.1}%)", num_clients, p99, err);
-                println!("  Max sustainable: {} clients", max_clients);
-                // Kill the last client
-                stop.store(true, Ordering::Relaxed);
-                thread::sleep(Duration::from_millis(500));
-                stop.store(false, Ordering::Relaxed);
-                break;
-            }
+            let elapsed = step_start.elapsed().as_secs_f64();
+            let current_ops_sec = if elapsed > 0.0 { (metrics.ops() - ops_before) as f64 / elapsed } else { 0.0 };
+            print!("\r    ops/s={:.1} p50={:.0}ms p99={:.0}ms err={:.1}% ops={} cycles={}    ",
+                   current_ops_sec, metrics.p50_ms(), metrics.p99_ms(), metrics.error_rate(),
+                   metrics.ops(), metrics.cycles());
         }
         println!();
 
-        if max_clients > 0 { break; }
+        // Measure stabilized ops/sec
+        let measure_start = Instant::now();
+        let ops_at_start = metrics.ops();
+        thread::sleep(Duration::from_secs(10));
+        let ops_at_end = metrics.ops();
+        let current_ops_sec = (ops_at_end - ops_at_start) as f64 / measure_start.elapsed().as_secs_f64();
 
-        // Safety: don't go above 50 clients
+        println!("    Measured: {:.1} ops/sec (prev: {:.1}, best: {:.1} at {} clients)",
+                 current_ops_sec, prev_ops_per_sec, best_ops_per_sec, best_clients);
+
+        if current_ops_sec > best_ops_per_sec {
+            best_ops_per_sec = current_ops_sec;
+            best_clients = num_clients;
+        }
+
+        // Check: did throughput improve by at least 10%?
+        let improved = prev_ops_per_sec < 1.0 || current_ops_sec > prev_ops_per_sec * 1.10;
+        // Check: hard limits
+        let p99 = metrics.p99_ms();
+        let err = metrics.error_rate();
+        let hard_limit = metrics.ops() > 100 && (p99 > 1000.0 || err > 1.0);
+
+        if hard_limit {
+            max_clients = best_clients;
+            println!("  HARD LIMIT at {} clients (p99={:.0}ms err={:.1}%)", num_clients, p99, err);
+            println!("  Best throughput: {:.1} ops/sec at {} clients", best_ops_per_sec, best_clients);
+            break;
+        }
+
+        if !improved && num_clients > 1 {
+            // Plateau detected — wait longer to confirm
+            println!("  Plateau detected at {:.1} ops/sec. Waiting {}s to confirm...",
+                     current_ops_sec, cfg.plateau_wait_secs);
+            let plateau_start = Instant::now();
+            while plateau_start.elapsed() < Duration::from_secs(cfg.plateau_wait_secs) {
+                thread::sleep(Duration::from_secs(2));
+                jsonl.write(&metrics, num_clients, "plateau");
+                let elapsed_total = plateau_start.elapsed().as_secs_f64();
+                print!("\r    [plateau {:.0}s/{:.0}s] ops/s={:.1} p99={:.0}ms    ",
+                       elapsed_total, cfg.plateau_wait_secs,
+                       current_ops_sec, metrics.p99_ms());
+            }
+            println!();
+
+            // Re-measure after plateau wait
+            let ops_before_remeasure = metrics.ops();
+            thread::sleep(Duration::from_secs(10));
+            let ops_after_remeasure = metrics.ops();
+            let remeasured = (ops_after_remeasure - ops_before_remeasure) as f64 / 10.0;
+            println!("    After plateau wait: {:.1} ops/sec", remeasured);
+
+            if remeasured <= prev_ops_per_sec * 1.10 {
+                // Confirmed plateau — adding more clients won't help
+                max_clients = best_clients;
+                println!("  PLATEAU CONFIRMED: {:.1} ops/sec at {} clients", best_ops_per_sec, best_clients);
+                break;
+            } else {
+                println!("  False plateau — throughput recovered to {:.1}, continuing", remeasured);
+                if remeasured > best_ops_per_sec {
+                    best_ops_per_sec = remeasured;
+                    best_clients = num_clients;
+                }
+            }
+        }
+
+        prev_ops_per_sec = current_ops_sec;
+
         if num_clients >= 50 {
-            max_clients = 50;
-            println!("  Reached safety limit: 50 clients");
+            max_clients = best_clients;
+            println!("  Safety limit: 50 clients. Best: {:.1} ops/sec at {}", best_ops_per_sec, best_clients);
             break;
         }
     }
@@ -365,7 +434,8 @@ fn main() {
 
     let ramp_duration = ramp_start.elapsed();
     println!();
-    println!("Ramp-up done in {:.0}s. Max clients: {}", ramp_duration.as_secs_f64(), max_clients);
+    println!("Ramp-up done in {:.0}s. Max: {} clients, {:.1} ops/sec",
+             ramp_duration.as_secs_f64(), max_clients, best_ops_per_sec);
 
     // Stop all current clients
     stop.store(true, Ordering::Relaxed);
@@ -380,8 +450,9 @@ fn main() {
     if cfg.soak_minutes == 0 {
         println!();
         println!("=== Ramp-up only (--soak-minutes 0) ===");
-        println!("Max clients: {}", max_clients);
-        println!("Results: loadtest-results.jsonl");
+        println!("Max clients:  {}", max_clients);
+        println!("Max ops/sec:  {:.1}", best_ops_per_sec);
+        println!("Results:      loadtest-results.jsonl");
         println!();
         println!("To run soak test:");
         println!("  canvas-loadtest --max-clients {} --soak-minutes 60", max_clients);
