@@ -279,6 +279,9 @@ impl ActorRuntime {
     pub fn set_slot_owners(&mut self, o: OCapNSlotOwners) { self.shared.slot_owners = Some(o); }
     pub fn set_repaint_signal(&mut self, signal: std::sync::Arc<dyn crate::types::RepaintSignal>) { self.shared.egui_ctx = Some(signal); }
 
+    /// Number of cached Scheme environments.
+    pub fn env_cache_size(&self) -> usize { self.env_cache.len() }
+
     /// Compute a node immediately (for cascade, node-send, programmatic triggers).
     pub fn compute(
         &mut self,

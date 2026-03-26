@@ -6,6 +6,10 @@
 //!   wasm-canvas-peer --project <dir>           Run in a project directory
 //!   wasm-canvas-peer [RELAY_ADDR]              Run in current directory (legacy)
 
+// Use jemalloc with profiling support
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use wasm_canvas::actor::ActorResult;
 use wasm_canvas::bridge::NetValues;
 use wasm_canvas::executor::AppResources;
@@ -185,6 +189,20 @@ fn main() {
                         &b"text/plain; version=0.0.4; charset=utf-8"[..],
                     ).unwrap());
                 let _ = request.respond(resp);
+            } else if request.url() == "/debug/stats" {
+                // Memory summary
+                let rss = wasm_canvas::metrics::read_rss_bytes();
+                let mut body = format!("RSS: {} MB\n", rss / 1024 / 1024);
+                if let (Ok(epoch), Ok(a), Ok(r)) = (
+                    tikv_jemalloc_ctl::epoch::mib(),
+                    tikv_jemalloc_ctl::stats::allocated::mib(),
+                    tikv_jemalloc_ctl::stats::resident::mib(),
+                ) {
+                    let _ = epoch.advance();
+                    if let Ok(v) = a.read() { body.push_str(&format!("jemalloc allocated: {} MB\n", v / 1024 / 1024)); }
+                    if let Ok(v) = r.read() { body.push_str(&format!("jemalloc resident:  {} MB\n", v / 1024 / 1024)); }
+                }
+                let _ = request.respond(tiny_http::Response::from_string(body));
             } else {
                 let _ = request.respond(tiny_http::Response::from_string("Not Found").with_status_code(404));
             }
@@ -284,6 +302,20 @@ fn main() {
         // Update gauge metrics + write JSONL snapshot periodically
         if last_gauge_update.elapsed() > Duration::from_secs(2) {
             wasm_canvas::metrics::update_gauges(&runtime);
+            // jemalloc stats
+            if let (Ok(epoch), Ok(alloc_mib), Ok(res_mib)) = (
+                tikv_jemalloc_ctl::epoch::mib(),
+                tikv_jemalloc_ctl::stats::allocated::mib(),
+                tikv_jemalloc_ctl::stats::resident::mib(),
+            ) {
+                let _ = epoch.advance();
+                if let Ok(v) = alloc_mib.read() {
+                    wasm_canvas::metrics::MEMORY_ALLOCATED_BYTES.set(v as i64);
+                }
+                if let Ok(v) = res_mib.read() {
+                    wasm_canvas::metrics::MEMORY_RESIDENT_BYTES.set(v as i64);
+                }
+            }
             if let Some(ref mut w) = metrics_writer {
                 use std::io::Write;
                 let line = wasm_canvas::metrics::snapshot_json();

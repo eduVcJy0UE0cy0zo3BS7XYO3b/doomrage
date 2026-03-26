@@ -109,6 +109,65 @@ pub static NETWORK_VALUES_RECEIVED: LazyLock<IntCounter> = LazyLock::new(|| {
     c
 });
 
+// --- Database ---
+
+pub static DB_QUERIES: LazyLock<IntCounter> = LazyLock::new(|| {
+    let c = IntCounter::new("wasm_canvas_db_queries_total", "Total SurrealDB queries").unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+pub static DB_QUERY_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
+    let h = Histogram::with_opts(HistogramOpts::new(
+        "wasm_canvas_db_query_duration_seconds",
+        "SurrealDB query duration",
+    ).buckets(vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1]))
+    .unwrap();
+    REGISTRY.register(Box::new(h.clone())).unwrap();
+    h
+});
+
+pub static DB_ERRORS: LazyLock<IntCounter> = LazyLock::new(|| {
+    let c = IntCounter::new("wasm_canvas_db_errors_total", "SurrealDB query errors").unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+// --- Memory ---
+
+pub static MEMORY_RSS_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let g = IntGauge::new("wasm_canvas_memory_rss_bytes", "Resident set size (bytes)").unwrap();
+    REGISTRY.register(Box::new(g.clone())).unwrap();
+    g
+});
+
+pub static MEMORY_ALLOCATED_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let g = IntGauge::new("wasm_canvas_memory_allocated_bytes", "Allocator active bytes").unwrap();
+    REGISTRY.register(Box::new(g.clone())).unwrap();
+    g
+});
+
+pub static MEMORY_RESIDENT_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let g = IntGauge::new("wasm_canvas_memory_resident_bytes", "Allocator resident bytes").unwrap();
+    REGISTRY.register(Box::new(g.clone())).unwrap();
+    g
+});
+
+pub static ENV_CACHE_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
+    let g = IntGauge::new("wasm_canvas_env_cache_size", "Cached Scheme environments").unwrap();
+    REGISTRY.register(Box::new(g.clone())).unwrap();
+    g
+});
+
+/// Read RSS from /proc/self/statm (Linux).
+pub fn read_rss_bytes() -> i64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<i64>().ok())
+        .map(|pages| pages * 4096)
+        .unwrap_or(0)
+}
+
 // --- Gather ---
 
 /// Render all metrics in Prometheus text format.
@@ -151,6 +210,21 @@ pub fn snapshot_json() -> String {
     if nc > 0 {
         write!(s, ",\"nrepl_duration_avg_ms\":{:.3}", (nh / nc as f64) * 1000.0).unwrap();
     }
+    // DB
+    write!(s, ",\"db_queries\":{}", DB_QUERIES.get()).unwrap();
+    write!(s, ",\"db_errors\":{}", DB_ERRORS.get()).unwrap();
+    let db_sum = DB_QUERY_DURATION.get_sample_sum();
+    let db_count = DB_QUERY_DURATION.get_sample_count();
+    write!(s, ",\"db_query_duration_sum\":{:.6}", db_sum).unwrap();
+    write!(s, ",\"db_query_count\":{}", db_count).unwrap();
+    if db_count > 0 {
+        write!(s, ",\"db_query_avg_ms\":{:.3}", (db_sum / db_count as f64) * 1000.0).unwrap();
+    }
+    // Memory
+    write!(s, ",\"memory_rss_bytes\":{}", MEMORY_RSS_BYTES.get()).unwrap();
+    write!(s, ",\"memory_allocated_bytes\":{}", MEMORY_ALLOCATED_BYTES.get()).unwrap();
+    write!(s, ",\"memory_resident_bytes\":{}", MEMORY_RESIDENT_BYTES.get()).unwrap();
+    write!(s, ",\"env_cache_size\":{}", ENV_CACHE_SIZE.get()).unwrap();
     s.push('}');
     s
 }
@@ -168,4 +242,8 @@ pub fn update_gauges(runtime: &crate::graph_runtime::GraphRuntime) {
         .map(|c| runtime.db.all_definitions(c).len() as i64)
         .sum();
     DEFINITIONS_TOTAL.set(all_defs);
+    // Memory
+    MEMORY_RSS_BYTES.set(read_rss_bytes());
+    // Env cache size
+    ENV_CACHE_SIZE.set(runtime.actor_runtime.env_cache_size() as i64);
 }

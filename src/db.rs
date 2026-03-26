@@ -35,7 +35,8 @@ impl Db {
 
     /// Run a SurrealQL query, return results as JSON array
     pub fn query(&self, surql: &str) -> Result<Vec<JsonValue>> {
-        self.inner.rt.block_on(async {
+        let _start = std::time::Instant::now();
+        let result = self.inner.rt.block_on(async {
             let mut response = self.inner.surreal.query(surql).await
                 .map_err(|e| anyhow::anyhow!("DB query error: {}", e))?;
 
@@ -50,16 +51,25 @@ impl Db {
                 }
             }
             Ok(all_results)
-        })
+        });
+        crate::metrics::DB_QUERIES.inc();
+        crate::metrics::DB_QUERY_DURATION.observe(_start.elapsed().as_secs_f64());
+        if result.is_err() { crate::metrics::DB_ERRORS.inc(); }
+        result
     }
 
     /// Run a mutation (CREATE/UPDATE/DELETE), ignore results
     pub fn run(&self, surql: &str) -> Result<()> {
-        self.inner.rt.block_on(async {
+        let _start = std::time::Instant::now();
+        let result = self.inner.rt.block_on(async {
             self.inner.surreal.query(surql).await
                 .map_err(|e| anyhow::anyhow!("DB run error: {}", e))?;
             Ok(())
-        })
+        });
+        crate::metrics::DB_QUERIES.inc();
+        crate::metrics::DB_QUERY_DURATION.observe(_start.elapsed().as_secs_f64());
+        if result.is_err() { crate::metrics::DB_ERRORS.inc(); }
+        result
     }
 
     /// Export all data as JSON (for save)
