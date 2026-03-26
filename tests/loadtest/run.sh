@@ -92,15 +92,12 @@ podman run --rm \
     /bin/bash -c "cd /output && loadtest --addr 127.0.0.1:7888 ${LOADTEST_ARGS}"
 EXIT_CODE=$?
 
-# Copy peer metrics before stopping (trap may not fire on pod stop)
+# Peer metrics are written directly to volume via symlink
 echo ""
-echo "=== Copying peer metrics ==="
-podman exec "${POD}-peer" cat /output/peer-metrics.jsonl > "$RUN_DIR/peer-metrics.jsonl" 2>/dev/null || \
-    podman exec "${POD}-peer" sh -c 'cat /tmp/*/canvas/metrics.jsonl 2>/dev/null || cat $(find /tmp -name metrics.jsonl 2>/dev/null | head -1) 2>/dev/null' > "$RUN_DIR/peer-metrics.jsonl" 2>/dev/null || true
 if [ -s "$RUN_DIR/peer-metrics.jsonl" ]; then
-    echo "  Copied $(wc -l < "$RUN_DIR/peer-metrics.jsonl") samples"
+    echo "=== Peer metrics: $(wc -l < "$RUN_DIR/peer-metrics.jsonl") samples ==="
 else
-    echo "  No peer metrics found"
+    echo "=== No peer metrics (peer may not have started) ==="
 fi
 
 echo ""
