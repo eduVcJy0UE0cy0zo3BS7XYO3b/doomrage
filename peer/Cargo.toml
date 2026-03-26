@@ -9,3 +9,4 @@ nrepl = { path = "../nrepl" }
 env_logger = "0.11"
 log = "0.4"
 dirs = "6"
+tiny_http = "0.12"

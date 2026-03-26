@@ -17,6 +17,7 @@ pub mod nrepl_eval;
 pub mod scheme_convert;
 pub mod scheme_engine;
 #[cfg(feature = "gui")] pub mod theme;
+pub mod metrics;
 pub mod sexp;
 pub mod types;
 pub use wasm_canvas_net::ocapn;

@@ -271,6 +271,7 @@ impl GraphRuntime {
             for node in graph.nodes.values() {
                 for hash in unresolved_hash_imports(node, &self.db) {
                     if requested.insert(hash.clone()) {
+                        crate::metrics::DEF_REQUESTS.inc();
                         let mut values = HashMap::new();
                         values.insert("hash".to_string(), Value::Str(hash));
                         self.net_handle.send(crate::network::NetCommand::Publish {
@@ -307,6 +308,7 @@ impl GraphRuntime {
                             channel: DEF_RESPONSE_CHANNEL.to_string(),
                             values: resp,
                         });
+                        crate::metrics::DEF_RESPONSES_SERVED.inc();
                         log::info!("Served definition #{}", hash);
                     }
                 }
@@ -339,6 +341,7 @@ impl GraphRuntime {
                     if !name.is_empty() {
                         self.db.register_def(hash, &name, "__remote__", "__network__", &form);
                     }
+                    crate::metrics::DEF_RESPONSES_RECEIVED.inc();
                     log::info!("Received definition #{} ({})", hash, name);
                 }
             }
@@ -352,6 +355,7 @@ impl GraphRuntime {
     /// `peer` is the source canvas name (loopback) or peer ID (network).
     /// Creates/updates phantom node, registers R6RS libraries, recomputes downstream.
     pub fn deliver_values(&mut self, canvas_key: &str, peer: &str, module_name: &str, values: &HashMap<String, Value>) {
+        crate::metrics::NETWORK_VALUES_RECEIVED.inc();
         // Extract metadata before filtering
         let source_code = match values.get("__source__") {
             Some(Value::Str(s)) => Some(s.clone()),

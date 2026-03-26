@@ -225,19 +225,33 @@ impl SessionManager {
     }
 }
 
+/// Optional callback for metrics: called with (op_name, duration) after each request.
+pub type MetricsCallback = Box<dyn Fn(&str, std::time::Duration) + Send + Sync>;
+
 /// Dispatch an nREPL message, returning response messages.
 pub fn handle_message(
     msg: &crate::bencode::Value,
     sessions: &SessionManager,
     evaluator: &dyn Evaluator,
 ) -> Vec<crate::bencode::Value> {
+    handle_message_with_metrics(msg, sessions, evaluator, None)
+}
+
+/// Dispatch an nREPL message with optional metrics callback.
+pub fn handle_message_with_metrics(
+    msg: &crate::bencode::Value,
+    sessions: &SessionManager,
+    evaluator: &dyn Evaluator,
+    metrics_cb: Option<&MetricsCallback>,
+) -> Vec<crate::bencode::Value> {
     use crate::bencode::Value;
 
+    let start = std::time::Instant::now();
     let op = msg.get_str("op").unwrap_or("");
     let id = msg.get_str("id").unwrap_or("unknown");
     let session_id = msg.get_str("session").unwrap_or("");
 
-    match op {
+    let result = match op {
         "clone" => {
             let new_id = sessions.create_session();
             vec![Value::dict(vec![
@@ -752,7 +766,11 @@ pub fn handle_message(
                 ])),
             ])]
         }
+    };
+    if let Some(cb) = metrics_cb {
+        cb(op, start.elapsed());
     }
+    result
 }
 
 #[cfg(test)]

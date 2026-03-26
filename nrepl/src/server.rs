@@ -1,5 +1,5 @@
 use crate::bencode;
-use crate::session::{Evaluator, SessionManager, handle_message};
+use crate::session::{Evaluator, SessionManager, MetricsCallback, handle_message, handle_message_with_metrics};
 use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream, SocketAddr};
 use std::sync::Arc;
@@ -15,6 +15,11 @@ pub struct Server {
 impl Server {
     /// Start an nREPL server on the given address (e.g. "127.0.0.1:0" for random port).
     pub fn start(addr: &str, evaluator: Arc<dyn Evaluator>) -> std::io::Result<Self> {
+        Self::start_with_metrics(addr, evaluator, None)
+    }
+
+    /// Start an nREPL server with optional metrics callback.
+    pub fn start_with_metrics(addr: &str, evaluator: Arc<dyn Evaluator>, metrics_cb: Option<Arc<MetricsCallback>>) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -34,8 +39,9 @@ impl Server {
                         log::info!("nREPL client connected: {}", peer);
                         let sessions = sessions.clone();
                         let evaluator = evaluator.clone();
+                        let metrics_cb = metrics_cb.clone();
                         thread::spawn(move || {
-                            handle_client(stream, &sessions, evaluator.as_ref());
+                            handle_client(stream, &sessions, evaluator.as_ref(), metrics_cb.as_deref());
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -90,7 +96,7 @@ impl Drop for Server {
     }
 }
 
-fn handle_client(stream: TcpStream, sessions: &SessionManager, evaluator: &dyn Evaluator) {
+fn handle_client(stream: TcpStream, sessions: &SessionManager, evaluator: &dyn Evaluator, metrics_cb: Option<&MetricsCallback>) {
     let peer = stream.peer_addr().ok();
     stream.set_nonblocking(false).ok();
 
@@ -107,7 +113,7 @@ fn handle_client(stream: TcpStream, sessions: &SessionManager, evaluator: &dyn E
             }
         };
 
-        let responses = handle_message(&msg, sessions, evaluator);
+        let responses = handle_message_with_metrics(&msg, sessions, evaluator, metrics_cb);
 
         for resp in &responses {
             let data = bencode::encode_to_vec(resp);

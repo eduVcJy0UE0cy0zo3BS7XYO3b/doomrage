@@ -585,22 +585,31 @@ fn execute_on_thread(
 
             let ch = hash_code(code);
 
+            let compute_start = std::time::Instant::now();
             let result = with_actor_context(&mut ctx, || {
                 engine.execute_script_cached(
                     cached_env, &msg.available_inputs, Some(&msg.db), code,
                     &msg.node.exports, &msg.node.imports, &msg.hash_resolved,
                 )
             });
+            let compute_elapsed = compute_start.elapsed();
 
             match result {
-                Ok((script_result, env, preprocessed)) => ActorResult::Computed {
-                    node_id,
-                    result: script_result,
-                    env,
-                    code_hash: ch,
-                    preprocessed: Some(preprocessed),
-                },
-                Err(e) => ActorResult::Error { node_id, message: e.to_string() },
+                Ok((script_result, env, preprocessed)) => {
+                    crate::metrics::COMPUTE_DURATION.observe(compute_elapsed.as_secs_f64());
+                    crate::metrics::COMPUTE_TOTAL.inc();
+                    ActorResult::Computed {
+                        node_id,
+                        result: script_result,
+                        env,
+                        code_hash: ch,
+                        preprocessed: Some(preprocessed),
+                    }
+                }
+                Err(e) => {
+                    crate::metrics::COMPUTE_ERRORS.inc();
+                    ActorResult::Error { node_id, message: e.to_string() }
+                }
             }
         }
         Some(BuiltinKind::Const) => {

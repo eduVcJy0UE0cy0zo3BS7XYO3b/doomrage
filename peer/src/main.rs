@@ -137,7 +137,12 @@ fn main() {
             runtime.all_graphs.keys().next().cloned().unwrap_or_default(),
         );
     }
-    let mut nrepl_server = match nrepl::Server::start("127.0.0.1:7888", evaluator) {
+    // Metrics callback for nREPL
+    let nrepl_metrics: std::sync::Arc<nrepl::MetricsCallback> = std::sync::Arc::new(Box::new(|op: &str, dur: std::time::Duration| {
+        wasm_canvas::metrics::NREPL_REQUESTS.with_label_values(&[op]).inc();
+        wasm_canvas::metrics::NREPL_DURATION.observe(dur.as_secs_f64());
+    }));
+    let mut nrepl_server = match nrepl::Server::start_with_metrics("127.0.0.1:7888", evaluator, Some(nrepl_metrics)) {
         Ok(server) => {
             let port_dir = persistence::project_dir();
             if let Ok(path) = server.write_port_file(&port_dir) {
@@ -161,7 +166,33 @@ fn main() {
         }
     };
 
+    // Start Prometheus metrics HTTP server
+    std::thread::spawn(|| {
+        let server = match tiny_http::Server::http("0.0.0.0:9090") {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Failed to start metrics server: {}", e);
+                return;
+            }
+        };
+        log::info!("Metrics server on http://0.0.0.0:9090/metrics");
+        for request in server.incoming_requests() {
+            if request.url() == "/metrics" {
+                let body = wasm_canvas::metrics::gather();
+                let resp = tiny_http::Response::from_string(body)
+                    .with_header(tiny_http::Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"text/plain; version=0.0.4; charset=utf-8"[..],
+                    ).unwrap());
+                let _ = request.respond(resp);
+            } else {
+                let _ = request.respond(tiny_http::Response::from_string("Not Found").with_status_code(404));
+            }
+        }
+    });
+
     log::info!("Headless daemon running. Ctrl+C to stop.");
+    let mut last_gauge_update = std::time::Instant::now();
 
     loop {
         // Poll file watcher
@@ -208,10 +239,12 @@ fn main() {
             match event {
                 NetEvent::PeerDiscovered(peer) => {
                     log::info!("Peer: +{}...", &peer[..12.min(peer.len())]);
+                    wasm_canvas::metrics::PEERS_CONNECTED.inc();
                     runtime.request_missing_defs();
                 }
                 NetEvent::PeerLost(peer) => {
                     log::info!("Peer: -{}...", &peer[..12.min(peer.len())]);
+                    wasm_canvas::metrics::PEERS_CONNECTED.dec();
                 }
                 NetEvent::ValuesReceived { peer, channel, values } => {
                     // Handle definition request/response channels
@@ -238,6 +271,12 @@ fn main() {
                 NetEvent::LocalPeerId(id) => log::info!("PeerId: {}", id),
                 _ => {}
             }
+        }
+
+        // Update gauge metrics periodically
+        if last_gauge_update.elapsed() > Duration::from_secs(5) {
+            wasm_canvas::metrics::update_gauges(&runtime);
+            last_gauge_update = std::time::Instant::now();
         }
 
         std::thread::sleep(Duration::from_millis(50));
