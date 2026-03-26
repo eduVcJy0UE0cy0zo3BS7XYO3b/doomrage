@@ -7,6 +7,11 @@ use scheme_rs::runtime::Runtime;
 use scheme_rs::value::Value;
 use std::collections::HashMap;
 
+/// Check if a string is a safe Scheme identifier (no code injection).
+fn is_safe_scheme_identifier(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '?' || c == '!' || c == '*' || c == '+')
+}
+
 /// Convert a Scheme runtime Value into a crate::types::Value.
 pub fn scheme_value_to_types_value(val: &Value) -> crate::types::Value {
     if let Some(f) = val.cast_to_scheme_type::<f64>() {
@@ -702,13 +707,21 @@ impl SchemeEngine {
         // Generate (import ...) and (define ...) statements, prepend to code
         let eval_code = if has_imports {
             let mut full = String::new();
-            // Legacy module imports
+            // Legacy module imports (validate identifiers to prevent code injection)
             for (canvas, module) in imports {
-                full.push_str(&format!("(import ({} {}))\n", canvas, module));
+                if is_safe_scheme_identifier(canvas) && is_safe_scheme_identifier(module) {
+                    full.push_str(&format!("(import ({} {}))\n", canvas, module));
+                } else {
+                    log::warn!("Skipping import with unsafe identifier: ({} {})", canvas, module);
+                }
             }
             // Hash-resolved imports: inject as (define name value)
             for (name, val) in hash_resolved {
-                full.push_str(&format!("(define {} {})\n", name, val.to_scheme_literal()));
+                if is_safe_scheme_identifier(name) {
+                    full.push_str(&format!("(define {} {})\n", name, val.to_scheme_literal()));
+                } else {
+                    log::warn!("Skipping hash import with unsafe name: {}", name);
+                }
             }
             full.push_str(code);
             full

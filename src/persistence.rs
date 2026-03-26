@@ -121,10 +121,22 @@ pub fn nodes_dir() -> PathBuf {
     project_dir().join("nodes")
 }
 
+/// Sanitize a name for safe use as a file/directory name.
+/// Removes path traversal characters, null bytes, limits length.
+pub fn sanitize_name(s: &str) -> String {
+    let s = s.replace(' ', "-");
+    let s: String = s.chars()
+        .filter(|c| *c != '/' && *c != '\\' && *c != '\0')
+        .collect();
+    let s = s.replace("..", "");
+    if s.len() > 128 { s[..128].to_string() } else { s }
+}
+
 /// Path to a node's .scm source file.
 pub fn node_file_path(canvas_name: &str, label: &str) -> PathBuf {
-    let safe_label = label.replace(' ', "-");
-    nodes_dir().join(canvas_name).join(format!("{}.scm", safe_label))
+    let safe_canvas = sanitize_name(canvas_name);
+    let safe_label = sanitize_name(label);
+    nodes_dir().join(safe_canvas).join(format!("{}.scm", safe_label))
 }
 
 /// Format hash import pragmas for writing to .scm file.
@@ -144,7 +156,11 @@ pub fn parse_hash_import_pragmas(content: &str) -> (Vec<crate::types::HashImport
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix(";;; @import ") {
             let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-            if parts.len() == 2 {
+            if parts.len() == 2
+                && parts[0].chars().all(|c| c.is_ascii_hexdigit())
+                && !parts[1].is_empty()
+                && parts[1].chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '?' || c == '!')
+            {
                 imports.push(crate::types::HashImport {
                     hash: parts[0].to_string(),
                     local_name: parts[1].to_string(),
@@ -1475,5 +1491,28 @@ mod tests {
         let (imports, code) = parse_hash_import_pragmas("");
         assert!(imports.is_empty());
         assert_eq!(code, "");
+    }
+
+    #[test]
+    fn test_sanitize_name_path_traversal() {
+        assert_eq!(sanitize_name("../../etc/passwd"), "etcpasswd");
+        assert_eq!(sanitize_name("normal-name"), "normal-name");
+        assert_eq!(sanitize_name("my canvas"), "my-canvas");
+        assert_eq!(sanitize_name("a/b\\c"), "abc");
+        assert_eq!(sanitize_name("has\0null"), "hasnull");
+    }
+
+    #[test]
+    fn test_sanitize_name_length() {
+        let long = "a".repeat(200);
+        assert_eq!(sanitize_name(&long).len(), 128);
+    }
+
+    #[test]
+    fn test_node_file_path_no_traversal() {
+        let path = node_file_path("../../etc", "passwd");
+        let path_str = path.to_string_lossy();
+        assert!(!path_str.contains(".."));
+        assert!(path_str.contains("etc"));
     }
 }

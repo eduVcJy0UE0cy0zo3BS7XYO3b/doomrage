@@ -327,6 +327,12 @@ impl GraphRuntime {
                     _ => "Simple".to_string(),
                 };
                 if let Ok(hash_u64) = u64::from_str_radix(hash, 16) {
+                    // Verify hash matches body (prevent injection of fake definitions)
+                    let actual_hash = crate::sexp::canonical_hash_str(body);
+                    if actual_hash != hash_u64 {
+                        log::warn!("Def hash mismatch from peer: claimed {:016x} actual {:016x}", hash_u64, actual_hash);
+                        return true;
+                    }
                     // Save to content-addressed storage
                     let _ = crate::persistence::save_definition(hash_u64, body);
                     // Register in Name DB (as remote definition)
@@ -898,6 +904,18 @@ pub fn rename_identifier_in_code(code: &str, old: &str, new: &str) -> String {
             in_string = !in_string;
             result.push(chars[i]);
             i += 1;
+            continue;
+        }
+        // Skip #\ character literals (e.g., #\newline, #\space, #\a)
+        if chars[i] == '#' && i + 1 < chars.len() && chars[i + 1] == '\\' {
+            result.push(chars[i]);
+            result.push(chars[i + 1]);
+            i += 2;
+            // Skip the character or name after #\
+            while i < chars.len() && is_ident_char(chars[i]) {
+                result.push(chars[i]);
+                i += 1;
+            }
             continue;
         }
         if in_string {

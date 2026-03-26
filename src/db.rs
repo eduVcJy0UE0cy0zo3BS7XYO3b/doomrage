@@ -98,6 +98,11 @@ impl Db {
                 self.run(&format!("DELETE {}", table))?;
                 for row in arr {
                     let content = serde_json::to_string(row)?;
+                    // Only accept JSON objects for CONTENT (reject arrays/primitives)
+                    if !content.starts_with('{') {
+                        log::warn!("Skipping non-object row in import for table '{}'", table);
+                        continue;
+                    }
                     self.run(&format!("CREATE {} CONTENT {}", table, content))?;
                 }
             }

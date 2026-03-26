@@ -275,6 +275,10 @@ fn decode_string_with_first(first: u8, r: &mut impl Read) -> Result<Vec<u8>, Dec
         .map_err(|_| DecodeError::InvalidFormat("invalid length".into()))?;
     let len: usize = len_str.parse()
         .map_err(|_| DecodeError::InvalidFormat(format!("invalid length: {}", len_str)))?;
+    const MAX_BENCODE_STRING: usize = 64 * 1024 * 1024;
+    if len > MAX_BENCODE_STRING {
+        return Err(DecodeError::InvalidFormat(format!("string length {} exceeds limit", len)));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(buf)
