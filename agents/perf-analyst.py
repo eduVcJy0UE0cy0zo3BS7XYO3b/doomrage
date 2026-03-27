@@ -166,10 +166,15 @@ def main():
     print("--- Analyzing... ---")
     print()
 
+    # Suppress AG2 logging noise
+    import logging
+    logging.getLogger("autogen.oai.client").setLevel(logging.ERROR)
+
     result = user.initiate_chat(
         analyst,
         message=f"Проанализируй результаты нагрузочного тестирования:\n\n{context}",
         max_turns=1,
+        silent=False,
     )
 
     # Extract response
