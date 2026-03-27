@@ -586,6 +586,25 @@ def generate_single_report(data, run_id="", meta=None, run_dir=None):
         )
     body += f"<p>Duration: {duration:.0f}s | Samples: {len(data)}</p>\n"
 
+    # Hardware info
+    if run_dir:
+        hw_path = os.path.join(run_dir, "hw-info.json")
+        if os.path.exists(hw_path):
+            try:
+                hw = json.load(open(hw_path))
+                body += '<div class="note"><strong>Hardware:</strong> '
+                parts = []
+                if hw.get("cpu_model"): parts.append(f'{hw["cpu_model"]} ({hw.get("cpu_count", "?")} cores)')
+                if hw.get("ram_total_mb"): parts.append(f'{hw["ram_total_mb"]} MB RAM')
+                if hw.get("disk_seq_write_mb_s"): parts.append(f'disk write {hw["disk_seq_write_mb_s"]} MB/s')
+                if hw.get("disk_seq_read_mb_s"): parts.append(f'read {hw["disk_seq_read_mb_s"]} MB/s')
+                if hw.get("kernel"): parts.append(f'kernel {hw["kernel"]}')
+                if hw.get("rustc"): parts.append(hw["rustc"])
+                body += ' | '.join(parts)
+                body += f'<br><strong>Container limits:</strong> {hw.get("container_cpus", "?")} CPUs, {hw.get("container_memory_mb", "?")} MB RAM'
+                body += '</div>\n'
+            except: pass
+
     # Summary cards
     body += '<div class="summary">\n'
     smry = run_summary("", data)

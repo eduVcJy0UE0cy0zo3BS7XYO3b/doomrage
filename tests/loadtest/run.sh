@@ -36,6 +36,81 @@ RUN_ID=$(date +%Y%m%d-%H%M%S)
 RUN_DIR="$OUTPUT_DIR/$RUN_ID"
 mkdir -p "$RUN_DIR"
 
+echo "=== Collecting hardware info ==="
+python3 -c "
+import json, subprocess, os, platform
+
+hw = {}
+hw['hostname'] = platform.node()
+hw['kernel'] = platform.release()
+hw['arch'] = platform.machine()
+hw['python'] = platform.python_version()
+
+# CPU
+try:
+    with open('/proc/cpuinfo') as f:
+        cpuinfo = f.read()
+    models = [l.split(':')[1].strip() for l in cpuinfo.split('\n') if 'model name' in l]
+    hw['cpu_model'] = models[0] if models else 'unknown'
+    hw['cpu_count'] = len(models)
+except: hw['cpu_model'] = 'unknown'; hw['cpu_count'] = os.cpu_count()
+
+# RAM
+try:
+    with open('/proc/meminfo') as f:
+        for line in f:
+            if 'MemTotal' in line:
+                hw['ram_total_mb'] = int(line.split()[1]) // 1024
+                break
+except: pass
+
+# Disk benchmark (sequential write 64MB)
+try:
+    import tempfile, time
+    with tempfile.NamedTemporaryFile(dir='$RUN_DIR', delete=True) as f:
+        data = b'x' * (64 * 1024 * 1024)
+        t0 = time.monotonic()
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+        dt = time.monotonic() - t0
+        hw['disk_seq_write_mb_s'] = round(64 / dt, 1)
+except: pass
+
+# Disk benchmark (sequential read)
+try:
+    import tempfile, time
+    with tempfile.NamedTemporaryFile(dir='$RUN_DIR', delete=False) as f:
+        fname = f.name
+        f.write(b'x' * (64 * 1024 * 1024))
+        f.flush()
+        os.fsync(f.fileno())
+    # Drop page cache for this file if possible
+    os.system(f'dd if={fname} of=/dev/null bs=1M 2>/dev/null')
+    t0 = time.monotonic()
+    with open(fname, 'rb') as f:
+        f.read()
+    dt = time.monotonic() - t0
+    hw['disk_seq_read_mb_s'] = round(64 / dt, 1)
+    os.unlink(fname)
+except: pass
+
+# Container limits
+hw['container_cpus'] = 4
+hw['container_memory_mb'] = 2048
+
+# Rust version
+try:
+    r = subprocess.run(['rustc', '--version'], capture_output=True, text=True)
+    hw['rustc'] = r.stdout.strip()
+except: pass
+
+json.dump(hw, open('$RUN_DIR/hw-info.json', 'w'), indent=2)
+for k, v in sorted(hw.items()):
+    print(f'  {k}: {v}')
+" 2>/dev/null || echo "  (hw-info collection failed)"
+
+echo ""
 echo "=== Building binaries ==="
 cargo build -p wasm-canvas-peer -p canvas-loadtest 2>&1 | tail -3
 

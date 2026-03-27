@@ -1,92 +1,101 @@
-Проведи нагрузочное тестирование wasm-canvas peer.
+Ты — НТ-инженер (нагрузочное тестирование). Твоя задача: провести тест, проанализировать данные, дать рекомендации.
 
-## Что делать
+**ВАЖНО: Ты НЕ модифицируешь исходный код приложения. Ты только:**
+1. Запускаешь тесты через shell
+2. Читаешь JSONL данные
+3. Анализируешь числа
+4. Даёшь рекомендации что оптимизировать
 
-1. Запусти тест
-2. Дождись завершения
-3. Прочитай данные из JSONL
-4. Проанализируй результаты
-5. Дай рекомендации по оптимизации
+Запусти Agent tool с описанием ниже. Agent должен быть изолирован — он работает только с loadtest-output/ и запуском тестов.
 
-## 1. Запуск
+## Промпт для агента
 
-Запусти find-max (поиск максимума):
+Запусти Agent tool с subagent_type "general-purpose" и следующим промптом:
+
+---
+
+Ты НТ-инженер. Проведи нагрузочное тестирование.
+
+### Шаг 1: Запуск теста
+
 ```bash
 ./tests/loadtest/run.sh --soak-minutes 0 --plateau-wait 30
 ```
 
-Или soak (держать нагрузку):
-```bash
-./tests/loadtest/run.sh --max-clients N --soak-minutes 60
-```
+Дождись завершения. Тест запускает peer в контейнере (4 CPU, 2GB RAM) и генерирует нагрузку nREPL операциями.
 
-## 2. После завершения — прочитай данные
+### Шаг 2: Найти результаты
 
-Найди последний прогон:
 ```bash
 ls -d loadtest-output/2* | tail -1
 ```
 
-Прочитай последнюю строку loadtest-results.jsonl через bash:
+### Шаг 3: Прочитать hw-info
+
 ```bash
-tail -1 loadtest-output/<date>/loadtest-results.jsonl
+cat loadtest-output/<date>/hw-info.json
 ```
 
-Прочитай последнюю строку peer-metrics.jsonl:
+### Шаг 4: Прочитать per-op latency
+
 ```bash
-tail -1 loadtest-output/<date>/peer-metrics.jsonl
+tail -1 loadtest-output/<date>/loadtest-results.jsonl | python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+ops = [(k.replace('__avg_ms',''), d.get(k,0), d.get(k.replace('avg_ms','count'),0)) for k in sorted(d) if k.endswith('__avg_ms')]
+total_time = sum(m*c for _,m,c in ops)
+for name, ms, count in sorted(ops, key=lambda x: -x[1]):
+    pct = ms * count / total_time * 100 if total_time > 0 else 0
+    print(f'  {name:20s}  {ms:8.1f} ms  ({count:.0f} calls)  {pct:5.1f}%')
+print(f'\n  ops/sec: {d.get(\"ops_per_sec\",0):.1f}  p50: {d.get(\"p50_ms\",0):.0f}ms  p99: {d.get(\"p99_ms\",0):.0f}ms')
+"
 ```
 
-Посчитай тренд памяти (первая и последняя строка peer-metrics):
+### Шаг 5: Прочитать peer metrics (DB + memory)
+
 ```bash
-head -1 loadtest-output/<date>/peer-metrics.jsonl
-tail -1 loadtest-output/<date>/peer-metrics.jsonl
+python3 -c "
+import json
+path = '$(ls -d loadtest-output/2* | tail -1)/peer-metrics.jsonl'
+lines = open(path).readlines()
+if not lines: print('No peer metrics'); exit()
+first, last = json.loads(lines[0]), json.loads(lines[-1])
+dt = last['ts'] - first['ts']
+print(f'Duration: {dt:.0f}s')
+print(f'RSS:      {first[\"memory_rss_bytes\"]//1024//1024} → {last[\"memory_rss_bytes\"]//1024//1024} MB')
+print(f'Alloc:    {first[\"memory_allocated_bytes\"]//1024//1024} → {last[\"memory_allocated_bytes\"]//1024//1024} MB')
+print(f'Env cache: {first[\"env_cache_size\"]} → {last[\"env_cache_size\"]}')
+print(f'DB queries: {last[\"db_queries\"]-first[\"db_queries\"]} (avg {last.get(\"db_query_avg_ms\",0):.1f}ms)')
+print(f'Computes: {last[\"compute_total\"]-first[\"compute_total\"]}')
+cycles = last['compute_total'] - first['compute_total']
+db = last['db_queries'] - first['db_queries']
+if cycles: print(f'DB queries/compute: {db/cycles:.0f}')
+"
 ```
 
-## 3. Что анализировать
+### Шаг 6: Сгенерировать отчёт
 
-### Per-op latency (из loadtest-results.jsonl)
-
-Поля `create_node__avg_ms`, `update_node__avg_ms`, `compute__avg_ms`, `node_state__avg_ms`, `defs__avg_ms`, `info__avg_ms`, `delete_node__avg_ms`.
-
-Отсортируй по убыванию — самая медленная операция = bottleneck.
-
-### DB нагрузка (из peer-metrics.jsonl)
-
-- `db_queries` — сколько всего SQL запросов
-- `db_query_avg_ms` — средняя latency запроса
-- Посчитай queries per nREPL cycle = db_queries / cycles
-
-### Memory (из peer-metrics.jsonl)
-
-- `memory_rss_bytes` — RSS в байтах, сравни первую и последнюю строку
-- `memory_allocated_bytes` — jemalloc allocated
-- `env_cache_size` — кешированные Scheme environments
-
-Если RSS растёт линейно — утечка. Если env_cache растёт но ноды удаляются — кеш не очищается.
-
-### Throughput
-
-- `ops_per_sec` — операций в секунду
-- При добавлении клиента ops/sec должен расти. Если падает — contention.
-
-## 4. Рекомендации
-
-На основе данных предложи конкретные изменения:
-
-- **node-state медленный** → читать через with_graphs напрямую вместо command channel
-- **update-node медленный** → batch DB queries в save_node_definitions
-- **DB avg > 10ms** → batch queries, или перейти на HashMap вместо SurrealDB для hot path
-- **RSS растёт** → проверить env_cache cleanup при delete-node
-- **env_cache растёт** → очищать при delete-node
-
-## 5. Отчёт
-
-Сгенерируй HTML отчёт:
 ```bash
-python3 tools/metrics-report.py loadtest-output/<date>/ -o loadtest-output/<date>/report.html
+RUN=$(ls -d loadtest-output/2* | tail -1)
+python3 tools/metrics-report.py "$RUN" -o "$RUN/report.html"
+python3 tools/metrics-report.py index loadtest-output
+echo "Report: $RUN/report.html"
 ```
 
-Скажи пользователю где открыть: `xdg-open loadtest-output/<date>/report.html`
+### Шаг 7: Анализ
 
-Все прогоны: `xdg-open loadtest-output/index.html`
+Составь отчёт:
+
+1. **Железо** — CPU, RAM, disk speed, container limits
+2. **Максимум** — ops/sec, при скольких клиентах
+3. **Per-op breakdown** — таблица операций отсортированная по % от цикла
+4. **DB нагрузка** — queries per compute, avg query ms
+5. **Memory** — RSS trend, env cache growth, есть ли утечка
+6. **Bottleneck** — конкретно какая операция и почему медленная
+7. **Рекомендации** — что оптимизировать, ожидаемый эффект
+
+Не предлагай изменения в коде — только что нужно оптимизировать и почему.
+
+В конце скажи пользователю:
+- Где открыть отчёт: `xdg-open <path>/report.html`
+- Где все прогоны: `xdg-open loadtest-output/index.html`
