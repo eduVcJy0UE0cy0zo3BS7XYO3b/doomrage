@@ -28,7 +28,7 @@ from autogen import ConversableAgent, GroupChat, GroupChatManager
 
 LITELLM_BASE = os.environ.get("LITELLM_BASE", "http://localhost:4000")
 LITELLM_KEY = os.environ.get("LITELLM_KEY", "sk-litellm-master-key-local")
-DEFAULT_MODEL = os.environ.get("PERF_MODEL", "gemini-flash")
+DEFAULT_MODEL = os.environ.get("PERF_MODEL", "deepseek-chat")
 
 # --- Tools ---
 
